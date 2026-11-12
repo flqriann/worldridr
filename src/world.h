@@ -1,0 +1,72 @@
+#pragma once
+#include "gfx.h"
+#include <functional>
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+// Lokales Koordinatensystem: x = Osten, y = Hoehe (m ue. M.), z = Sueden. Ursprung = Startpunkt.
+struct GeoRef {
+    double lat0 = 0, lon0 = 0, mx0 = 0, my0 = 0, S = 1; // S = Meter pro Mercator-Einheit
+    int gen = 0;
+};
+
+struct RoadSeg {
+    float ax, az, bx, bz, hw, maxspeed;
+    int8_t oneway;
+    uint8_t klass, lanes, marked;
+    int name;
+};
+// Ampel (0), Stoppschild (1), Vorrang geben (2) - jeweils fuer eine Anfahrtsrichtung
+struct Control {
+    Vec3 pos;
+    float dx, dz, hw;
+    int type, group;
+    float phase;
+    bool oneway;
+};
+struct Building {
+    float minx, minz, maxx, maxz;
+    std::vector<float> poly;
+};
+struct RoadHit {
+    bool found = false;
+    float dist = 1e9f, side = 0, dx = 0, dz = -1, px = 0, pz = 0;
+    const RoadSeg* seg = nullptr;
+    std::string name;
+};
+
+class World {
+public:
+    void init(const Config& cfg);
+    void setOrigin(double lat, double lon);
+    void update(Vec3 carPos, double now);
+    bool height(float x, float z, float& h);
+    Vec3 normal(float x, float z);
+    RoadHit nearestRoad(float x, float z, float maxDist);
+    bool insideBuilding(float x, float z);
+    void forControls(Vec3 p, float radius, const std::function<void(const Control&)>& fn);
+    static int signalState(const Control& c, double t); // 0 rot, 1 rot-gelb, 2 gruen, 3 gelb
+    void drawTerrain(int level); // 0 fern, 1 mittel, 2 nah
+    void drawRoads();
+    void drawBuildings();
+    bool ready(Vec3 p, double now);
+    void toLatLon(float x, float z, double& lat, double& lon) const;
+    void toLocal(double lat, double lon, float& x, float& z) const;
+    const GeoRef& geo() const { return g; }
+    std::string attribution() const;
+    int pendingJobs() const;
+    // Selbst gebaute Strassen (Editor) und befahrbare Objekte
+    void setCustomRoads(const std::vector<Vertex>& verts, const std::vector<RoadSeg>& segs);
+    void drawCustomRoads();
+    int roadVersion() const;                          // aendert sich, wenn Strassen nachgeladen/entfernt wurden
+    void collectSegs(std::vector<RoadSeg>& out) const; // alle geladenen Strassenabschnitte (fuer den Verkehr)
+    std::function<bool(float x, float z, float yRef, float& h)> surfaceHook;
+    bool surface(float x, float z, float yRef, float& h); // Gelaende oder hoechste befahrbare Flaeche unter yRef
+    Vec3 surfaceNormal(float x, float z, float yRef);
+    struct Impl;
+
+private:
+    Impl* d = nullptr;
+    GeoRef g;
+};

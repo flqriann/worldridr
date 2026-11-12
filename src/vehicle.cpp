@@ -1,0 +1,277 @@
+#include "vehicle.h"
+#include "world.h"
+
+namespace {
+const float MASS = 1300.0f;
+const Vec3 INERTIA{1900.0f, 2100.0f, 550.0f}; // Nicken (x), Gieren (y), Wanken (z)
+const float R = 0.316f;                       // Radradius
+const float SUS_REST = 0.30f, SUS_MAX = 0.26f;
+const float I_WHEEL = 1.1f, I_ENGINE = 0.23f; // Kurbeltrieb + Zweimassenschwungrad + Kupplung
+const float FINAL = 3.65f;
+const float GEARS[8] = {-3.60f, 0.0f, 3.78f, 2.12f, 1.36f, 1.03f, 0.84f, 0.70f}; // R, N, 1..6
+const float CLUTCH_K = 40.0f, CLUTCH_CAP = 330.0f;
+const float MAX_STEER = 0.56f;
+const float STEER_RATIO = 14.5f;
+const float SR_PEAK = 0.10f, SA_PEAK = 0.14f;
+
+float torqueCurve(float rpm) {
+    static const float pts[][2] = {{0, 60}, {800, 115}, {1500, 200}, {3500, 200}, {5000, 176}, {6000, 142}, {6600, 100}, {7500, 0}};
+    for (int i = 0; i < 7; i++)
+        if (rpm <= pts[i + 1][0]) {
+            float t = (rpm - pts[i][0]) / (pts[i + 1][0] - pts[i][0]);
+            return pts[i][1] + (pts[i + 1][1] - pts[i][1]) * clampv(t, 0.0f, 1.0f);
+        }
+    return 0;
+}
+float clutchEngage(float pedal) {
+    float e = clampv((0.72f - pedal) / 0.42f, 0.0f, 1.0f);
+    return e * std::sqrt(e);
+}
+} // namespace
+
+float Vehicle::wheelRadius() { return R; }
+
+Vehicle::Vehicle() {
+    const float a = 1.10f, b = 1.52f, tw = 0.77f, my = -0.05f;
+    w[0].mount = {-tw, my, -a}; w[1].mount = {tw, my, -a};
+    w[2].mount = {-tw, my, b}; w[3].mount = {tw, my, b};
+    for (int i = 0; i < 4; i++) {
+        w[i].front = i < 2; w[i].driven = i < 2;
+        w[i].k = i < 2 ? 29000.0f : 21000.0f;
+        w[i].c = i < 2 ? 2400.0f : 1750.0f;
+    }
+}
+
+float Vehicle::speed() const { return dot(vel, forward()); }
+
+Vec3 Vehicle::hubLocal(int i) const { return w[i].mount - Vec3{0, SUS_REST - w[i].comp, 0}; }
+
+void Vehicle::place(Vec3 p, float yaw) {
+    pos = p; vel = {}; angVel = {};
+    q = qaxis({0, 1, 0}, yaw);
+    for (Wheel& wh : w) { wh.omega = 0; wh.comp = 0.12f; wh.hasGround = false; }
+}
+
+void Vehicle::shift(int dir) {
+    if (automatic) { selector = clampv(selector + dir, 0, 3); return; }
+    requestGear(clampv(gear + dir, -1, 6));
+}
+
+void Vehicle::requestGear(int g) {
+    if (automatic || g == gear) return;
+    // Ohne getretene Kupplung geht bei laufendem Motor kein Gang rein (bei stehendem Motor und Stillstand schon)
+    bool still = !engineOn && std::fabs(speed()) < 0.5f;
+    if (g != 0 && !autoClutch && clutch < 0.7f && !still) { evGrind = true; return; }
+    if ((g == -1 && speed() > 2.0f) || (g > 0 && speed() < -2.0f)) { evGrind = true; return; }
+    gear = g;
+    if (autoClutch) shiftTimer = 0.28f;
+}
+
+// Automatik-Schaltlogik und automatische Kupplung (Tastatur-Hilfe)
+void Vehicle::logic(float dt) {
+    float r = rpm();
+    shiftTimer = std::max(0.0f, shiftTimer - dt);
+    autoShiftCd = std::max(0.0f, autoShiftCd - dt);
+    if (automatic) {
+        if (selector == 1) gear = -1;
+        else if (selector == 3) {
+            if (speed() < 1.0f) autoGear = 1;
+            if (autoShiftCd <= 0) {
+                if (r > 2300 + 3300 * throttle && autoGear < 6) { autoGear++; autoShiftCd = 0.9f; shiftTimer = 0.2f; }
+                else if (r < 1150 + 1200 * throttle && autoGear > 1) { autoGear--; autoShiftCd = 0.9f; shiftTimer = 0.2f; }
+            }
+            gear = autoGear;
+        } else gear = 0;
+    }
+    if (automatic || autoClutch) {
+        float ratio = GEARS[gear + 1] * FINAL;
+        float inRpm = std::fabs(0.5f * (w[0].omega + w[1].omega) * ratio) * 9.5493f;
+        float want;
+        if (gear == 0 || shiftTimer > 0 || !engineOn) want = 0;
+        else if (inRpm > 1150) want = 1;
+        else {
+            want = clampv((r - 980.0f) / 700.0f, 0.0f, 1.0f);
+            if (automatic && brake < 0.1f) want = std::max(want, 0.07f); // Kriechen
+            if (brake > 0.2f && throttle < 0.05f) want = 0;
+            if (r < 780) want = 0;
+        }
+        autoEngage += clampv(want - autoEngage, -dt * 8.0f, dt * 3.0f);
+    }
+}
+
+void Vehicle::update(float dt, World& world) {
+    evStall = false; // evGrind setzt requestGear(); das Hauptprogramm wertet es aus und loescht es
+    dt = clampv(dt, 0.0f, 0.05f);
+    int grounded = 0;
+    for (Wheel& wh : w) {
+        Vec3 m = pos + qrot(q, wh.mount);
+        float h;
+        float yRef = pos.y - 0.2f; // Stufen bis ca. 35 cm werden ueberfahren, hoehere Kanten sind Hindernisse
+        wh.hasGround = world.surface(m.x, m.z, yRef, h);
+        if (wh.hasGround) {
+            wh.gp = {m.x, h, m.z};
+            wh.gn = world.surfaceNormal(m.x, m.z, yRef);
+            grounded++;
+        }
+        wh.mu = onRoad ? 1.0f : 0.62f;
+        wh.crr = onRoad ? 0.012f : 0.07f;
+    }
+    if (grounded < 4) return; // Gelaende noch nicht geladen: Auto anhalten
+    float gh;
+    if (world.surface(pos.x, pos.z, pos.y - 0.2f, gh) && pos.y < gh - 0.2f) { pos.y = gh + 0.6f; vel.y = 0; }
+
+    float st = steer * MAX_STEER;
+    w[0].steer = w[1].steer = st;
+    logic(dt);
+    int n = std::max(1, (int)std::ceil(dt / 0.001f));
+    float h = dt / n;
+    ffb = 0;
+    Vec3 p0 = pos;
+    for (int i = 0; i < n; i++) substep(h);
+    ffb /= n;
+    odo += length(Vec3{pos.x - p0.x, 0, pos.z - p0.z});
+    for (Wheel& wh : w) wh.rot = std::fmod(wh.rot + wh.omega * dt, 2 * PI);
+}
+
+void Vehicle::substep(float dt) {
+    Vec3 right = qrot(q, {1, 0, 0}), up = qrot(q, {0, 1, 0}), fwd = qrot(q, {0, 0, -1});
+    Vec3 F{0, -MASS * 9.81f, 0}, T{};
+    float sp = length(vel);
+    F += vel * (-0.5f * 1.2f * 0.66f * sp); // Luftwiderstand
+
+    // --- Federung ---
+    float fs[4];
+    Vec3 cp[4];
+    for (int i = 0; i < 4; i++) {
+        Wheel& wh = w[i];
+        fs[i] = 0;
+        wh.contact = false;
+        Vec3 mw = pos + qrot(q, wh.mount);
+        float dn = dot(up, wh.gn);
+        float c = 0;
+        if (dn > 0.25f) {
+            float dist = dot(mw - wh.gp, wh.gn) / dn;
+            c = SUS_REST + R - dist;
+            if (c > 0) {
+                wh.contact = true;
+                float cv = clampv((c - wh.comp) / dt, -4.0f, 4.0f);
+                float f = wh.k * c + wh.c * cv;
+                if (c > SUS_MAX) f += wh.k * 12.0f * (c - SUS_MAX);
+                fs[i] = std::max(f, 0.0f);
+                cp[i] = mw - up * dist;
+            }
+        }
+        wh.comp = wh.contact ? std::min(c, SUS_MAX + 0.08f) : 0.0f;
+    }
+    for (int a = 0; a < 4; a += 2) { // Stabilisatoren
+        float dlt = (w[a].comp - w[a + 1].comp) * (a == 0 ? 12000.0f : 6000.0f);
+        if (w[a].contact) fs[a] = std::max(0.0f, fs[a] + dlt);
+        if (w[a + 1].contact) fs[a + 1] = std::max(0.0f, fs[a + 1] - dlt);
+    }
+
+    // --- Motor und Kupplung ---
+    float ratio = GEARS[gear + 1] * FINAL;
+    float engage = (automatic || autoClutch) ? autoEngage : clutchEngage(clutch);
+    float Tc = 0, Keff = 0;
+    if (ratio != 0 && engage > 0) {
+        float wg = 0.5f * (w[0].omega + w[1].omega) * ratio;
+        float raw = CLUTCH_K * (engW - wg), cap = CLUTCH_CAP * engage;
+        if (std::fabs(raw) > cap) Tc = raw > 0 ? cap : -cap;
+        else { Tc = raw; Keff = CLUTCH_K; }
+    }
+    // Motor (1,4-l-Turbobenziner, 200 Nm / 92 kW):
+    //  - Die Drosselklappe begrenzt den Luftstrom. Bei wenig Gas faellt die Fuellung mit steigender Drehzahl,
+    //    deshalb pendelt sich der Motor ohne Last auf eine zur Pedalstellung passende Drehzahl ein
+    //    (ca. 10 % -> 2000, 15 % -> 3000, 20 % -> 4200 U/min) statt in den Begrenzer zu laufen.
+    //  - Saugrohr (ca. 0,09 s) und Turbolader (0,2 .. 1,1 s je nach Drehzahl) verzoegern den Momentenaufbau.
+    //  - Reib- und Pumpverluste entsprechen ca. 1 .. 2 bar Reibmitteldruck (15 Nm bei 2000, 29 Nm bei 6000 U/min).
+    float r = rpm();
+    float n = std::max(r, 300.0f) / 1000.0f;
+    float fric = 8.0f + 0.0035f * r;
+    float Te;
+    if (engineOn) {
+        float area = 1.2f * throttle + 25.0f * throttle * throttle * throttle;
+        float req = 1.0f - std::exp(-area / n);
+        req = std::max(req, clampv((850.0f - r) * 0.0022f, 0.0f, 0.24f)); // Leerlaufregler mit kleiner Momentenreserve
+        if (r > 6500) req = 0;                                              // Drehzahlbegrenzer
+        manifold += (req - manifold) * std::min(1.0f, dt / 0.09f);
+        float boostTarget = std::max(0.0f, manifold - 0.6f) / 0.4f;
+        float tau = boostTarget < boost ? 0.15f : clampv(1.5f - 0.33f * n, 0.22f, 1.1f);
+        boost += (boostTarget - boost) * std::min(1.0f, dt / tau);
+        float fill = std::min(manifold, 0.6f) + 0.4f * boost;
+        float pump = (1.0f - fill) * (4.0f + 0.0012f * r);                  // Drosselverluste = Motorbremse
+        Te = fill * (torqueCurve(r) + fric) - fric - pump;
+    } else {
+        manifold = boost = 0;
+        Te = -(fric + 4.0f + 0.0012f * r) * clampv(engW / 2.0f, 0.0f, 1.0f);
+        if (starter) Te += 75.0f;
+    }
+
+    // --- Reifen ---
+    for (int i = 0; i < 4; i++) {
+        Wheel& wh = w[i];
+        float Tdrive = wh.driven ? Tc * ratio * 0.5f * 0.93f : 0.0f; // 7 % Verluste in Getriebe und Differential
+        float Dc = wh.driven ? Keff * ratio * ratio : 0.0f;
+        float Fx = 0, Dt = 0;
+        float Tb = brake * (wh.front ? 1900.0f : 1000.0f);
+        if (!wh.front && (handbrake || (automatic && selector == 0))) Tb += 1600.0f;
+        wh.slip = 0;
+        if (wh.contact) {
+            Vec3 nrm = wh.gn;
+            Vec3 hd = fwd * std::cos(wh.steer) + right * std::sin(wh.steer);
+            Vec3 f = normalize(hd - nrm * dot(hd, nrm));
+            Vec3 s = cross(f, nrm);
+            Vec3 rc = cp[i] - pos;
+            Vec3 vc = vel + cross(angVel, rc);
+            float vx = dot(vc, f), vy = dot(vc, s);
+            float den = std::max(std::fabs(vx), 0.5f);
+            float sr = (wh.omega * R - vx) / den;
+            float sa = vy / (std::fabs(vx) + 0.5f);
+            float sx = sr / SR_PEAK, sy = sa / SA_PEAK;
+            float rho = std::sqrt(sx * sx + sy * sy);
+            float mu = wh.mu * clampv(1.12f - 0.1f * fs[i] / 3500.0f, 0.75f, 1.12f);
+            const float B = 1.732f, C = 1.5f;
+            float at = std::atan(B * rho);
+            float cur = std::sin(C * at), dcur = C * B / (1 + B * B * rho * rho) * std::cos(C * at);
+            float Fmax = mu * fs[i], Fy = 0;
+            if (rho > 1e-5f) { Fx = Fmax * cur * sx / rho; Fy = -Fmax * cur * sy / rho; }
+            Dt = R * Fmax * std::max(dcur, 0.0f) / SR_PEAK * R / den;
+            float Frr = -wh.crr * fs[i] * std::tanh(vx * 2.0f);
+            Vec3 Fw = f * (Fx + Frr) + s * Fy + nrm * fs[i];
+            F += Fw;
+            T += cross(rc, Fw);
+            wh.slip = rho;
+            if (wh.front) { // Rueckstellmoment fuer Force Feedback
+                float trail = 0.022f + 0.04f * std::max(0.0f, 1.0f - std::fabs(sy) * 0.8f);
+                ffb += -Fy * trail / STEER_RATIO * 0.25f; // 0.25 = Servounterstuetzung
+            }
+            if (Tb > 0 && vx > 3.0f && sr < -0.2f) Tb *= 0.25f;  // ABS
+            if (Tb > 0 && vx < -3.0f && sr > 0.2f) Tb *= 0.25f;
+        }
+        float Ieff = I_WHEEL + dt * (Dt + Dc);
+        float wn = wh.omega + dt * (Tdrive - R * Fx) / Ieff;
+        float db = Tb * dt / Ieff;
+        if (std::fabs(wn) <= db) wn = 0;
+        else wn -= wn > 0 ? db : -db;
+        wh.omega = wn;
+    }
+
+    // --- Motor ---
+    engW += dt * (Te - Tc) / (I_ENGINE + dt * 2.0f * Keff);
+    if (engW < 0) engW = 0;
+    if (engineOn && engW * 9.5493f < 350.0f) { engineOn = false; evStall = true; }
+    if (!engineOn && starter && engW * 9.5493f > 480.0f) engineOn = true;
+
+    // --- Starrkoerper integrieren ---
+    vel += F * (dt / MASS);
+    Quat qc = qconj(q);
+    Vec3 wb = qrot(qc, angVel), tb = qrot(qc, T);
+    Vec3 Iw{INERTIA.x * wb.x, INERTIA.y * wb.y, INERTIA.z * wb.z};
+    Vec3 gy = cross(wb, Iw);
+    wb += Vec3{(tb.x - gy.x) / INERTIA.x, (tb.y - gy.y) / INERTIA.y, (tb.z - gy.z) / INERTIA.z} * dt;
+    wb = wb * (1.0f - 0.05f * dt);
+    angVel = qrot(q, wb);
+    pos += vel * dt;
+    Quat dq = qmul(Quat{0, angVel.x, angVel.y, angVel.z}, q);
+    q = qnorm({q.w + 0.5f * dt * dq.w, q.x + 0.5f * dt * dq.x, q.y + 0.5f * dt * dq.y, q.z + 0.5f * dt * dq.z});
+}
