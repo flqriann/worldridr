@@ -1,6 +1,7 @@
 // Fussgaenger: laufen auf den Gehsteigen entlang des Strassennetzes, ueberqueren an Kreuzungen die Fahrbahn
 // (Autos der KI halten dafuer an) und werden bei einem Zusammenstoss mit dem Spieler umgestossen.
 #include "game.h"
+#include "ragdoll.h"
 #include <array>
 #include <cstring>
 #include <random>
@@ -26,6 +27,7 @@ struct Ped {
     Vec3 pos;
     Color shirt, pants, skin, hair;
     bool crossing = false, down = false, frozen = false;
+    Ragdoll rag;
     Vec3 cFrom, cTo;
     float cT = 0, cDur = 5, downT = 0;
     int nextEdge = 0;
@@ -163,7 +165,7 @@ void spawn() {
         p.s = s;
         p.side = (rng() & 1) ? 1.0f : -1.0f;
         p.pos = walkTarget(p);
-        float dp = std::hypot(p.pos.x - car.pos.x, p.pos.z - car.pos.z);
+        float dp = std::hypot(p.pos.x - playerPos().x, p.pos.z - playerPos().z);
         if (dp < 25 || dp > 170) continue;
         float h;
         if (!world.surface(p.pos.x, p.pos.z, 1e9f, h)) continue;
@@ -214,8 +216,10 @@ void update(float dt) {
     for (size_t i = 0; i < peds.size();) {
         Ped& p = peds[i];
         float dCar = std::hypot(p.pos.x - car.pos.x, p.pos.z - car.pos.z);
-        if (dCar > 230 || (p.down && p.downT > 10)) { peds.erase(peds.begin() + i); continue; }
-        if (p.down) { p.downT += dt; i++; continue; }
+        if (std::hypot(p.pos.x - playerPos().x, p.pos.z - playerPos().z) > 230 || (p.down && p.downT > 45)) { peds.erase(peds.begin() + i); continue; }
+        if (p.down) { p.rag.step(dt); p.downT += dt; p.pos = p.rag.center(); i++; continue; }
+        { Vec3 hv; if (!p.frozen && traffic::hitTest(p.pos, 0.4f, hv)) { // von einem KI-Auto erfasst
+            p.down = true; p.downT = 0; p.rag.shirt = p.shirt; p.rag.pants = p.pants; p.rag.skin = p.skin; p.rag.hair = p.hair; p.rag.start(p.pos, p.yaw, hv * 0.9f); i++; continue; } }
         if (p.frozen) { p.phase += dt * 4.0f; i++; continue; } // Testfigur
         Vec3 moveDir{0, 0, 0};
         if (p.crossing) {
@@ -257,6 +261,9 @@ void update(float dt) {
             float lat = std::fabs(rel.x * cf.z - rel.z * cf.x) / std::max(0.01f, std::hypot(cf.x, cf.z));
             if (std::fabs(along) < 2.4f && lat < 1.15f && std::fabs(car.speed()) > 1.5f) {
                 p.down = true; p.downT = 0;
+                Vec3 imp = car.vel; float il = length(imp); if (il > 22.0f) imp = imp * (22.0f / il);
+                p.rag.shirt = p.shirt; p.rag.pants = p.pants; p.rag.skin = p.skin; p.rag.hair = p.hair;
+                p.rag.start(p.pos, p.yaw, imp * 0.95f);
                 hud.msgs.push_back({"Fu\xC3\x9Fg\xC3\xA4nger angefahren!", 4.0f});
                 script.event("pedestrian");
                 traffic::offence(2);
@@ -287,6 +294,31 @@ void debugSpawnAhead() {
     peds.push_back(p);
 }
 
+// Figur (Spieler zu Fuss) in einen Batch zeichnen: detailliertes Modell mit Geh-Animation, sonst einfache Koerper
+void appendFigure(Batch& out, Vec3 pos, float yaw, float phase, float swingAmount, Color shirt, Color pants, Color skin, Color hair) {
+    loadPedModel();
+    Mat4 base = fromQuatPos(qaxis({0, 1, 0}, yaw), pos);
+    float sw = std::sin(phase) * 0.55f * swingAmount;
+    if (!pedTris.empty()) {
+        float bob = std::fabs(std::sin(phase)) * 0.025f * swingAmount;
+        Mat4 mb = mul(base, translate({0, bob, 0}));
+        Mat4 mA = mul(mb, mul(translate({0, 0.92f, 0}), mul(rotX(sw), translate({0, -0.92f, 0}))));
+        Mat4 mB = mul(mb, mul(translate({0, 0.92f, 0}), mul(rotX(-sw), translate({0, -0.92f, 0}))));
+        Mat4 armA = mul(mb, mul(translate({0, 1.45f, 0}), mul(rotX(-sw * 0.85f), translate({0, -1.45f, 0}))));
+        Mat4 armB = mul(mb, mul(translate({0, 1.45f, 0}), mul(rotX(sw * 0.85f), translate({0, -1.45f, 0}))));
+        for (const PedTri& t : pedTris) {
+            Color c = t.region == 0 ? skin : t.region == 1 ? shirt : t.region == 2 ? pants : t.region == 3 ? pedShoe : t.region == 4 ? pedSole : hair;
+            const Mat4& m = t.part == 1 ? mA : t.part == 2 ? mB : t.part == 3 ? armA : t.part == 4 ? armB : mb;
+            for (int q = 0; q < 3; q++) out.vert(xformPoint(m, t.p[q]), normalize(xformDir(m, t.n[q])), 0, 0, c);
+        }
+        return;
+    }
+    out.box(base, {0, 1.2f, 0}, {0.19f, 0.31f, 0.11f}, shirt);
+    out.box(base, {-0.09f, 0.45f, 0}, {0.065f, 0.44f, 0.075f}, pants);
+    out.box(base, {0.09f, 0.45f, 0}, {0.065f, 0.44f, 0.075f}, pants);
+    out.box(base, {0, 1.64f, 0}, {0.095f, 0.11f, 0.095f}, skin);
+}
+
 void draw(const Mat4& vp, Vec3 cam, float maxDist) {
     (void)vp;
     pb.clear();
@@ -295,6 +327,7 @@ void draw(const Mat4& vp, Vec3 cam, float maxDist) {
     for (const Ped& p : peds) {
         float d = std::hypot(p.pos.x - cam.x, p.pos.z - cam.z);
         if (d > maxDist) continue;
+        if (p.down) { p.rag.draw(pb); continue; } // Ragdoll nach dem Aufprall
         Mat4 base = fromQuatPos(qaxis({0, 1, 0}, p.yaw), p.pos);
         if (p.down) { // liegt am Boden
             base = mul(base, mul(translate({0, 0.16f, 0}), rotX(-PI / 2)));
@@ -332,6 +365,7 @@ void draw(const Mat4& vp, Vec3 cam, float maxDist) {
         pb.box(base, {0, 1.64f, 0}, {0.095f, 0.11f, 0.095f}, p.skin);
         pb.box(base, {0, 1.72f, -0.01f}, {0.10f, 0.05f, 0.10f}, p.hair);
     }
+    foot::appendToBatch(pb);
     if (pb.v.empty()) return;
     gfxModel(identity());
     gfxBias(0);

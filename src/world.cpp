@@ -226,7 +226,11 @@ static void buildTile(World::Impl* d, GeoRef g, int z, int x, int y) {
             r.v.reserve(cells * cells * 6);
             auto V = [&](int i, int j) {
                 Vec3 q = p[j * n + i];
-                r.v.push_back({{q.x, q.y, q.z}, {0, 1, 0}, {(float)i / cells, (float)j / cells}, Color{}});
+                // Gelaendeneigung aus dem Hoehenmodell: Normale fuer die Schummerung (Hanglicht), sichtbar als Relief
+                Vec3 a = p[j * n + std::max(i - 1, 0)], b = p[j * n + std::min(i + 1, n - 1)], c0 = p[std::max(j - 1, 0) * n + i], d0 = p[std::min(j + 1, n - 1) * n + i];
+                float cx = std::max(0.5f, b.x - a.x), cz = std::max(0.5f, d0.z - c0.z);
+                Vec3 nn = normalize({-cz * (b.y - a.y), cz * cx, -(d0.y - c0.y) * cx});
+                r.v.push_back({{q.x, q.y, q.z}, {nn.x, nn.y, nn.z}, {(float)i / cells, (float)j / cells}, Color{}});
             };
             for (int j = 0; j < cells; j++)
                 for (int i = 0; i < cells; i++) { V(i, j); V(i, j + 1); V(i + 1, j); V(i + 1, j); V(i, j + 1); V(i + 1, j + 1); }
@@ -336,6 +340,31 @@ static void pushBox(std::vector<Vertex>& out, Vec3 c, Vec3 h, float ux, float uz
     quad(P(-1, 1, -1), P(-1, 1, 1), P(1, 1, 1), P(1, 1, -1), Vv);
     quad(P(-1, -1, -1), P(1, -1, -1), P(1, -1, 1), P(-1, -1, 1), -Vv);
 }
+// Baum (Stamm + Krone aus zwei Oktaedern) und Strassenlaterne als einfache Geometrie
+static void pushOcta(std::vector<Vertex>& out, Vec3 c, float rx, float ry, float rz, Color col) {
+    col.a = 0;
+    Vec3 P[6] = {c + Vec3{rx, 0, 0}, c + Vec3{-rx, 0, 0}, c + Vec3{0, ry, 0}, c + Vec3{0, -ry, 0}, c + Vec3{0, 0, rz}, c + Vec3{0, 0, -rz}};
+    static const int F[8][3] = {{0, 2, 4}, {4, 2, 1}, {1, 2, 5}, {5, 2, 0}, {4, 3, 0}, {1, 3, 4}, {5, 3, 1}, {0, 3, 5}};
+    for (auto& f : F) {
+        Vec3 n = normalize(cross(P[f[1]] - P[f[0]], P[f[2]] - P[f[0]]));
+        if (dot(n, P[f[0]] - c) < 0) n = -n;
+        for (int k = 0; k < 3; k++) out.push_back({{P[f[k]].x, P[f[k]].y, P[f[k]].z}, {n.x, n.y, n.z}, {0, 0}, col});
+    }
+}
+static void pushTree(std::vector<Vertex>& out, float x, float gy, float z, float rnd) {
+    static const Color greens[5] = {{58, 108, 50, 255}, {74, 128, 54, 255}, {50, 94, 46, 255}, {96, 138, 58, 255}, {66, 118, 60, 255}};
+    float h = 5.0f + rnd * 4.0f, cr = 1.5f + rnd * 1.1f;
+    pushBox(out, {x, gy + h * 0.28f, z}, {0.11f, h * 0.28f, 0.11f}, 1, 0, Color{84, 64, 46, 255});
+    Color g = greens[(int)(rnd * 4.99f)];
+    pushOcta(out, {x, gy + h * 0.72f, z}, cr, h * 0.30f, cr, g);
+    pushOcta(out, {x, gy + h * 0.92f, z}, cr * 0.7f, h * 0.20f, cr * 0.7f, Color{(uint8_t)(g.r + 10), (uint8_t)(g.g + 12), (uint8_t)(g.b + 6), 255});
+}
+static void pushLamp(std::vector<Vertex>& out, float x, float gy, float z, float dx, float dz) {
+    pushBox(out, {x, gy + 2.6f, z}, {0.05f, 2.6f, 0.05f}, 1, 0, Color{92, 94, 100, 255});
+    pushBox(out, {x + dx * 0.55f, gy + 5.15f, z + dz * 0.55f}, {0.62f, 0.05f, 0.05f}, dx, dz, Color{92, 94, 100, 255});
+    pushBox(out, {x + dx * 1.1f, gy + 5.05f, z + dz * 1.1f}, {0.22f, 0.06f, 0.12f}, dx, dz, Color{232, 228, 200, 255});
+}
+
 static Color brandColor(const std::string& nm, bool fuel) {
     std::string n;
     for (char c : nm) n += (char)tolower((unsigned char)c);
@@ -1041,6 +1070,9 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
         // Erst alle Gehsteige, dann aller Asphalt: so schneidet kein Gehsteig die Einmuendung einer Seitenstrasse ab.
         std::stable_sort(ways.begin(), ways.end(), [](const WayTmp& a, const WayTmp& b) { return a.klass > b.klass; });
         std::vector<Vertex> sideV, asphV;
+        int treeCount = 0, lampCount = 0;
+        struct JN { float x, z, hw; };
+        std::unordered_map<int64_t, JN> jmap;
         for (const WayTmp& w : ways) {
             int n = (int)w.px.size();
             // ----- Linie glaetten: Ecken werden mit quadratischen Kurven gerundet, Kreuzungsknoten bleiben exakt -----
@@ -1116,6 +1148,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
             rx.push_back(sx[sn - 1]); rz.push_back(sz[sn - 1]); rd.push_back(dist);
             int m = (int)rx.size();
             bool hasSw = (w.flags & 8) != 0;
+            if ((int)w.nodes.size() == n) for (int i = 0; i < n; i++) if (junction[w.nodes[i]] >= 3 && !w.ring) { JN& jn = jmap[w.nodes[i]]; jn.x = w.px[i]; jn.z = w.pz[i]; jn.hw = std::max(jn.hw, w.hw); }
             float hwq = std::min(255.0f, w.hw * 10.0f) / 10.0f;
             auto ribbon = [&](float half, int flags, std::vector<Vertex>& dst) {
                 Color col{(uint8_t)w.lanes, (uint8_t)flags, (uint8_t)w.klass, (uint8_t)std::min(255.0f, w.hw * 10.0f)};
@@ -1148,6 +1181,40 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
             };
             if (hasSw) ribbon(hwq + 1.9f, w.flags | 16, sideV);
             ribbon(hasSw ? hwq + 0.15f : hwq, w.flags, asphV);
+            // ----- Strassenbaeume und Laternen entlang der Gehsteige -----
+            if (w.klass >= 2 && w.klass <= 5 && !w.ring && m >= 2) {
+                float nextTree = 8.0f + hash2((int)(w.id & 0xFFFF), 3) * 20.0f, nextLamp = 12.0f + hash2((int)(w.id & 0xFFFF), 7) * 30.0f;
+                int sideT = (int)(w.id & 1) ? 1 : -1, sideL = -sideT;
+                for (int k = 0; k + 1 < m; k++) {
+                    float tx = rx[k + 1] - rx[k], tz = rz[k + 1] - rz[k], tl = std::hypot(tx, tz);
+                    if (tl < 0.01f) continue;
+                    tx /= tl; tz /= tl;
+                    float nx = -tz, nz = tx;
+                    while (rd[k] >= nextTree && (hasSw || w.klass >= 4)) {
+                        float off = hwq + (hasSw ? 1.0f : 3.2f);
+                        float px2 = rx[k] + nx * off * sideT, pz2 = rz[k] + nz * off * sideT;
+                        nextTree += (w.klass >= 4 ? 17.0f : 26.0f) + hash2((int)(px2 * 2), (int)(pz2 * 2)) * 8.0f;
+                        sideT = -sideT;
+                        if (!inside(px2, pz2) || treeCount > 1600) continue;
+                        bool inB = false;
+                        for (const Building& bb : r.buildings) { if (px2 < bb.minx - 1 || px2 > bb.maxx + 1 || pz2 < bb.minz - 1 || pz2 > bb.maxz + 1) continue; if (pointInPoly(bb.poly, px2, pz2)) { inB = true; break; } }
+                        if (inB) continue;
+                        if (w.klass <= 3 && hash2((int)(px2), (int)(pz2)) < 0.55f) continue; // grosse Strassen: weniger Baeume
+                        pushTree(r.bldV, px2, H(px2, pz2), pz2, hash2((int)(px2 * 5), (int)(pz2 * 5)));
+                        treeCount++;
+                    }
+                    while (rd[k] >= nextLamp) {
+                        float off = hwq + (hasSw ? 0.7f : 1.2f);
+                        float sg = (float)sideL;
+                        float px2 = rx[k] + nx * off * sg, pz2 = rz[k] + nz * off * sg;
+                        nextLamp += 38.0f;
+                        sideL = -sideL;
+                        if (!inside(px2, pz2) || lampCount > 1200) continue;
+                        pushLamp(r.bldV, px2, H(px2, pz2), pz2, -nx * sg, -nz * sg);
+                        lampCount++;
+                    }
+                }
+            }
             if (w.ring && !rgroups[w.ringGroup].done) { // Mittelinsel (einmal je Kreisverkehr): Rasen mit Bordstein, fuer Fahrzeuge ein Hindernis
                 RingGroup& rg = rgroups[w.ringGroup];
                 rg.done = true;
@@ -1203,6 +1270,21 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                 else if (i == 0) add(-1);
                 else if (i == n - 1) add(1);
                 else add(i < n - 1 - i ? -1 : 1);
+            }
+        }
+        { // Kreuzungen: Asphaltscheibe ueber den Strassenenden (saubere Einmuendungen, keine Linien quer durch die Kreuzung)
+            for (auto& kv : jmap) {
+                float Rj = std::min(24.0f, kv.second.hw * 1.2f + 0.7f);
+                Color jc{1, 0, 3, (uint8_t)std::min(255.0f, Rj * 10.0f)};
+                const int NJ = 20;
+                auto JV = [&](float x, float z, float lat) { asphV.push_back({{x, H(x, z) + 0.035f, z}, {0, 1, 0}, {lat, 0}, jc}); };
+                for (int i = 0; i < NJ; i++) {
+                    float a0 = i * 2 * PI / NJ, a1 = (i + 1) * 2 * PI / NJ;
+                    if (!inside(kv.second.x, kv.second.z)) break;
+                    JV(kv.second.x, kv.second.z, 0);
+                    JV(kv.second.x + std::cos(a0) * Rj, kv.second.z + std::sin(a0) * Rj, Rj);
+                    JV(kv.second.x + std::cos(a1) * Rj, kv.second.z + std::sin(a1) * Rj, Rj);
+                }
             }
         }
         { // Tankstellen und Supermaerkte: Eintraege fuer das Spiel und einfache Modelle (Dach mit Zapfsaeulen, Werbesaeule)

@@ -119,7 +119,7 @@ void rebuildLocal() {
 void project() {
     int n = (int)rx.size();
     if (n < 2) return;
-    Vec3 p = car.pos;
+    Vec3 p = playerPos();
     auto scan = [&](int a, int b, float& bd, int& bi, float& bt) {
         for (int i = a; i < b; i++) {
             float vx = rx[i + 1] - rx[i], vz = rz[i + 1] - rz[i], l2 = vx * vx + vz * vz;
@@ -242,12 +242,12 @@ void buildMinimap(float W, float H) {
     if (range <= 0) return;
     const float R = 108;
     float cx = W - R - 24, cy = H - R - 34, k = R / range;
-    Vec3 fw = car.forward();
+    Vec3 fw = playerForward();
     float fl = std::hypot(fw.x, fw.z);
     float fx = fl > 1e-4f ? fw.x / fl : 0, fz = fl > 1e-4f ? fw.z / fl : -1;
     float rxv = -fz, rzv = fx;
     auto toS = [&](float wx, float wz, float& sx, float& sy) {
-        float dx = wx - car.pos.x, dz = wz - car.pos.z;
+        float dx = wx - playerPos().x, dz = wz - playerPos().z;
         sx = (dx * rxv + dz * rzv) * k;
         sy = -(dx * fx + dz * fz) * k;
     };
@@ -262,7 +262,7 @@ void buildMinimap(float W, float H) {
     // Gebaeude
     float reach = range * 1.15f;
     int drawn = 0;
-    world.forBuildingsNear(car.pos.x, car.pos.z, reach, [&](const Building& b) {
+    world.forBuildingsNear(playerPos().x, playerPos().z, reach, [&](const Building& b) {
         if (drawn > 900) return;
         size_t n = b.poly.size() / 2;
         for (size_t i = 0; i < n; i++) {
@@ -274,7 +274,7 @@ void buildMinimap(float W, float H) {
     // Strassen: erst alle Raender, dann alle Flaechen (kleine zuerst)
     std::vector<RoadSeg> cls[8];
     int cnt = 0;
-    world.forSegmentsNear(car.pos.x, car.pos.z, reach, [&](const RoadSeg& s) {
+    world.forSegmentsNear(playerPos().x, playerPos().z, reach, [&](const RoadSeg& s) {
         if (cnt > 9000) return;
         int kl = std::min<int>(s.klass, 7);
         if (range > 300 && kl >= 7) return;
@@ -297,7 +297,7 @@ void buildMinimap(float W, float H) {
         for (int pass = 0; pass < 2; pass++)
             for (size_t i = 0; i + 1 < rx.size(); i++) {
                 if (cum[i + 1] < along - 40) continue;
-                if (std::fabs(rx[i] - car.pos.x) > reach * 1.5f && std::fabs(rx[i + 1] - car.pos.x) > reach * 1.5f) continue;
+                if (std::fabs(rx[i] - playerPos().x) > reach * 1.5f && std::fabs(rx[i + 1] - playerPos().x) > reach * 1.5f) continue;
                 if (pass == 0) line(rx[i], rz[i], rx[i + 1], rz[i + 1], 8.5f, Color{255, 255, 255, 255});
                 else line(rx[i], rz[i], rx[i + 1], rz[i + 1], 5.5f, approx ? Color{255, 170, 60, 255} : Color{38, 132, 255, 255});
             }
@@ -456,7 +456,7 @@ void drawWorld() {
     world.toLocal(dLat, dLon, tx, tz);
     if (routed && rx.size() >= 2 && builtGen == world.geo().gen) {
         int n = (int)rx.size();
-        auto height = [&](float x, float z) { float h; return world.height(x, z, h) ? h : car.pos.y - 0.5f; };
+        auto height = [&](float x, float z) { float h; return world.height(x, z, h) ? h : playerPos().y - 0.5f; };
         // Punkte alle ~4 m von knapp hinter dem Auto bis 450 m voraus
         std::vector<Vec3> pts;
         float d = std::max(0.0f, along - 6), end = std::min(total, along + 450);
@@ -479,8 +479,8 @@ void drawWorld() {
         }
     }
     float h = 0;
-    if (!world.height(tx, tz, h)) h = car.pos.y;
-    if (std::hypot(tx - car.pos.x, tz - car.pos.z) < 2500) { // Zielsaeule
+    if (!world.height(tx, tz, h)) h = playerPos().y;
+    if (std::hypot(tx - playerPos().x, tz - playerPos().z) < 2500) { // Zielsaeule
         Mat4 I = identity();
         ribbon.box(I, {tx, h + 20, tz}, {0.5f, 20, 0.5f}, Color{238, 70, 60, 150});
         ribbon.box(I, {tx, h + 41, tz}, {1.6f, 1.0f, 1.6f}, Color{255, 255, 255, 190});

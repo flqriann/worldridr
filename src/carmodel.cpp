@@ -215,7 +215,7 @@ struct ObjCar {
     bool tried = false, ok = false, hasWheels = false, hasPaint = false, hasLamps = false;
     int tris = 0;
     std::vector<LampTri> lamps;   // Leuchtflaechen (Brems-, Blink-, Rueckfahr-, Scheinwerferlicht)
-    Mesh paint, body, wheel[4];   // Karosserie-Lack (einfaerbbar), Rest, Raeder (VL, VR, HL, HR)
+    Mesh paint, body, wheel[4], glass;   // Karosserie-Lack (einfaerbbar), Rest, Raeder (VL, VR, HL, HR), Fensterglas (durchsichtig)
     Vec3 wc[4];                   // Radmittelpunkte
     Vec3 lo, hi;                  // Abmessungen im Autokoordinatensystem (Vorwaerts = -z, Boden = -0.525)
     Color ref{176, 28, 34, 255};  // Originalfarbe des Lacks
@@ -524,7 +524,7 @@ bool loadObjCar(ObjCar& m) {
         }
     }
 
-    Batch paint, body, wheel[4];
+    Batch paint, body, wheel[4], glassB;
     m.lamps.clear();
     for (size_t i = 0; i < faces.size(); i++) {
         const Face& fc = faces[i];
@@ -533,7 +533,15 @@ bool loadObjCar(ObjCar& m) {
         bool inWheel = k >= 0 && wheelsOk;
         if (inWheel) dst = &wheel[k];
         else if (isPaint[i] && m.hasPaint) dst = &paint;
+        {   // Fensterglas: Materialname oder helles, kaum gesaettigtes Blau der Farbtextur; wird durchsichtig gezeichnet
+            float gh, gs, gv;
+            rgbToHsv(fcol[i], gh, gs, gv);
+            bool nameGlass = fc.mat >= 0 && (has(lower(mats[fc.mat].name), "glass") || has(lower(mats[fc.mat].name), "window"));
+            bool colGlass = gv > 0.8f && gs > 0.06f && gs < 0.4f && gh > 195 && gh < 240;
+            if (!inWheel && (nameGlass || colGlass)) dst = &glassB;
+        }
         Color c = fcol[i];
+        if (dst == &glassB) c = Color{58, 78, 98, 120};
         if (dst == &paint) {
             c = Color{(uint8_t)std::min(255.0f, c.r / (m.ref.r * 1.4f + 1.0f) * 255.0f), (uint8_t)std::min(255.0f, c.g / (m.ref.g * 1.4f + 1.0f) * 255.0f),
                       (uint8_t)std::min(255.0f, c.b / (m.ref.b * 1.4f + 1.0f) * 255.0f), 255};
@@ -563,6 +571,7 @@ bool loadObjCar(ObjCar& m) {
     }
     m.paint.create(paint.v.data(), (int)paint.v.size());
     m.body.create(body.v.data(), (int)body.v.size());
+    m.glass.create(glassB.v.data(), (int)glassB.v.size());
     for (int i = 0; i < 4; i++) m.wheel[i].create(wheel[i].v.data(), (int)wheel[i].v.size());
     m.hasWheels = wheelsOk;
     m.hasLamps = !m.lamps.empty();
@@ -602,6 +611,35 @@ int carModelCount() { return (int)objCars.size(); }
 const std::string& carModelName(int i) { static const std::string builtin = "Eigenbau"; return i >= 0 && i < (int)objCars.size() ? objCars[i].name : builtin; }
 int carModelFind(const std::string& name) { for (int i = 0; i < (int)objCars.size(); i++) if (objCars[i].name == name) return i; return -1; }
 void carModelCycle() { carModelSel++; if (carModelSel >= (int)objCars.size()) carModelSel = -1; }
+
+// ---------- Insassen: Fahrer (und Beifahrer) mit Kopf, Oberkoerper, Armen; wackeln mit der Fahrdynamik ----------
+static Batch occB;
+static void drawOccupants(const CarVisual& v) {
+    if (!v.driver && !v.passenger) return;
+    occB.clear();
+    Color skin{232, 188, 158, 255}, hair{58, 40, 30, 255}, pants{40, 46, 66, 255};
+    auto person = [&](float sx, Color shirt, float yaw, float pitch, bool hands) {
+        float cx = sx + v.occX * 0.5f, cz = 0.33f + v.occZ * 0.5f;
+        occB.box(I4, {sx, -0.03f, 0.30f}, {0.15f, 0.06f, 0.20f}, pants);          // Becken
+        occB.box(I4, {sx, -0.16f, -0.02f}, {0.12f, 0.05f, 0.30f}, pants);         // Oberschenkel nach vorn
+        occB.box(I4, {cx, 0.27f, cz}, {0.17f, 0.26f, 0.10f}, shirt);              // Oberkoerper
+        Mat4 hm = mul(translate({sx + v.occX, 0.76f, 0.31f + v.occZ}), mul(rY(yaw), rX(pitch)));
+        occB.box(hm, {0, 0, 0}, {0.10f, 0.115f, 0.10f}, skin);                      // Kopf
+        occB.box(hm, {0, 0.085f, 0.005f}, {0.105f, 0.04f, 0.105f}, hair);
+        occB.box(hm, {0, 0.0f, -0.10f}, {0.02f, 0.02f, 0.015f}, skin);              // Nase
+        for (float s : {-1.0f, 1.0f}) {
+            Vec3 sh{cx + s * 0.20f, 0.48f, cz - 0.02f};
+            Vec3 hand = hands ? Vec3{sx + s * 0.15f, 0.20f, -0.28f} : Vec3{cx + s * 0.22f, 0.12f, cz - 0.20f};
+            occB.beam(I4, sh, (sh + hand) * 0.5f + Vec3{s * 0.04f, -0.06f, 0}, 0.04f, shirt);
+            occB.beam(I4, (sh + hand) * 0.5f + Vec3{s * 0.04f, -0.06f, 0}, hand, 0.035f, skin);
+        }
+    };
+    if (v.driver) person(-0.38f, v.occShirt, v.headYaw, v.headPitch, true);
+    if (v.passenger) person(0.38f, Color{(uint8_t)(255 - v.occShirt.r / 2), (uint8_t)(v.occShirt.b), (uint8_t)(v.occShirt.g), 255}, -v.headYaw * 0.5f, 0, false);
+    gfxModel(v.M);
+    gfxMode(0, FLAG_LIT | FLAG_FOG);
+    occB.draw();
+}
 
 static void drawObjCar(const CarVisual& v, const Mat4& vp, ObjCar& m) {
     gfxMVP(vp);
@@ -674,6 +712,17 @@ static void drawObjCar(const CarVisual& v, const Mat4& vp, ObjCar& m) {
     gfxModel(v.M);
     gfxMode(0, FLAG_FOG);
     dynGlow.draw();
+    drawOccupants(v);
+    if (m.glass.count > 0) { // Fensterglas durchsichtig ueber den Insassen
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDepthMask(GL_FALSE);
+        gfxModel(v.M);
+        gfxMode(0, FLAG_LIT | FLAG_FOG | FLAG_GLOSS);
+        m.glass.draw();
+        glDepthMask(GL_TRUE);
+        glDisable(GL_BLEND);
+    }
     gfxModel(I4);
 }
 
@@ -960,6 +1009,7 @@ void carDraw(const CarVisual& vIn, const Mat4& vp, bool cockpit, const DashState
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);
     } else {
+        drawOccupants(v);
         glEnable(GL_BLEND);
         gfxMode(0, FLAG_LIT | FLAG_FOG | FLAG_GLOSS);
         mGlass.draw();
@@ -1021,6 +1071,33 @@ void carPreviewDraw(int x, int y, int w, int h, float yaw) {
     carOwnPaint(v);
     carDraw(v, vp, false, nullptr);
     glDisable(GL_SCISSOR_TEST);
+}
+
+// Vorschaubild eines Katalog-Eintrags (modelIdx: Index in die Autoliste, -1 = Eigenbau; kind: 0 Auto, 1 Moped, 2 Motorrad) in ein Ziel rendern
+void carThumbRender(Target& t, int modelIdx, int kind) {
+    if (!t.fbo) t.create(192, 108);
+    glBindFramebuffer(GL_FRAMEBUFFER, t.fbo);
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, t.w, t.h);
+    glClearColor(0.11f, 0.13f, 0.17f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glClearColor(0, 0, 0, 1);
+    Vec3 cam{0, kind > 0 ? 1.0f : 1.7f, kind > 0 ? 5.6f : 10.2f};
+    Mat4 vp = mul(perspective(0.50f, (float)t.w / t.h, 0.1f, 200.0f), rigidInverse(mul(translate(cam), rX(-0.17f))));
+    gfxCamera(cam, invert(vp));
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    gfxMVP(vp);
+    gfxModel(I4);
+    gfxBias(0);
+    CarVisual v;
+    v.M = fromQuatPos(qaxis({0, 1, 0}, 0.75f), {0, 0, 0});
+    v.kind = kind;
+    v.model = modelIdx;
+    v.lights = true;
+    carOwnPaint(v);
+    carDraw(v, vp, false, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
 int vehKind = 0;

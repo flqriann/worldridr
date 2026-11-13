@@ -132,6 +132,20 @@ auf Bremse, Blinker, Licht und Rückwärtsgang. Das Fußgängermodell liegt in `
   Modell mit Fahrer, neigt sich in Kurven; im Cockpit sitzt du hinter dem Lenker. Auf der Straße fahren auch KI-Mopeds und -Motorräder.
 - **Kreisverkehre** sind ein eigenes Modell: glatter Ring, Mittelinsel mit Bordstein (für Fahrzeuge ein Hindernis), Fußgänger laufen nur außen.
 - Entwicklungsbau: Läuft das Spiel noch, ist `worldridr.exe` gesperrt. Mit `set WR_SUFFIX=_dev` vor `build.bat` entsteht `build\worldridr_dev.exe`.
+
+## Zu Fuß, Auto sperren, Tastenbelegung, Motor
+
+- **Aussteigen/Einsteigen: O** (Auto muss stehen). Zu Fuß: WASD (relativ zur Kamera), Shift rennt, rechte Maustaste dreht die Kamera. **Y** sperrt
+  das Auto zu bzw. auf (Warnblinker-Quittung, funktioniert bis 30 m); ein abgesperrtes Auto lässt sich nicht betreten.
+- **Angefahren werden:** Fahrzeuge (und du als Fußgänger) werden bei einem Aufprall zu Ragdolls mit Verlet-Physik: sie fliegen, überschlagen sich und
+  rutschen aus. Als Fußgänger wird dir danach schwarz, du stehst an der Stelle wieder auf.
+- **Tastenbelegung:** Einstellungen → „Tasten belegen“: Aktion anklicken, neue Taste drücken, „Alle auf Standard“ setzt zurück.
+- **Motor:** Einstellungen → Motor Benzin/Diesel. Der Diesel hat viel Drehmoment im Leerlauf und rollt nur mit der Kupplung los; der Benziner hat einen
+  Leerlaufregler mit begrenzter Reserve und würgt bei zu schnellem Einkuppeln verzögert ab. Die Kupplung hat einen Schleifpunkt.
+- **Polizei:** Sie reagiert nur auf Verstöße, die eine Streife in der Nähe (≤ 55–80 m, freie Sicht) wirklich sehen konnte. Dann fährt sie unauffällig
+  hinterher (kein Blaulicht), überholt irgendwann mit Blaulicht und fährt rechts ran, um dich zum Anhalten zu bringen.
+- **Insassen:** Fahrer (und teils Beifahrer) sitzen in den Autos und wackeln mit Beschleunigung und Kurven; dein Fahrer dreht den Kopf mit der
+  Kamera bzw. dem VR-Headset. **Bäume, Laternen, Kreuzungsflächen und Hangschummerung** beleben Straßen und Gelände.
 ## Verkehr
 
 KI-Fahrzeuge fahren auf dem echten Straßennetz und auf selbst gebauten Straßen. Sie halten Abstand, halten an

@@ -37,6 +37,8 @@ struct Vehicle {
     Vehicle();
     int kind = 0;               // 0 Auto, 1 Moped, 2 Motorrad
     void setKind(int k);
+    int engineType = 0;         // 0 Benzin, 1 Diesel (nur Auto)
+    void setEngine(int e);
     float rpm() const { return engW * 9.5493f; }
     float speed() const; // m/s vorwaerts (negativ = rueckwaerts)
     Vec3 forward() const { return qrot(q, {0, 0, -1}); }

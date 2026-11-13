@@ -154,7 +154,7 @@ struct Config {
     int peds = 10;    // Anzahl Fussgaenger in der Umgebung (0 = aus)
     int quality = 1;  // 0 niedrig, 1 mittel, 2 hoch
     float renderScale = 0.85f, bldDist = 800, roadDist = 1000;
-    bool msaa = false, police = true, faultPoints = false, minimap = true, mapQuestions = true;
+    bool msaa = false, police = true, faultPoints = false, minimap = true, mapQuestions = true, diesel = false;
     int hudMode = 0;  // 0 ruhig, 1 normal
     bool server = false;
     WheelCfg wheel;

@@ -32,8 +32,22 @@ struct CarVisual {
     bool siren = false;         // Blaulicht (Polizei im Einsatz)
     int kind = 0;               // 0 Auto, 1 Moped, 2 Motorrad
     float lean = 0;             // Schraeglage (rad), nur Zweiraeder
+    bool driver = false, passenger = false;       // Insassen (Ragdoll-artig, wackeln mit der Fahrdynamik)
+    float occX = 0, occZ = 0;   // Auslenkung des Oberkoerpers (m): seitlich / laengs (Fahrzeug-z)
+    float headYaw = 0, headPitch = 0;             // Kopfdrehung des Fahrers (VR-Kopf oder Kamera)
+    Color occShirt{70, 100, 170, 255};
 };
 constexpr int MODEL_SELECTED = -2, MODEL_BUILTIN = -1;
+// Gefederter Insasse: Feder-Daempfer, wird von der Beschleunigung ausgelenkt
+struct Sway {
+    float x = 0, v = 0;
+    void step(float accel, float dt) {
+        dt = std::min(dt, 0.033f);
+        float acc = -accel * 0.9f - 48.0f * x - 7.0f * v;
+        v += acc * dt; x += v * dt;
+        x = x > 0.18f ? 0.18f : (x < -0.18f ? -0.18f : x);
+    }
+};
 // .obj-Autos aus assets/cars (Wavefront OBJ + MTL + Farbtextur, Raeder als eigene Gruppen "wheel-front-left" ...)
 int carModelCount();
 const std::string& carModelName(int i);
@@ -46,6 +60,7 @@ extern bool carColorSet;                       // Spielerfarbe gesetzt (sonst Or
 extern uint8_t carColor[3];
 void carOwnPaint(CarVisual& v);               // Spielerfarbe auf ein CarVisual anwenden
 void carPreviewDraw(int x, int y, int w, int h, float yaw);   // 3D-Vorschau des gewaehlten Autos (Pixelrechteck)
+void carThumbRender(Target& t, int modelIdx, int kind);   // Vorschaubild eines Katalog-Eintrags
 struct DashState {
     float kmh = 0, rpm = 0, steerInput = 0, odoKm = 0;
     int gear = 0, selector = 0, limit = 0;
@@ -110,6 +125,7 @@ int count();
 std::string policeStatus();   // Hinweis fuer die Anzeige ("Polizei: Bitte anhalten"), sonst leer
 bool policeActive();
 void offence(int kind);       // Verstoss melden: 0 rote Ampel, 1 Stoppschild, 2 Unfall
+bool hitTest(Vec3 p, float r, Vec3& vel);   // erfasst ein fahrendes KI-Auto diesen Punkt? (vel = Autogeschwindigkeit)
 float sirenLevel();           // Lautstaerke der naechsten Sirene 0..1
 void policeMarks(std::vector<std::pair<Vec3, bool>>& out);  // Polizeiautos (Position, im Einsatz) fuer die Minimap
 }
@@ -129,11 +145,32 @@ void buildHUD();
 }
 
 // ---------- Fussgaenger ----------
+// ---------- Zu Fuss, Ragdoll, Auto sperren ----------
+namespace foot {
+extern bool on, locked;
+extern Vec3 pos;
+extern float yaw, camYaw;
+void exitCar();
+void enterCar();
+void toggleLock();
+void update(float dt);
+Mat4 camera();
+float fade();                 // 0..1 schwarzer Bildschirm
+bool incapacitated();
+bool lockBlink();
+std::string prompt();
+void appendToBatch(Batch& b);
+void debugHit();
+}
+Vec3 playerPos();             // Spieler zu Fuss oder Auto
+Vec3 playerForward();
+
 namespace ped {
 extern int wanted;                                           // gewuenschte Anzahl (0 = aus)
 void update(float dt);
 void draw(const Mat4& vp, Vec3 cam, float maxDist);
 void crossing(std::vector<std::pair<Vec3, Vec3>>& out);    // Fussgaenger auf der Fahrbahn (Position, Richtung)
+void appendFigure(Batch& out, Vec3 pos, float yaw, float phase, float swingAmount, Color shirt, Color pants, Color skin, Color hair);
 int count();
 void debugSpawnAhead();
 }

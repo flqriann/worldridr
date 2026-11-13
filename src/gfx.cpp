@@ -79,6 +79,8 @@ void main(){
     float d=length(vW-uCam);
     if(uQ>0){ float n=vnoise(vW.xz*2.3)*0.5+vnoise(vW.xz*9.0)*0.35+vnoise(vW.xz*31.0)*0.15;
     c*=mix(1.0, 0.80+0.40*n, clamp(1.0-d/90.0,0.0,1.0)); }
+    // Hangschummerung aus dem Hoehenmodell: Sonnenseiten heller, Schattenhaenge dunkler (Gelaenderelief)
+    c*=mix(1.0, (0.58+0.62*max(dot(nn,uSun),0.0))/1.03, 0.9);
     o=vec4(fog(c),1.0); return;
   }
   if(uMode==2){

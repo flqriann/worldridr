@@ -1,4 +1,5 @@
 #include "input.h"
+#include "keys.h"
 #include <cstring>
 
 void Input::init(const WheelCfg& c) {
@@ -71,19 +72,17 @@ void Input::handleEvent(const SDL_Event& e, bool typing) {
         else if (b == cfg.bCamera) camera = true;
         else if (b == cfg.bReset) reset = true;
     } else if (e.type == SDL_EVENT_KEY_DOWN && !typing && !e.key.repeat) {
-        switch (e.key.key) {
-        case SDLK_LSHIFT: case SDLK_RSHIFT: case SDLK_PAGEUP: shiftUp = true; break;
-        case SDLK_LCTRL: case SDLK_RCTRL: case SDLK_PAGEDOWN: shiftDown = true; break;
-        case SDLK_SPACE: handbrake = true; break;
-        case SDLK_Q: blinkL = true; break;
-        case SDLK_E: blinkR = true; break;
-        case SDLK_F: hazard = true; break;
-        case SDLK_L: lights = true; break;
-        case SDLK_G: belt = true; break;
-        case SDLK_R: reset = true; break;
-        case SDLK_V: camera = true; break;
-        default: break;
-        }
+        SDL_Keycode k = e.key.key;
+        if (keys::is(A_SHIFTUP, k)) shiftUp = true;
+        else if (keys::is(A_SHIFTDOWN, k)) shiftDown = true;
+        else if (keys::is(A_HANDBRAKE, k)) handbrake = true;
+        else if (keys::is(A_BLINK_L, k)) blinkL = true;
+        else if (keys::is(A_BLINK_R, k)) blinkR = true;
+        else if (keys::is(A_HAZARD, k)) hazard = true;
+        else if (keys::is(A_LIGHTS, k)) lights = true;
+        else if (keys::is(A_BELT, k)) belt = true;
+        else if (keys::is(A_RESET, k)) reset = true;
+        else if (keys::is(A_CAMERA, k)) camera = true;
     }
 }
 
@@ -102,20 +101,21 @@ float Input::pedal(int axis) {
 
 void Input::update(float dt, float speedMs, bool typing) {
     const bool* k = SDL_GetKeyboardState(nullptr);
-    auto key = [&](SDL_Scancode s) { return !typing && k[s]; };
+    (void)k;
+    auto key = [&](Act a) { return !typing && keys::held(a); };
     // Tastatur: weiches, geschwindigkeitsabhaengiges Lenken
-    float target = (key(SDL_SCANCODE_D) || key(SDL_SCANCODE_RIGHT) ? 1.0f : 0.0f) - (key(SDL_SCANCODE_A) || key(SDL_SCANCODE_LEFT) ? 1.0f : 0.0f);
+    float target = (key(A_RIGHT) ? 1.0f : 0.0f) - (key(A_LEFT) ? 1.0f : 0.0f);
     float kmh = std::fabs(speedMs) * 3.6f;
     target *= 1.0f / (1.0f + (kmh / 45.0f) * (kmh / 45.0f));
     float rate = (std::fabs(target) < std::fabs(kbSteer) || target * kbSteer < 0) ? 3.0f : 1.4f;
     kbSteer += clampv(target - kbSteer, -rate * dt, rate * dt);
     auto ramp = [&](float& v, bool on, float up, float down) { v = clampv(v + (on ? up : -down) * dt, 0.0f, 1.0f); };
-    ramp(kbThrottle, key(SDL_SCANCODE_W) || key(SDL_SCANCODE_UP), 1.6f, 4.0f);
-    ramp(kbBrake, key(SDL_SCANCODE_S) || key(SDL_SCANCODE_DOWN), 2.2f, 6.0f);
-    ramp(kbClutch, key(SDL_SCANCODE_X), 6.0f, 1.1f);
+    ramp(kbThrottle, key(A_THROTTLE), 1.6f, 4.0f);
+    ramp(kbBrake, key(A_BRAKE), 2.2f, 6.0f);
+    ramp(kbClutch, key(A_CLUTCH), 6.0f, 1.1f);
     steer = kbSteer; throttle = kbThrottle; brake = kbBrake; clutch = kbClutch;
-    horn = key(SDL_SCANCODE_H);
-    starter = key(SDL_SCANCODE_I);
+    horn = key(A_HORN);
+    starter = key(A_IGNITION);
     lookYaw = 0;
     buttons = 0;
     if (joy) {

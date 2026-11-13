@@ -13,13 +13,18 @@ float CLUTCH_K = 40.0f, CLUTCH_CAP = 330.0f;
 float MAX_STEER = 0.56f;
 // weitere Fahrzeugparameter (Auto / Moped / Motorrad), siehe Vehicle::setKind
 float TQ = 1.0f, RPMK = 1.0f, IDLE = 850.0f, RLIMIT = 6500.0f, STALL = 350.0f, START = 480.0f, BRAKE_F = 1900.0f, BRAKE_R = 1000.0f, BRAKE_H = 1600.0f;
+int ENG = 0;                 // 0 Benzin (Turbo), 1 Diesel (Turbo)
+float IDLEAUTH = 0.28f, STALLT = 0.35f, stallTimer = 0.0f, FRICK = 1.0f;
 float STAB_F = 12000.0f, STAB_R = 6000.0f, MUN = 3500.0f, CDA = 0.66f, TWIDTH = 0.77f, ZF = 1.10f, ZR = 1.52f, KF = 29000.0f, CF = 2400.0f, KR = 21000.0f, CR = 1750.0f;
 const float STEER_RATIO = 14.5f;
 const float SR_PEAK = 0.10f, SA_PEAK = 0.14f;
 
 float torqueCurve(float rpmIn) {
     float rpm = rpmIn * RPMK;
-    static const float pts[][2] = {{0, 60}, {800, 115}, {1500, 200}, {3500, 200}, {5000, 176}, {6000, 142}, {6600, 100}, {7500, 0}};
+    static const float petrol[8][2] = {{0, 60}, {800, 115}, {1500, 200}, {3500, 200}, {5000, 176}, {6000, 142}, {6600, 100}, {7500, 0}};
+    // Turbodiesel 1.6: viel Drehmoment schon bei Leerlauf, Maximum 320 Nm ab 1750/min, Drehzahlbegrenzung bei knapp 5000
+    static const float diesel[8][2] = {{0, 120}, {800, 175}, {1250, 262}, {1750, 320}, {3000, 320}, {3800, 270}, {4500, 190}, {5000, 0}};
+    const float (*pts)[2] = (ENG == 1 && TQ == 1.0f) ? diesel : petrol;
     for (int i = 0; i < 7; i++)
         if (rpm <= pts[i + 1][0]) {
             float t = (rpm - pts[i][0]) / (pts[i + 1][0] - pts[i][0]);
@@ -28,13 +33,26 @@ float torqueCurve(float rpmIn) {
     return 0;
 }
 float clutchEngage(float pedal) {
-    float e = clampv((0.72f - pedal) / 0.42f, 0.0f, 1.0f);
-    return e * std::sqrt(e);
+    // Pedal 0 = losgelassen, 1 = getreten. Voll eingekuppelt unter 22 %, getrennt ab 78 %;
+    // dazwischen steigt das Moment progressiv (Schleifpunkt bei ca. 55-65 %).
+    float x = clampv((0.78f - pedal) / 0.56f, 0.0f, 1.0f);
+    return x * x * (3.0f - 2.0f * x);
 }
 } // namespace
 
 float Vehicle::wheelRadius() { return R; }
 
+
+// Motorvariante des Autos: 0 Benzin (1,4 l Turbo), 1 Diesel (1,6 l Turbo)
+static void applyEngine(int e) {
+    if (e == 1) { IDLE = 800; RLIMIT = 4800; I_ENGINE = 0.34f; STALL = 300; START = 450; IDLEAUTH = 0.65f; STALLT = 0.8f; FRICK = 1.15f; }
+    else { IDLE = 850; RLIMIT = 6500; I_ENGINE = 0.23f; STALL = 350; START = 480; IDLEAUTH = 0.28f; STALLT = 0.35f; FRICK = 1.0f; }
+}
+void Vehicle::setEngine(int e) {
+    engineType = e == 1 ? 1 : 0;
+    ENG = engineType;
+    if (kind == 0) applyEngine(ENG);
+}
 Vehicle::Vehicle() { setKind(0); }
 
 // Fahrzeugart: 0 Auto (Kompaktwagen), 1 Moped (Derbi Senda 50, 6 Gaenge, ca. 50 km/h), 2 Motorrad (125 ccm, ca. 100 km/h).
@@ -66,6 +84,8 @@ void Vehicle::setKind(int k) {
         for (int i = 0; i < 8; i++) GEARS[i] = bikeGears[i];
         if (moped) FINAL = 24.3f * 0.70f / 0.78f; // 6. Gang: ca. 50 km/h bei 7500 U/min
     }
+    if (k == 0) applyEngine(ENG);
+    else { IDLEAUTH = 0.28f; STALLT = 0.35f; FRICK = 1.0f; }
     const float my = -0.05f;
     w[0].mount = {-TWIDTH, my, -ZF}; w[1].mount = {TWIDTH, my, -ZF};
     w[2].mount = {-TWIDTH, my, ZR}; w[3].mount = {TWIDTH, my, ZR};
@@ -124,10 +144,10 @@ void Vehicle::logic(float dt) {
         if (gear == 0 || shiftTimer > 0 || !engineOn) want = 0;
         else if (inRpm > 1150) want = 1;
         else {
-            want = clampv((r - 980.0f) / 700.0f, 0.0f, 1.0f);
+            want = clampv((r - (IDLE + 130.0f)) / 700.0f, 0.0f, 1.0f);
             if (automatic && brake < 0.1f) want = std::max(want, 0.07f); // Kriechen
             if (brake > 0.2f && throttle < 0.05f) want = 0;
-            if (r < 780) want = 0;
+            if (r < IDLE - 70.0f) want = 0;
         }
         autoEngage += clampv(want - autoEngage, -dt * 8.0f, dt * 3.0f);
     }
@@ -221,19 +241,21 @@ void Vehicle::substep(float dt) {
     //  - Reib- und Pumpverluste entsprechen ca. 1 .. 2 bar Reibmitteldruck (15 Nm bei 2000, 29 Nm bei 6000 U/min).
     float r = rpm();
     float n = std::max(r, 300.0f) / 1000.0f;
-    float fric = (8.0f + 0.0035f * r) * TQ;
+    float fric = (8.0f + 0.0035f * r) * TQ * FRICK;
     float Te;
     if (engineOn) {
+        bool diesel = ENG == 1 && kind == 0;
         float area = 1.2f * throttle + 25.0f * throttle * throttle * throttle;
-        float req = 1.0f - std::exp(-area / n);
-        req = std::max(req, clampv((IDLE - r) * 0.0022f * 850.0f / IDLE, 0.0f, 0.24f)); // Leerlaufregler mit kleiner Momentenreserve
+        float req = diesel ? throttle : 1.0f - std::exp(-area / n); // Diesel: Einspritzmenge folgt dem Pedal, keine Drosselklappe
+        // Leerlaufregler: haelt die Leerlaufdrehzahl mit begrenzter Momentenreserve (Benzin knapp, Diesel kraeftig)
+        req = std::max(req, clampv((IDLE - r) * (diesel ? 0.0050f : 0.0030f), 0.0f, IDLEAUTH));
         if (r > RLIMIT) req = 0;                                              // Drehzahlbegrenzer
         manifold += (req - manifold) * std::min(1.0f, dt / 0.09f);
-        float boostTarget = std::max(0.0f, manifold - 0.6f) / 0.4f;
-        float tau = boostTarget < boost ? 0.15f : clampv(1.5f - 0.33f * n, 0.22f, 1.1f);
+        float boostTarget = diesel ? manifold : std::max(0.0f, manifold - 0.6f) / 0.4f;
+        float tau = boostTarget < boost ? 0.15f : (diesel ? clampv(1.4f - 0.35f * n, 0.25f, 1.0f) : clampv(1.5f - 0.33f * n, 0.22f, 1.1f)); // Turboloch
         boost += (boostTarget - boost) * std::min(1.0f, dt / tau);
-        float fill = std::min(manifold, 0.6f) + 0.4f * boost;
-        float pump = (1.0f - fill) * (4.0f + 0.0012f * r) * TQ;                  // Drosselverluste = Motorbremse
+        float fill = diesel ? 0.55f * manifold + 0.45f * boost : std::min(manifold, 0.6f) + 0.4f * boost;
+        float pump = (1.0f - fill) * (diesel ? 2.0f + 0.0008f * r : 4.0f + 0.0012f * r) * TQ;                  // Drosselverluste = Motorbremse
         Te = fill * (torqueCurve(r) + fric) - fric - pump;
     } else {
         manifold = boost = 0;
@@ -293,7 +315,9 @@ void Vehicle::substep(float dt) {
     // --- Motor ---
     engW += dt * (Te - Tc) / (I_ENGINE + dt * 2.0f * Keff);
     if (engW < 0) engW = 0;
-    if (engineOn && engW * 9.5493f < STALL) { engineOn = false; evStall = true; }
+    // Abwuergen: erst wenn die Drehzahl laenger unter der Schwelle bleibt (Schwungrad, Leerlaufregler); sehr niedrig sofort
+    if (engineOn && engW * 9.5493f < STALL) stallTimer += dt; else stallTimer = 0;
+    if (engineOn && (stallTimer > STALLT || engW * 9.5493f < STALL * 0.45f)) { engineOn = false; evStall = true; stallTimer = 0; }
     if (!engineOn && starter && engW * 9.5493f > START) engineOn = true;
 
     // --- Starrkoerper integrieren ---

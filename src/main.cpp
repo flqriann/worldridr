@@ -7,11 +7,13 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
 #include "audio.h"
 #include "game.h"
+#include "keys.h"
 #include "net.h"
 #include "stb_image_write.h"
 
@@ -40,6 +42,11 @@ static bool onRoad = true, wrongWay = false, running = true;
 static float laneOffset = 0;
 static bool menuOpen = false, started = false;
 static float previewYawOff = 0;
+static int keyListen = -1;   // Tastenbelegung: Aktion, die gerade eine neue Taste bekommt
+struct ThumbRect { int idx; float x, y, w, h; };
+static std::vector<ThumbRect> thumbRects;      // Vorschaubilder im Autokatalog (je Eintrag eines)
+static std::map<int, Target> thumbs;
+static int thumbColorKey = -2;
 static double spawnedAt = -100;
 static int menuPage = 0;
 static Mat4 mainVP = identity();
@@ -122,6 +129,7 @@ static void applyVehicle() {
     car.setKind(vehKind);
     EYE = vehKind == 0 ? Vec3{-0.36f, 0.60f, 0.22f} : Vec3{0.0f, 0.98f, 0.14f};
     static const float cap[3] = {45.0f, 6.5f, 12.0f}, use[3] = {1.0f, 0.12f, 0.25f};
+    car.setEngine(cfg.diesel ? 1 : 0);
     float old = econ::fuel;
     econ::fuel = -1;
     econ::setTank(cap[vehKind], use[vehKind]);
@@ -134,7 +142,8 @@ static void saveSettings() {
             cfg.quality, cfg.renderScale, (int)cfg.mirrors, cfg.traffic, (int)cfg.police, (int)cfg.faultPoints, cfg.hudMode, (int)cfg.minimap, (int)cfg.automatic, camMode,
             carModelSel >= 0 ? carModelName(carModelSel).c_str() : "builtin", (int)cfg.msaa, cfg.bldDist, cfg.roadDist, cfg.peds, (int)cfg.mapQuestions);
     if (carColorSet) fprintf(f, "carcolor=%d,%d,%d\n", carColor[0], carColor[1], carColor[2]);
-    fprintf(f, "veh=%d\nfuel=%.2f\nmoney=%.2f\n", vehKind, econ::fuel, econ::money);
+    fprintf(f, "veh=%d\nfuel=%.2f\nmoney=%.2f\ndiesel=%d\n", vehKind, econ::fuel, econ::money, (int)cfg.diesel);
+    keys::save(f);
     fclose(f);
 }
 // vor dem Fenster aufrufen (MSAA gilt nur beim Start)
@@ -170,6 +179,8 @@ static bool loadSettings() {
         else if (k == "msaa") cfg.msaa = n != 0;
         else if (k == "bld") cfg.bldDist = (float)n;
         else if (k == "road") cfg.roadDist = (float)n;
+        else if (k == "diesel") cfg.diesel = n != 0;
+        else keys::load(k, v);
     }
     fclose(f);
     return true;
@@ -283,17 +294,39 @@ static void spawnCar(bool nearCurrent) {
 static Mat4 rotY(float a) { return fromQuatPos(qaxis({0, 1, 0}, a), {}); }
 static Mat4 rotX(float a) { return fromQuatPos(qaxis({1, 0, 0}, a), {}); }
 
+// Fahrer-Insasse: federt mit der Fahrdynamik und dreht den Kopf mit der Kamera bzw. dem VR-Headset
+static Sway ownSwayLat, ownSwayLong;
+static float ownHeadYaw = 0, ownHeadPitch = 0;
+static void updateOwnOccupant(float dt) {
+    static Vec3 prevV;
+    Vec3 a = (car.vel - prevV) * (1.0f / std::max(dt, 0.001f));
+    prevV = car.vel;
+    Vec3 f = car.forward(), r{-f.z, 0, f.x};
+    ownSwayLong.step(clampv(dot(a, f), -12.0f, 12.0f), dt);
+    ownSwayLat.step(clampv(dot(a, r), -12.0f, 12.0f), dt);
+    float ty = lookYaw + input.lookYaw, tp = lookPitch;
+    if (vr.running) { // Kopfhaltung des VR-Headsets
+        Vec3 hf = xformDir(vr.eye[0].pose, {0, 0, -1});
+        ty = std::atan2(-hf.x, -hf.z);
+        tp = std::asin(clampv(hf.y, -1.0f, 1.0f));
+    }
+    float k = std::min(1.0f, dt * 12.0f);
+    ownHeadYaw += (clampv(ty, -1.6f, 1.6f) - ownHeadYaw) * k;
+    ownHeadPitch += (clampv(tp, -0.7f, 0.7f) - ownHeadPitch) * k;
+}
+
 static CarVisual ownVisual() {
     CarVisual v;
     v.M = car.transform();
     v.steer = car.w[0].steer;
     for (int i = 0; i < 4; i++) { v.wheelRot[i] = car.w[i].rot; v.comp[i] = car.w[i].comp; }
     v.brake = car.brake > 0.05f;
-    v.blinkL = (blinker == -1 || blinker == 2) && blinkLit;
-    v.blinkR = (blinker == 1 || blinker == 2) && blinkLit;
+    v.blinkL = ((blinker == -1 || blinker == 2) && blinkLit) || foot::lockBlink();
+    v.blinkR = ((blinker == 1 || blinker == 2) && blinkLit) || foot::lockBlink();
     v.lights = lights;
     v.reverse = car.gear == -1;
     carOwnPaint(v);
+    v.driver = car.kind == 0; v.occX = ownSwayLat.x; v.occZ = -ownSwayLong.x; v.headYaw = ownHeadYaw; v.headPitch = ownHeadPitch;
     v.kind = car.kind;
     if (car.kind > 0) { // Zweirad neigt sich in Kurven
         static float leanS = 0;
@@ -451,7 +484,9 @@ static void buildHUD(bool cockpit, bool loading) {
     float W = ui.W, H = ui.H, cx = W * 0.5f;
     char buf[256];
     bool calm = cfg.hudMode == 0;
-    if ((!cockpit || car.kind > 0) && spawned && !loading) { // kompakte Tempoanzeige
+    { std::string fp = foot::prompt(); // zu Fuss: Hinweis zum Einsteigen/Sperren
+        if (!fp.empty()) { float pw2 = font.width(fp, 17) + 36; ui.geo.rrect(cx - pw2 / 2, H - 120, pw2, 36, 12, Color{14, 17, 23, 215}); ui.labelC(cx, H - 96, 17, Color{255, 214, 120, 255}, fp); } }
+    if ((!cockpit || car.kind > 0) && spawned && !loading && !foot::on) { // kompakte Tempoanzeige
         float by = H - 20;
         ui.geo.rrect(cx - 78, by - 48, 156, 48, 14, PANEL);
         snprintf(buf, sizeof buf, "%d", (int)std::lround(std::fabs(car.speed() * 3.6f)));
@@ -611,6 +646,43 @@ static void buildMapQuestion() {
     if (ui.button(x + 18, y + 152, 228, 32, "So lassen, nicht mehr fragen", false, 14)) { nextAsk = simTime + 25; world.resolveConflict(c, 0); mapQ.erase(mapQ.begin() + best); return; }
 }
 
+// Vorschaubilder des Katalogs: je Eintrag ein eigenes 3D-Bild (hoechstens zwei neue pro Bild, wegen der Rechenzeit)
+static void renderThumbs() {
+    int key = carColorSet ? ((carColor[0] << 16) | (carColor[1] << 8) | carColor[2]) : -1;
+    if (key != thumbColorKey) { for (auto& kv : thumbs) kv.second.destroy(); thumbs.clear(); thumbColorKey = key; }
+    int budget = 2, count = carModelCount();
+    for (const ThumbRect& r : thumbRects) {
+        if (budget <= 0) break;
+        auto it = thumbs.find(r.idx);
+        if (it != thumbs.end() && it->second.fbo) continue;
+        int model = -1, kind = 0;
+        if (r.idx >= 1 && r.idx <= count) model = r.idx - 1;
+        else if (r.idx > count) kind = r.idx - count;
+        carThumbRender(thumbs[r.idx], model, kind);
+        budget--;
+    }
+}
+static void drawThumbs(const Mat4& mvp) {
+    if (thumbRects.empty()) return;
+    glDisable(GL_DEPTH_TEST);
+    gfxMVP(mvp);
+    gfxModel(identity());
+    gfxBias(0);
+    gfxMode(8);
+    for (const ThumbRect& r : thumbRects) {
+        auto it = thumbs.find(r.idx);
+        if (it == thumbs.end() || !it->second.fbo) continue;
+        Batch b;
+        Color w{255, 255, 255, 255};
+        Vec3 n{0, 0, 1};
+        b.vert({r.x, r.y, 0}, n, 0, 1, w); b.vert({r.x + r.w, r.y, 0}, n, 1, 1, w); b.vert({r.x + r.w, r.y + r.h, 0}, n, 1, 0, w);
+        b.vert({r.x, r.y, 0}, n, 0, 1, w); b.vert({r.x + r.w, r.y + r.h, 0}, n, 1, 0, w); b.vert({r.x, r.y + r.h, 0}, n, 0, 0, w);
+        gfxBindTexture(it->second.tex);
+        b.draw();
+    }
+    glEnable(GL_DEPTH_TEST);
+}
+
 // ---------- H-Schalthebel einrichten: jede Stellung einmal einlegen, die gemeldete Taste wird gemerkt ----------
 static int calStep = -1, calCand = -1, calMap[7];
 static float calHold = 0;
@@ -700,7 +772,7 @@ static void closeMenu() { menuOpen = false; started = true; menuPage = 0; }
 static void buildMenu() {
     float W = ui.W, H = ui.H;
     if (menuPage != 3) ui.geo.rect(0, 0, W, H, Color{4, 6, 10, started ? (uint8_t)150 : (uint8_t)70});
-    float pw = menuPage == 2 ? 820.0f : (menuPage == 3 ? 480.0f : 440.0f);
+    float pw = (menuPage == 2 || menuPage == 4) ? 820.0f : (menuPage == 3 ? 480.0f : 440.0f);
     ui.geo.rect(0, 0, pw + 64, H, Color{8, 10, 15, 215});
     ui.geo.rect(pw + 64, 0, 2, H, Color{255, 184, 48, 90});
     const float x = 64;
@@ -777,6 +849,7 @@ static void buildMenu() {
     } else if (menuPage == 3) {
         // ---------- Autokatalog: Liste, Farbauswahl; die 3D-Vorschau wird rechts daneben gezeichnet ----------
         static float lastX = 0;
+        thumbRects.clear();
         if (ui.down && ui.mx > pw + 70 && !ui.captured) previewYawOff += (ui.mx - lastX) * 0.012f;
         lastX = ui.mx;
         int count = carModelCount();
@@ -798,12 +871,14 @@ static void buildMenu() {
             bool active;
             if (idx <= count) { int ci = idx - 1; label = ci < 0 ? "Eigenbau" : pretty(carModelName(ci)); active = vehKind == 0 && carModelSel == ci; }
             else { label = idx == count + 1 ? "Derbi Senda (Moped)" : "Motorrad 125"; active = vehKind == idx - count; }
-            if (item(label, active, bx, bwid)) {
+            if (item("", active, bx, bwid)) {
                 int oldKind = vehKind;
                 if (idx <= count) { vehKind = 0; carModelSel = idx - 1; } else vehKind = idx - count;
                 if (vehKind != oldKind) { applyVehicle(); if (spawned) spawnCar(true); }
                 saveSettings();
             }
+            thumbRects.push_back({idx, bx + 6, byy + 3, 64.0f, 36.0f});
+            { std::string shown = label; if (shown == "Derbi Senda (Moped)") shown = "Derbi Senda"; ui.label(bx + 78, byy + 26, 14, active ? Color{20, 16, 6, 255} : col::white, shown); }
             by = old;
         }
         float cy0 = ly + ((entries + (two ? 1 : 0)) / (two ? 2 : 1)) * 40 + 14;
@@ -838,6 +913,23 @@ static void buildMenu() {
         else if (carModelSel >= 0 && carModelInfo(carModelSel, info)) ui.label(px, 96, 14, col::gray, info);
         else if (carModelSel < 0) ui.label(px, 96, 14, col::gray, "Im Spiel erzeugtes Modell");
         ui.label(px, H - 28, 13, Color{150, 156, 166, 200}, "Mit der Maus ziehen = drehen");
+    } else if (menuPage == 4) {
+        // ---------- Tastenbelegung ----------
+        ui.label(x, 166, 14, col::gray, keyListen >= 0 ? "Neue Taste dr\xC3\xBC" "cken ...  (Esc = abbrechen)" : "Auf eine Taste klicken, dann die neue Taste dr\xC3\xBC" "cken. Pfeiltasten und Bild auf/ab bleiben als Zweittasten.");
+        const int perCol = 9;
+        for (int i = 0; i < A_COUNT; i++) {
+            int c2 = i / perCol, row = i % perCol;
+            float bx = x + c2 * 272, byy = 190 + row * 44;
+            ui.label(bx, byy + 26, 13, SOFT, keys::label((Act)i));
+            bool lis = keyListen == i;
+            float old = by;
+            by = byy;
+            if (item(lis ? std::string("...") : keys::name((Act)i), lis, bx + 142, 118)) keyListen = i;
+            by = old;
+        }
+        by = 190 + perCol * 44 + 12;
+        if (item("Alle auf Standard", false, x, 260)) { keys::resetAll(); saveSettings(); }
+        { float old = by; if (item("Fertig", false, x + 272, 260)) { menuPage = 2; keyListen = -1; } by = old; }
     } else {
         // Einstellungen in zwei Spalten
         float x2 = x + 380;
@@ -890,6 +982,8 @@ static void buildMenu() {
         next();
         if (left(cfg.mapQuestions ? "Kartenfragen: an" : "Kartenfragen: aus")) { cfg.mapQuestions = !cfg.mapQuestions; changed = true; }
         next();
+        if (left(cfg.diesel ? "Motor: Diesel (Turbo)" : "Motor: Benzin (Turbo)")) { cfg.diesel = !cfg.diesel; car.setEngine(cfg.diesel ? 1 : 0); changed = true; }
+        next();
         float leftEnd = by;
         if (right(cfg.police ? "Polizei: an" : "Polizei: aus", ry)) { cfg.police = !cfg.police; changed = true; }
         ry += 52;
@@ -915,6 +1009,7 @@ static void buildMenu() {
         if (right(input.shifterReady() ? "Schalthebel neu einrichten" : "Schalthebel einrichten", ry)) { closeMenu(); startShifterSetup(); }
         by = std::max(leftEnd, ry + 52) + 8;
         if (item("Zur\xC3\xBC" "ck")) menuPage = 0;
+        { float old = by; if (item("Tasten belegen", false, x2, 360)) menuPage = 4; by = old; }
         if (changed) saveSettings();
         ui.label(x, H - 24, 12, col::gray, "Niedrig = schnellste Darstellung f\xC3\xBCr schwache Rechner. \xC3\x84nderungen werden automatisch gespeichert.");
     }
@@ -974,6 +1069,7 @@ int main(int argc, char** argv) {
     bool revTest = false;
     int serverMax = 16;
     bool policeTest = false, pedShow = false;
+    int footTest = 0;
     int poiTest = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -982,6 +1078,7 @@ int main(int argc, char** argv) {
         else if (a == "--page" && i + 1 < argc) menuPage = atoi(argv[++i]);
         else if (a == "--policetest") policeTest = true;
         else if (a == "--pedshow") pedShow = true;
+        else if (a == "--foottest") footTest = 1;
         else if (a == "--poitest") poiTest = 1;
         else if (a == "--port" && i + 1 < argc) cfg.port = atoi(argv[++i]);
         else if (a == "--max" && i + 1 < argc) serverMax = atoi(argv[++i]);
@@ -1087,6 +1184,7 @@ int main(int argc, char** argv) {
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_EVENT_QUIT) { running = false; continue; }
             if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT) uiClick = true;
+            if (keyListen >= 0 && e.type == SDL_EVENT_KEY_DOWN) { if (e.key.key != SDLK_ESCAPE) { keys::set((Act)keyListen, e.key.key); saveSettings(); } keyListen = -1; continue; }
             if (e.type == SDL_EVENT_TEXT_INPUT && typing) { typed += e.text.text; continue; }
             if (e.type == SDL_EVENT_KEY_DOWN && typing) {
                 SDL_Keycode k = e.key.key;
@@ -1107,8 +1205,8 @@ int main(int argc, char** argv) {
                 if (k == SDLK_ESCAPE && calStep >= 0) { calStep = -1; statusLine.clear(); continue; }
                 if (k == SDLK_ESCAPE && worldmap::active()) { worldmap::close(); statusLine.clear(); continue; }
                 if (k == SDLK_ESCAPE) { menuOpen = !menuOpen; menuPage = 0; statusLine.clear(); if (!menuOpen) started = true; continue; }
-                if (k == SDLK_RETURN && !menuOpen && !edit && !worldmap::active() && netplay::active()) { beginTyping(4); continue; }
-                if (k == SDLK_M && !edit && !menuOpen) { if (worldmap::active()) worldmap::close(); else worldmap::open(); continue; }
+                if (keys::is(A_CHAT, k) && !menuOpen && !edit && !worldmap::active() && netplay::active()) { beginTyping(4); continue; }
+                if (keys::is(A_MAP, k) && !edit && !menuOpen) { if (worldmap::active()) worldmap::close(); else worldmap::open(); continue; }
                 if (k == SDLK_P) { wantShot = true; continue; }
                 if (k == SDLK_F2 && spawned) { if (edit) editor::close(); else { Vec3 f = car.forward(); editor::open(car.pos, std::atan2(-f.x, -f.z)); } continue; }
             }
@@ -1117,16 +1215,19 @@ int main(int argc, char** argv) {
             if (edit) { editor::event(e); continue; }
             input.handleEvent(e, false);
             if (e.type == SDL_EVENT_MOUSE_MOTION && (e.motion.state & SDL_BUTTON_RMASK)) {
+                if (foot::on) foot::camYaw -= e.motion.xrel * 0.004f;
                 lookYaw = clampv(lookYaw - e.motion.xrel * 0.004f, -2.4f, 2.4f);
                 lookPitch = clampv(lookPitch - e.motion.yrel * 0.004f, -1.0f, 1.0f);
             } else if (e.type == SDL_EVENT_MOUSE_BUTTON_UP && e.button.button == SDL_BUTTON_RIGHT) { lookYaw = lookPitch = 0; }
             else if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
                 SDL_Keycode k = e.key.key;
-                if (k == SDLK_T) beginTyping(1);
+                if (keys::is(A_PLACE, k)) beginTyping(1);
                 else if (k == SDLK_F3) debugOverlay = !debugOverlay;
-                else if (k == SDLK_N) nav::zoomCycle();
-                else if (k == SDLK_J) econ::keyJ();
-                else if (k == SDLK_K) econ::navToNearest(0);
+                else if (keys::is(A_MINIMAP, k)) nav::zoomCycle();
+                else if (keys::is(A_EXIT, k)) { if (foot::on) foot::enterCar(); else foot::exitCar(); }
+                else if (keys::is(A_LOCK, k)) foot::toggleLock();
+                else if (keys::is(A_ACTION, k)) econ::keyJ();
+                else if (keys::is(A_FUELNAV, k)) econ::navToNearest(0);
                 else if (k == SDLK_F5) vr.recenter();
                 else if (k == SDLK_F1) script.event("key", "f1");
                 else if (k >= SDLK_0 && k <= SDLK_9) { char s[2] = {(char)('0' + (k - SDLK_0)), 0}; script.event("key", s); }
@@ -1154,11 +1255,12 @@ int main(int argc, char** argv) {
         bool driving = spawned && !edit;
         if (testTp && spawned && simTime - spawnTime > 4) { testTp = false; gameTeleport(testTpLat, testTpLon); }
         bool mapOpen = worldmap::active();
-        bool controls = driving && !menuOpen && !typing && !mapOpen;
+        bool controls = driving && !menuOpen && !typing && !mapOpen && !foot::on;
         input.update(dt, car.speed(), !controls);
+        if (spawned) foot::update(dt);
         updateShifterSetup(dt);
         netplay::pollDiscovery();
-        Vec3 focus = edit ? editor::cameraPos() : (spawned ? car.pos : Vec3{});
+        Vec3 focus = edit ? editor::cameraPos() : (spawned ? playerPos() : Vec3{});
         world.update(focus, simTime);
         editor::refresh(simTime);
         // Strassenbezug jedes Bild neu bestimmen: Zeiger in nachgeladene/entfernte Kacheln duerfen nicht ueberleben
@@ -1194,12 +1296,13 @@ int main(int argc, char** argv) {
         float aspect = (float)ww / wh, uiH = 720, uiW = uiH * aspect;
         float mxp, myp;
         Uint32 mb = SDL_GetMouseState(&mxp, &myp);
-        bool cockpit = camMode == 0 && !edit;
+        bool cockpit = camMode == 0 && !edit && !foot::on;
         ui.begin(uiW, uiH, mxp * uiH / wh, myp * uiH / wh, (mb & SDL_BUTTON_LMASK) != 0, uiClick);
         if (mapOpen && !menuOpen) worldmap::buildUI();
-        else if (!edit && !menuOpen) { buildHUD(cockpit, !spawned); if (spawned) nav::buildHUD(); buildMapQuestion(); }
+        else if (!edit && !menuOpen && foot::fade() < 0.5f) { buildHUD(cockpit, !spawned); if (spawned) nav::buildHUD(); buildMapQuestion(); }
         if (edit && !menuOpen) editor::buildUI();
         buildPrompt();
+        if (foot::fade() > 0.01f) ui.geo.rect(0, 0, uiW, uiH, Color{0, 0, 0, (uint8_t)(255.0f * foot::fade())});
         if (menuOpen) buildMenu();
 
         // ---------- Fahren ----------
@@ -1207,6 +1310,7 @@ int main(int argc, char** argv) {
             car.automatic = cfg.automatic;
             car.autoClutch = cfg.autoClutch == -1 ? !input.wheelPresent : cfg.autoClutch == 1;
             car.steer = input.steer; car.throttle = input.throttle; car.brake = input.brake; car.clutch = input.clutch;
+            if (foot::on) { car.throttle = 0; car.brake = 0.35f; car.steer = 0; car.clutch = 0; car.handbrake = true; car.engineOn = false; car.starter = false; }
             // Zuendschluessel: bei laufendem Motor = abstellen, sonst Anlasser solange gehalten
             if (input.starter && !starterPrev && car.engineOn) { car.engineOn = false; starterLock = true; }
             if (!input.starter) starterLock = false;
@@ -1333,6 +1437,8 @@ int main(int argc, char** argv) {
             script.carEnd();
             hud.faultsOn = cfg.faultPoints || hud.lessonActive;
             if (pedShow && simTime - spawnTime > 7) { ped::debugSpawnAhead(); pedShow = false; }
+            if (footTest == 1 && simTime - spawnTime > 6) { foot::exitCar(); footTest = 2; }
+            if (footTest == 2 && simTime - spawnTime > 8) { foot::debugHit(); footTest = 3; }
             if (poiTest == 1 && simTime - spawnTime > 7) { // Selbsttest: zur naechsten Tankstelle setzen, Tank fast leer, tanken
                 float bd = 1e9f; Poi bp; bool fnd = false;
                 world.forPoisNear(car.pos.x, car.pos.z, 4000, [&](const Poi& p) { float d = std::hypot(p.x - car.pos.x, p.z - car.pos.z); if (p.kind == 0 && d < bd) { bd = d; bp = p; fnd = true; } });
@@ -1375,6 +1481,7 @@ int main(int argc, char** argv) {
         }
 
         // ---------- Rendern ----------
+        updateOwnOccupant(dt);
         Mat4 M = car.transform();
         buildProps(focus);
         bool vrFrame = !edit && vr.beginFrame();
@@ -1426,6 +1533,7 @@ int main(int argc, char** argv) {
                 float a = (float)simTime * 0.06f;
                 camM = mul(translate(c + Vec3{std::sin(a) * 16.0f, 0, std::cos(a) * 16.0f} + Vec3{0, spawned ? 3.5f : (gh - c.y + 30.0f), 0}), mul(rotY(a), rotX(-0.14f)));
             }
+            else if (foot::on) camM = foot::camera();
             else if (cockpit) camM = mul(M, mul(translate(EYE), mul(rotY(lookYaw + input.lookYaw), rotX(lookPitch - 0.13f))));
             else {
                 Vec3 f = car.forward();
@@ -1450,9 +1558,12 @@ int main(int argc, char** argv) {
                 int x0 = (int)((480.0f + 66) * wh / uiH);
                 carPreviewDraw(x0, 0, ww - x0, wh, (float)simTime * 0.45f + previewYawOff);
                 glViewport(0, 0, ww, wh);
+                renderThumbs();
+                glViewport(0, 0, ww, wh);
             }
             if (worldmap::active()) worldmap::draw(ortho(0, uiW, uiH, 0), ww, wh);
             ui.flush(ortho(0, uiW, uiH, 0));
+            if (menuOpen && menuPage == 3) drawThumbs(ortho(0, uiW, uiH, 0));
         }
         bool autoShot = shotAt >= 0 && ((spawned && simTime - spawnTime >= shotAt) || simTime > shotAt + 90);
         if (wantShot || autoShot) {
