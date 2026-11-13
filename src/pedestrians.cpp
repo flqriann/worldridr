@@ -32,7 +32,14 @@ struct Ped {
     float cT = 0, cDur = 5, downT = 0;
     int nextEdge = 0;
     bool nextRev = false;
+    int uid = 0, ski = 0, hai = 0;
+    bool puppet = false;
+    Vec3 tgt; float tyaw = 0; double seen = 0; float v = 0;
 };
+int nextPedUid = 1;
+const Color SKINS[4] = {{236, 190, 160, 255}, {210, 160, 120, 255}, {160, 110, 80, 255}, {110, 76, 56, 255}};
+const Color HAIRS[4] = {{40, 30, 24, 255}, {90, 62, 34, 255}, {200, 170, 100, 255}, {120, 120, 120, 255}};
+double lastRemoteT = -100; bool wasPuppet = false;
 std::vector<Ped> peds;
 Batch pb;
 float spawnTimer = 0;
@@ -172,7 +179,7 @@ void spawn() {
         p.pos.y = h + 0.05f;
         p.speed = 1.15f + (rng() % 100) / 100.0f * 0.6f;
         p.phase = (rng() % 628) / 100.0f;
-        p.shirt = shirts[rng() % 8]; p.pants = pantsC[rng() % 5]; p.skin = skins[rng() % 4]; p.hair = hairs[rng() % 4];
+        p.shirt = shirts[rng() % 8]; p.pants = pantsC[rng() % 5]; p.ski = rng() % 4; p.hai = rng() % 4; p.skin = SKINS[p.ski]; p.hair = HAIRS[p.hai]; p.uid = nextPedUid++;
         peds.push_back(p);
         return;
     }
@@ -206,9 +213,70 @@ void nextSegment(Ped& p) {
 
 namespace ped {
 
+bool puppetMode() { return simTime - lastRemoteT < 2.5; }
+void snapshot(std::vector<NpcState>& out) {
+    for (const Ped& p : peds) {
+        if (p.puppet) continue;
+        NpcState n{};
+        n.uid = (uint16_t)p.uid;
+        world.toLatLon(p.pos.x, p.pos.z, n.lat, n.lon);
+        n.y = p.pos.y;
+        n.yaw = (int16_t)clampv((int)std::lround(std::remainder(p.yaw, 2 * PI) * 5000.0f), -32000, 32000);
+        n.v = (int16_t)std::lround(p.speed * 100.0f);
+        n.flags = (p.down ? 32 : 0) | (p.crossing ? 64 : 0);
+        n.model = (uint8_t)(p.ski | (p.hai << 4));
+        n.c1[0] = p.shirt.r; n.c1[1] = p.shirt.g; n.c1[2] = p.shirt.b;
+        n.c2[0] = p.pants.r; n.c2[1] = p.pants.g; n.c2[2] = p.pants.b;
+        out.push_back(n);
+    }
+}
+void applyRemote(const NpcState* s, int n) {
+    lastRemoteT = simTime;
+    if (!wasPuppet) { peds.clear(); wasPuppet = true; }
+    for (int i = 0; i < n; i++) {
+        Ped* a = nullptr;
+        for (Ped& p : peds) if (p.puppet && p.uid == s[i].uid) { a = &p; break; }
+        if (!a) { peds.push_back(Ped{}); a = &peds.back(); a->puppet = true; a->uid = s[i].uid; a->seen = -1; }
+        float x, z;
+        world.toLocal(s[i].lat, s[i].lon, x, z);
+        Vec3 t{x, s[i].y, z};
+        a->tyaw = s[i].yaw / 5000.0f; a->v = s[i].v / 100.0f; a->speed = a->v;
+        a->shirt = Color{s[i].c1[0], s[i].c1[1], s[i].c1[2], 255}; a->pants = Color{s[i].c2[0], s[i].c2[1], s[i].c2[2], 255};
+        a->skin = SKINS[s[i].model & 3]; a->hair = HAIRS[(s[i].model >> 4) & 3];
+        a->crossing = (s[i].flags & 64) != 0;
+        if (s[i].flags & 32) { // vom Auto erfasst: ab hier lokal als Ragdoll
+            if (!a->down) {
+                a->down = true; a->downT = 0; a->rag.shirt = a->shirt; a->rag.pants = a->pants; a->rag.skin = a->skin; a->rag.hair = a->hair;
+                Vec3 fwd{-std::sin(a->tyaw), 0, -std::cos(a->tyaw)}; a->rag.start(a->pos, a->yaw, fwd * 6.0f);
+            }
+            a->seen = simTime;
+            continue;
+        }
+        a->tgt = t;
+        if (a->seen < 0 || length(a->pos - t) > 30) { a->pos = t; a->yaw = a->tyaw; }
+        a->seen = simTime;
+    }
+}
+static void stepPuppets(float dt) {
+    for (size_t i = 0; i < peds.size();) {
+        Ped& p = peds[i];
+        if (!p.puppet || simTime - p.seen > 2.0 || (p.down && p.downT > 45)) { peds.erase(peds.begin() + i); continue; }
+        if (p.down) { p.rag.step(dt); p.downT += dt; p.pos = p.rag.center(); i++; continue; }
+        Vec3 fwd{-std::sin(p.tyaw), 0, -std::cos(p.tyaw)};
+        Vec3 t = p.tgt + fwd * (p.v * (float)std::min(0.3, simTime - p.seen));
+        float k = 1.0f - std::exp(-dt * 10.0f);
+        p.pos += (t - p.pos) * k;
+        p.yaw += std::remainder(p.tyaw - p.yaw, 2 * PI) * k;
+        p.phase += dt * p.v * 4.6f;
+        i++;
+    }
+}
+
 void update(float dt) {
     if (builtGen != world.geo().gen) { builtGen = world.geo().gen; peds.clear(); builtVersion = -1; }
     if (wanted <= 0) { peds.clear(); return; }
+    if (puppetMode()) { stepPuppets(dt); return; }
+    if (wasPuppet) { wasPuppet = false; peds.clear(); }
     if (builtVersion != world.roadVersion()) { builtVersion = world.roadVersion(); rebuild(); }
     spawnTimer -= dt;
     if ((int)peds.size() < wanted && spawnTimer <= 0) { spawnTimer = 0.25f; spawn(); }

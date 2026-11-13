@@ -214,6 +214,9 @@ struct ObjCar {
     std::string name;
     bool tried = false, ok = false, hasWheels = false, hasPaint = false, hasLamps = false;
     int tris = 0;
+    std::vector<Vec3> surf;       // Dreiecke von Lack und Karosserie (zum Aufsetzen der Lampen)
+    struct Pad { Vec3 c; Vec3 h; int kind; float side; bool rear; };
+    std::vector<Pad> pads; bool padsInit = false;
     std::vector<LampTri> lamps;   // Leuchtflaechen (Brems-, Blink-, Rueckfahr-, Scheinwerferlicht)
     Mesh paint, body, wheel[4], glass;   // Karosserie-Lack (einfaerbbar), Rest, Raeder (VL, VR, HL, HR), Fensterglas (durchsichtig)
     Vec3 wc[4];                   // Radmittelpunkte
@@ -569,6 +572,8 @@ bool loadObjCar(ObjCar& m) {
             dst->vert(pp[q], nn, 0, 0, c);
         }
     }
+    for (const Batch* bt : {&paint, &body})
+        for (const auto& q : bt->v) m.surf.push_back({q.p[0], q.p[1], q.p[2]});
     m.paint.create(paint.v.data(), (int)paint.v.size());
     m.body.create(body.v.data(), (int)body.v.size());
     m.glass.create(glassB.v.data(), (int)glassB.v.size());
@@ -641,6 +646,41 @@ static void drawOccupants(const CarVisual& v) {
     occB.draw();
 }
 
+
+// Strahl entlang z durch (x,y): vorderste bzw. hinterste Flaeche der Karosserie
+static bool surfZ(const ObjCar& m, float x, float y, bool rear, float& z) {
+    bool found = false; float best = rear ? -1e9f : 1e9f;
+    for (size_t i = 0; i + 2 < m.surf.size(); i += 3) {
+        const Vec3 &a = m.surf[i], &b = m.surf[i + 1], &c = m.surf[i + 2];
+        float d = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+        if (std::fabs(d) < 1e-9f) continue;
+        float l1 = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / d, l2 = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / d, l3 = 1 - l1 - l2;
+        if (l1 < -0.001f || l2 < -0.001f || l3 < -0.001f) continue;
+        float zz = l1 * a.z + l2 * b.z + l3 * c.z;
+        if (rear ? zz > best : zz < best) { best = zz; found = true; }
+    }
+    z = best;
+    return found;
+}
+static void buildPads(ObjCar& m) {
+    m.padsInit = true;
+    float hw = std::max(std::fabs(m.lo.x), std::fabs(m.hi.x)), H = m.hi.y - m.lo.y, lw = hw * 0.62f;
+    struct Spec { float xf, yf, hx, hy; int kind; bool rear; };
+    const Spec spec[] = {{1.0f, 0.36f, 0.17f, 0.045f, 0, false}, {1.35f, 0.30f, 0.07f, 0.03f, 1, false},
+                         {1.0f, 0.40f, 0.17f, 0.05f, 2, true}, {1.35f, 0.33f, 0.07f, 0.03f, 3, true}, {0.5f, 0.33f, 0.06f, 0.03f, 4, true}};
+    for (const Spec& sp : spec)
+        for (float sd : {-1.0f, 1.0f}) {
+            if (sp.kind == 4 && sd > 0) continue; // Rueckfahrlicht nur einmal je Seite unten
+            float x = sd * lw * sp.xf, y = m.lo.y + H * sp.yf, z = 0; bool ok = false;
+            for (int t = 0; t < 12 && !ok; t++) {      // nach innen / oben wandern, bis die Karosserie getroffen wird
+                float xx = x * (1.0f - 0.06f * (t % 6)), yy = y + 0.04f * (t / 6);
+                if (surfZ(m, xx, yy, sp.rear, z) && (sp.rear ? z > m.hi.z - 0.45f : z < m.lo.z + 0.45f)) { x = xx; y = yy; ok = true; }
+            }
+            if (!ok) z = sp.rear ? m.hi.z : m.lo.z;
+            m.pads.push_back({{x, y, z + (sp.rear ? -0.012f : 0.012f)}, {hw * sp.hx, H * sp.hy, 0.03f}, sp.kind, sd, sp.rear});
+        }
+}
+
 static void drawObjCar(const CarVisual& v, const Mat4& vp, ObjCar& m) {
     gfxMVP(vp);
     gfxBias(0);
@@ -652,7 +692,7 @@ static void drawObjCar(const CarVisual& v, const Mat4& vp, ObjCar& m) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
     gfxMode(0, 0);
-    shadow.draw();
+    gfxBias(2e-5f); shadow.draw(); gfxBias(0);   // Schatten leicht zur Kamera ziehen: kein Flackern gegen das Gelaende
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 
@@ -691,13 +731,19 @@ static void drawObjCar(const CarVisual& v, const Mat4& vp, ObjCar& m) {
             for (int q = 0; q < 3; q++) dynGlow.vert(lt.p[q], lt.n, 0, 0, c);
         }
     }
-    for (float s : (m.hasLamps ? std::initializer_list<float>{} : std::initializer_list<float>{-1.0f, 1.0f})) {
-        bool blink = s < 0 ? v.blinkL : v.blinkR;
-        dynGlow.box(I4, {s * lw, yHead, m.lo.z + 0.01f}, {hw * 0.17f, H * 0.045f, 0.03f}, v.lights ? Color{255, 250, 228, 255} : Color{214, 220, 226, 255});
-        dynGlow.box(I4, {s * (lw + hw * 0.22f), yBlink, m.lo.z + 0.01f}, {hw * 0.07f, H * 0.03f, 0.03f}, blink ? Color{255, 170, 20, 255} : Color{150, 100, 24, 255});
-        dynGlow.box(I4, {s * lw, yTail, m.hi.z - 0.01f}, {hw * 0.17f, H * 0.05f, 0.03f}, v.brake ? Color{255, 34, 22, 255} : (v.lights ? Color{170, 14, 12, 255} : Color{110, 12, 12, 255}));
-        dynGlow.box(I4, {s * (lw + hw * 0.22f), yTail - H * 0.07f, m.hi.z - 0.01f}, {hw * 0.07f, H * 0.03f, 0.03f}, blink ? Color{255, 170, 20, 255} : Color{150, 100, 24, 255});
-        if (v.reverse) dynGlow.box(I4, {s * lw * 0.5f, yTail - H * 0.07f, m.hi.z - 0.01f}, {hw * 0.06f, H * 0.03f, 0.03f}, Color{245, 245, 245, 255});
+    if (!m.hasLamps) {
+        if (!m.padsInit) buildPads(m);
+        for (const auto& pd : m.pads) {
+            bool blink = pd.side < 0 ? v.blinkL : v.blinkR;
+            Color c;
+            switch (pd.kind) {
+            case 0: c = v.lights ? Color{255, 250, 228, 255} : Color{214, 220, 226, 255}; break;
+            case 1: case 3: c = blink ? Color{255, 170, 20, 255} : Color{150, 100, 24, 255}; break;
+            case 2: c = v.brake ? Color{255, 34, 22, 255} : (v.lights ? Color{170, 14, 12, 255} : Color{110, 12, 12, 255}); break;
+            default: if (!v.reverse) continue; c = Color{245, 245, 245, 255}; break;
+            }
+            dynGlow.box(I4, pd.c, pd.h, c);
+        }
     }
     if (v.siren) { // Blaulicht-Balken auf dem Dach, wechselt im Takt
         bool a = std::fmod(simTime, 0.36) < 0.18;
@@ -824,7 +870,7 @@ static void bikeDraw(const CarVisual& v, const Mat4& vp, bool cockpit) {
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
     gfxMode(0, 0);
-    shadow.draw();
+    gfxBias(2e-5f); shadow.draw(); gfxBias(0);   // Schatten leicht zur Kamera ziehen: kein Flackern gegen das Gelaende
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 
@@ -958,7 +1004,7 @@ void carDraw(const CarVisual& vIn, const Mat4& vp, bool cockpit, const DashState
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
     gfxMode(0, 0);
-    shadow.draw();
+    gfxBias(2e-5f); shadow.draw(); gfxBias(0);   // Schatten leicht zur Kamera ziehen: kein Flackern gegen das Gelaende
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 
@@ -1042,6 +1088,7 @@ void carPreviewDraw(int x, int y, int w, int h, float yaw) {
     glEnable(GL_SCISSOR_TEST);
     glScissor(x, y, w, h);
     glViewport(x, y, w, h);
+    gfxEnv(1, 0, 1, 0, 0, {0.45f, 0.75f, 0.35f}); gfxHead({0, 0, 0}, {0, 0, 1}, 0);
     glClearColor(0.075f, 0.09f, 0.12f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glClearColor(0, 0, 0, 1);
@@ -1081,6 +1128,7 @@ void carThumbRender(Target& t, int modelIdx, int kind) {
     glBindFramebuffer(GL_FRAMEBUFFER, t.fbo);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, t.w, t.h);
+    gfxEnv(1, 0, 1, 0, 0, {0.45f, 0.75f, 0.35f}); gfxHead({0, 0, 0}, {0, 0, 1}, 0);
     glClearColor(0.11f, 0.13f, 0.17f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glClearColor(0, 0, 0, 1);

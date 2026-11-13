@@ -118,7 +118,23 @@ bool escape();               // Esc im Studio: Verschieben abbrechen / Bearbeitu
 }
 
 // ---------- KI-Verkehr ----------
+// Zustand eines KI-Fahrzeugs oder Fussgaengers fuers Netz (der Host simuliert, die Mitspieler zeigen genau dasselbe)
+#pragma pack(push, 1)
+struct NpcState {
+    uint16_t uid;
+    double lat, lon;
+    float y;
+    int16_t yaw, v;       // Gieren in 1/5000 rad, Tempo in cm/s
+    uint8_t flags;        // 1 Bremse, 2 Blinker links, 4 rechts, 8 Beifahrer, 16 Warnblinker, 32 liegt (Fussgaenger), 64 quert
+    uint8_t model, kind, police;
+    uint8_t c1[3], c2[3];
+};
+#pragma pack(pop)
+
 namespace traffic {
+void snapshot(std::vector<NpcState>& out);                 // Host: alle Fahrzeuge
+void applyRemote(const NpcState* s, int n);                // Mitspieler: Zustand vom Host uebernehmen
+bool puppetMode();                                         // true, solange der Host den Verkehr liefert
 extern int wanted;            // gewuenschte Anzahl Fahrzeuge (0 = aus)
 void update(float dt);
 void draw(const Mat4& vp, Vec3 cam, float maxDist);
@@ -129,6 +145,33 @@ void offence(int kind);       // Verstoss melden: 0 rote Ampel, 1 Stoppschild, 2
 bool hitTest(Vec3 p, float r, Vec3& vel);   // erfasst ein fahrendes KI-Auto diesen Punkt? (vel = Autogeschwindigkeit)
 float sirenLevel();           // Lautstaerke der naechsten Sirene 0..1
 void policeMarks(std::vector<std::pair<Vec3, bool>>& out);  // Polizeiautos (Position, im Einsatz) fuer die Minimap
+}
+
+// ---------- Tageszeit und Wetter ----------
+namespace envir {
+extern float hour;            // Ortszeit 0..24
+extern int weather;           // 0 Klar, 1 Wolkig, 2 Regen, 3 Nebel, 4 Gewitter, 5 Schnee
+extern int speedIdx;          // 0 Uhr steht, 1 Echtzeit, 2 x30, 3 x120
+extern const char* weatherName[6];
+void update(float dt);
+void apply();                 // Shader-Parameter setzen (je Bild)
+Vec3 sunDir();
+float dayFactor();            // 0 Nacht .. 1 Tag
+float night();
+float grip();                 // Reibungsfaktor (nass/Schnee)
+float rainLevel();
+float timeScale();
+float systemHour();
+bool remoteControlled();
+void setRemote(float h, int w, int sp);
+void getState(float& h, int& w, int& sp);
+void drawPrecip(Vec3 cam, Vec3 camVel, double now);
+}
+
+// ---------- Verkehrsschilder und Wechselanzeigen ----------
+namespace signs {
+void draw(const Mat4& vp, Vec3 cam, double now, bool mirrorPass);
+int dynamicLimit(Vec3 pos, Vec3 fwd);   // Tempolimit der naechsten Wechselanzeige vor dem Fahrzeug, 0 = keine
 }
 
 // ---------- Tank, Geld, Tankstellen, Supermaerkte ----------
@@ -173,6 +216,9 @@ void draw(bool mirror);
 }
 
 namespace ped {
+void snapshot(std::vector<NpcState>& out);
+void applyRemote(const NpcState* s, int n);
+bool puppetMode();
 extern int wanted;                                           // gewuenschte Anzahl (0 = aus)
 void update(float dt);
 void draw(const Mat4& vp, Vec3 cam, float maxDist);
@@ -223,6 +269,9 @@ struct NetCar {
     int kind = 0;      // 0 Auto, 1 Moped, 2 Motorrad
     bool tinted = false;
     uint8_t paint[3] = {190, 30, 40};
+    float headYaw = 0, headPitch = 0;   // Kopfhaltung des Fahrers (bei VR-Spielern der echte Kopf)
+    float hyS = 0, hpS = 0;             // nur lokal: geglaettet
+    double tRecv = 0;                   // nur lokal: Zeitpunkt des letzten Pakets
     // nur lokal:
     Vec3 pos;
     Quat qs;

@@ -21,6 +21,17 @@ struct Packet {
     float y, q[4], steer, speed, wheelRot;
     uint8_t flags;
     int8_t model; uint8_t kind, tinted, paint[3];
+    int8_t headYaw, headPitch;   // Kopfhaltung des Fahrers (VR-Kopf oder Kamera): Gieren +-1,6 rad, Nicken +-0,7 rad in 1/127-Schritten
+};
+struct NpcPacket {
+    Hdr h;
+    uint8_t group, count;   // group 0 Fahrzeuge, 1 Fussgaenger
+    NpcState s[24];
+};
+struct EnvPacket {
+    Hdr h;
+    float hour;
+    uint8_t weather, speed;
 };
 struct ChatPacket {
     Hdr h;
@@ -44,7 +55,7 @@ std::vector<NetCar> remote;
 std::vector<LanServer> lan;
 std::vector<netplay::ChatLine> chatLines;
 uint32_t myId = 0;
-float sendTimer = 0, beatTimer = 0;
+float sendTimer = 0, beatTimer = 0, npcTimer = 0, envTimer = 0;
 double lastFromHost = -100, discStart = -100;
 std::string info, serverName = "worldridr";
 int portUsed = 0, maxPlayers = 16;
@@ -109,7 +120,7 @@ std::string addrString(const sockaddr_in& a) {
 
 void receive() {
     for (;;) {
-        char buf[512];
+        char buf[1500];
         sockaddr_in from{};
         int fl = sizeof from;
         int n = recvfrom(sock, buf, sizeof buf, 0, (sockaddr*)&from, &fl);
@@ -135,6 +146,20 @@ void receive() {
             continue;
         }
         if (h.type == 6) { lastFromHost = simTime; continue; }
+        if (h.type == 8) { // Tageszeit und Wetter vom Host
+            if (!isHost && n == (int)sizeof(EnvPacket)) { EnvPacket ep; memcpy(&ep, buf, sizeof ep); lastFromHost = simTime; envir::setRemote(ep.hour, ep.weather, ep.speed); }
+            continue;
+        }
+        if (h.type == 7) { // Verkehr/Fussgaenger vom Host
+            if (!isHost && n >= (int)offsetof(NpcPacket, s)) {
+                lastFromHost = simTime;
+                NpcPacket np{};
+                memcpy(&np, buf, std::min(n, (int)sizeof np));
+                int cnt = std::min<int>(np.count, 24);
+                if (n >= (int)offsetof(NpcPacket, s) + cnt * (int)sizeof(NpcState)) { if (np.group == 0) traffic::applyRemote(np.s, cnt); else ped::applyRemote(np.s, cnt); }
+            }
+            continue;
+        }
         Peer* pe = nullptr;
         if (isHost) {
             for (Peer& q : peers) if (q.addr.sin_addr.s_addr == from.sin_addr.s_addr && q.addr.sin_port == from.sin_port) pe = &q;
@@ -183,7 +208,8 @@ void receive() {
             it->steer = p.steer; it->speed = p.speed; it->wheelRot = p.wheelRot; it->flags = p.flags;
             it->model = p.model; it->kind = p.kind; it->tinted = p.tinted != 0;
             for (int i = 0; i < 3; i++) it->paint[i] = p.paint[i];
-            it->lastSeen = simTime;
+            it->headYaw = p.headYaw * (1.6f / 127.0f); it->headPitch = p.headPitch * (0.7f / 127.0f);
+            it->lastSeen = simTime; it->tRecv = simTime;
         } else if (n == (int)sizeof(ChatPacket) && h.type == 3) {
             ChatPacket c;
             memcpy(&c, buf, sizeof c);
@@ -292,9 +318,42 @@ void update(float dt, const NetCar& mine) {
         p.steer = mine.steer; p.speed = mine.speed; p.wheelRot = mine.wheelRot; p.flags = mine.flags;
         p.model = (int8_t)mine.model; p.kind = (uint8_t)mine.kind; p.tinted = mine.tinted ? 1 : 0;
         for (int i = 0; i < 3; i++) p.paint[i] = mine.paint[i];
+        p.headYaw = (int8_t)clampv((int)std::lround(mine.headYaw * (127.0f / 1.6f)), -127, 127);
+        p.headPitch = (int8_t)clampv((int)std::lround(mine.headPitch * (127.0f / 0.7f)), -127, 127);
         if (isHost) sendAll(p, nullptr); else sendTo(p, hostAddr);
     }
     purge();
+    if (isHost && !peers.empty()) { // Tageszeit/Wetter (1 Hz)
+        envTimer -= dt;
+        if (envTimer <= 0) {
+            envTimer = 1.0f;
+            EnvPacket ep{};
+            ep.h = {MAGIC, 8, myId};
+            float hr; int w, sp;
+            envir::getState(hr, w, sp);
+            ep.hour = hr; ep.weather = (uint8_t)w; ep.speed = (uint8_t)sp;
+            sendAll(ep, nullptr);
+        }
+    }
+    if (isHost && !peers.empty()) { // Verkehr und Fussgaenger: der Host simuliert, alle bekommen denselben Zustand (10 Hz)
+        npcTimer -= dt;
+        if (npcTimer <= 0) {
+            npcTimer = 0.1f;
+            for (int g = 0; g < 2; g++) {
+                std::vector<NpcState> st;
+                if (g == 0) traffic::snapshot(st); else ped::snapshot(st);
+                for (size_t i = 0; i < st.size(); i += 24) {
+                    NpcPacket np{};
+                    np.h = {MAGIC, 7, myId};
+                    np.group = (uint8_t)g;
+                    np.count = (uint8_t)std::min<size_t>(24, st.size() - i);
+                    for (int k = 0; k < np.count; k++) np.s[k] = st[i + k];
+                    int len = (int)offsetof(NpcPacket, s) + np.count * (int)sizeof(NpcState);
+                    for (const Peer& pe : peers) sendto(sock, (const char*)&np, len, 0, (const sockaddr*)&pe.addr, sizeof pe.addr);
+                }
+            }
+        }
+    }
     if (isHost) { // Lebenszeichen, damit Beitretende auch ohne weitere Mitspieler "Verbunden" sehen
         beatTimer -= dt;
         if (beatTimer <= 0) { beatTimer = 1.0f; Hdr h{MAGIC, 6, myId}; sendAll(h, nullptr); }
@@ -305,12 +364,17 @@ void update(float dt, const NetCar& mine) {
         world.toLocal(c.lat, c.lon, target.x, target.z);
         target.y = c.y;
         if (!c.placed || length(target - c.pos) > 30) { c.pos = target; c.qs = c.q; c.placed = true; }
-        float k = std::min(1.0f, dt * 12.0f);
+        // Ziel = letzte bekannte Position, entlang der Fahrtrichtung bis zur Gegenwart fortgeschrieben (Pakete kommen nur mit 20 Hz);
+        // das Auto folgt dem Ziel exponentiell weich, ohne zusaetzlich selbst vorzulaufen (sonst entsteht das Ruckeln)
+        float k = 1.0f - std::exp(-dt * 14.0f);
         Vec3 f = qrot(c.q, {0, 0, -1});
-        c.pos += f * (c.speed * dt) + (target - c.pos) * k;
+        target = target + f * (c.speed * (float)std::min(0.30, std::max(0.0, simTime - c.tRecv)));
+        c.pos += (target - c.pos) * k;
         float sgn = (c.qs.w * c.q.w + c.qs.x * c.q.x + c.qs.y * c.q.y + c.qs.z * c.q.z) < 0 ? -1.0f : 1.0f;
         c.qs = qnorm({c.qs.w + (c.q.w * sgn - c.qs.w) * k, c.qs.x + (c.q.x * sgn - c.qs.x) * k, c.qs.y + (c.q.y * sgn - c.qs.y) * k, c.qs.z + (c.q.z * sgn - c.qs.z) * k});
         c.wheelRot += c.speed / 0.316f * dt;
+        c.hyS += (c.headYaw - c.hyS) * std::min(1.0f, dt * 14.0f);   // Kopf weich nachfuehren (Pakete kommen mit 20 Hz)
+        c.hpS += (c.headPitch - c.hpS) * std::min(1.0f, dt * 14.0f);
     }
 }
 

@@ -146,7 +146,11 @@ struct Cell { Mesh m; Vec3 lo, hi; };               // Teilnetz eines Chunks, ei
 struct CellRes { std::vector<Vertex> v; Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f}; };
 static const int GC = 6;                              // Zellen pro Achse
 struct TileRes { int gen, z, x, y; bool ok = false; std::vector<Vertex> v; std::vector<uint8_t> rgb; int w = 0, h = 0; std::vector<uint8_t> forest; };
-struct RoadPatch { std::vector<float> px, pz, py; float hw = 3; };
+struct RoadPatch {
+    std::vector<float> px, pz, py;
+    float hw = 3;
+    float x0 = 1e9f, z0 = 1e9f, x1 = -1e9f, z1 = -1e9f;
+};
 struct Chunk {
     std::vector<RoadPatch> patches;   // ueberschriebene Strassenhoehen (Fahrflaeche unter der Gelaendehoehe)
     Mesh roads;                       // nur fuer selbst gebaute Strassen
@@ -157,6 +161,7 @@ struct Chunk {
     std::vector<Building> buildings;
     std::vector<Poi> pois;
     std::vector<TreePos> trees;
+    std::vector<SignDef> signs;
     float x0 = 0, z0 = 0, x1 = 0, z1 = 0;
     double touched = 0;
     bool ok = false;
@@ -173,6 +178,7 @@ struct ChunkRes {
     std::vector<Building> buildings;
     std::vector<Poi> pois;
     std::vector<TreePos> trees;
+    std::vector<SignDef> signs;
     float x0, z0, x1, z1;
 };
 
@@ -376,6 +382,66 @@ static void pushLamp(std::vector<Vertex>& out, float x, float gy, float z, float
     pushBox(out, {x, gy + 2.6f, z}, {0.05f, 2.6f, 0.05f}, 1, 0, Color{92, 94, 100, 255});
     pushBox(out, {x + dx * 0.55f, gy + 5.15f, z + dz * 0.55f}, {0.62f, 0.05f, 0.05f}, dx, dz, Color{92, 94, 100, 255});
     pushBox(out, {x + dx * 1.1f, gy + 5.05f, z + dz * 1.1f}, {0.22f, 0.06f, 0.12f}, dx, dz, Color{232, 228, 200, 255});
+}
+
+// Beliebige Flaeche (Boeschung): Normale wird zur Aussenseite ausgerichtet
+static void pushQuadN(std::vector<Vertex>& out, Vec3 a, Vec3 b, Vec3 c, Vec3 d, Vec3 outward, Color col) {
+    col.a = 0;
+    Vec3 n = normalize(cross(b - a, d - a));
+    if (dot(n, outward) < 0) n = -n;
+    Vec3 pp[4] = {a, b, c, d};
+    Vertex v[4];
+    for (int i = 0; i < 4; i++) v[i] = {{pp[i].x, pp[i].y, pp[i].z}, {n.x, n.y, n.z}, {0, 0}, col};
+    out.push_back(v[0]); out.push_back(v[1]); out.push_back(v[2]);
+    out.push_back(v[0]); out.push_back(v[2]); out.push_back(v[3]);
+}
+// Strassenmarkierungen als flache Dreiecke im Strassenpass (Klasse 9 = weisse Farbe, siehe Shader)
+static void markTri(std::vector<Vertex>& out, float x0, float z0, float x1, float z1, float x2, float z2, float y) {
+    Color c{0, 0, 9, 0};
+    out.push_back({{x0, y, z0}, {0, 1, 0}, {0, 0}, c}); out.push_back({{x1, y, z1}, {0, 1, 0}, {0, 0}, c}); out.push_back({{x2, y, z2}, {0, 1, 0}, {0, 0}, c});
+}
+static void markBar(std::vector<Vertex>& out, float ax, float az, float bx, float bz, float half, float y) {
+    float dx = bx - ax, dz = bz - az, l = std::hypot(dx, dz);
+    if (l < 1e-4f) return;
+    float nx = -dz / l * half, nz = dx / l * half;
+    markTri(out, ax - nx, az - nz, ax + nx, az + nz, bx + nx, bz + nz, y);
+    markTri(out, ax - nx, az - nz, bx + nx, bz + nz, bx - nx, bz - nz, y);
+}
+static void markHead(std::vector<Vertex>& out, float tx, float tz, float dx, float dz, float len, float half, float y) {
+    float bx = tx - dx * len, bz = tz - dz * len;
+    markTri(out, tx, tz, bx - dz * half, bz + dx * half, bx + dz * half, bz - dx * half, y);
+}
+// Fahrspurpfeil in Fahrtrichtung (fx,fz): geradeaus, links und/oder rechts; sc = Groesse (1 = Spurbreite ca. 3,3 m)
+static void arrowGlyph(std::vector<Vertex>& out, float cx, float cz, float y, float fx, float fz, bool thru, bool left, bool right, float sc) {
+    float rxv = -fz, rzv = fx;
+    auto P = [&](float u, float v, float& x, float& z) { x = cx + (fx * u + rxv * v) * sc; z = cz + (fz * u + rzv * v) * sc; };
+    float ax, az, bx, bz;
+    if (thru) {
+        P(-1.3f, 0, ax, az); P(0.5f, 0, bx, bz); markBar(out, ax, az, bx, bz, 0.10f * sc, y);
+        P(1.4f, 0, ax, az); markHead(out, ax, az, fx, fz, 0.9f * sc, 0.42f * sc, y);
+    }
+    for (int side = -1; side <= 1; side += 2) {
+        if ((side < 0 && !left) || (side > 0 && !right)) continue;
+        float u0 = thru ? -0.2f : 0.0f;
+        if (!thru) { P(-1.3f, 0, ax, az); P(u0, 0, bx, bz); markBar(out, ax, az, bx, bz, 0.10f * sc, y); }
+        float ex, ez, tx, tz;
+        float ddx = (fx * 0.72f + rxv * 0.69f * side), ddz = (fz * 0.72f + rzv * 0.69f * side);   // 45 Grad zur Seite
+        P(u0, 0, ax, az);
+        ex = ax + ddx * 1.15f * sc; ez = az + ddz * 1.15f * sc;
+        markBar(out, ax, az, ex, ez, 0.10f * sc, y);
+        tx = ex + ddx * 0.55f * sc; tz = ez + ddz * 0.55f * sc;
+        markHead(out, tx, tz, ddx, ddz, 0.85f * sc, 0.40f * sc, y);
+    }
+}
+// Schnitt zweier Strecken (ta/tb = Parameter 0..1)
+static bool segCross(float ax, float az, float bx, float bz, float cx, float cz, float dx, float dz, float& ta, float& tb) {
+    float rx = bx - ax, rz = bz - az, sx = dx - cx, sz = dz - cz;
+    float den = rx * sz - rz * sx;
+    if (std::fabs(den) < 1e-6f) return false;
+    float qx = cx - ax, qz = cz - az;
+    ta = (qx * sz - qz * sx) / den;
+    tb = (qx * rz - qz * rx) / den;
+    return ta >= 0 && ta <= 1 && tb >= 0 && tb <= 1;
 }
 
 static Color brandColor(const std::string& nm, bool fuel) {
@@ -897,6 +963,14 @@ struct WayTmp {
     uint8_t ringOuter = 1;        // 1: Aussenseite liegt rechts der Laufrichtung, 2: links
     int64_t id = 0;
     bool lanesExplicit = false;
+    bool bridge = false, tunnel = false;   // bridge=*, tunnel=yes
+    bool inferred = false;                 // Spurzahl stammt von einem Nachbarabschnitt (kein eigener lanes-Tag)
+    float widthTag = 0;                    // width=* in Metern, 0 = nicht angegeben
+    bool speedTag = false, link = false;   // maxspeed explizit gesetzt, *_link-Strasse (Auf-/Abfahrt)
+    std::string dest, ref, jref;           // destination, ref, junction:ref (Wegweiser)
+    int layer = 0;                         // layer=*
+    int lanesBack = 0;                     // Spuren links der Mittellinie (Gegenrichtung); 0 = symmetrisch
+    std::string turnF, turnB;              // turn:lanes in Fahrtrichtung / Gegenrichtung (links nach rechts)
     int klass, lanes, flags, oneway, name;
     float hw, maxspeed;
     std::vector<float> px, pz;
@@ -932,7 +1006,8 @@ static bool fetchWater(int cx, int cy, json& j) {
     return false;
 }
 
-static void buildWater(World::Impl* d, const GeoRef& g, int cx, int cy, float x0, float z0, float x1, float z1, std::vector<Vertex>& out) {
+// roadMask: gleiche 4-m-Zellen wie unten (nx * nz); dort liegt eine Strasse auf dem Boden, das Wasser wird ausgespart
+static void buildWater(World::Impl* d, const GeoRef& g, int cx, int cy, float x0, float z0, float x1, float z1, std::vector<Vertex>& out, const std::vector<uint8_t>* roadMask = nullptr) {
     json j;
     if (!fetchWater(cx, cy, j)) return;
     const float CS = 4.0f;
@@ -1005,6 +1080,7 @@ static void buildWater(World::Impl* d, const GeoRef& g, int cx, int cy, float x0
             for (int c = c0; c <= c1; c++) mask[(size_t)r * nx + c] = 1;
         }
     }
+    if (roadMask && roadMask->size() == mask.size()) for (size_t i = 0; i < mask.size(); i++) if ((*roadMask)[i]) mask[i] = 0;   // keine Wasserflaeche ueber Strassen
     auto H = [&](float x, float z) { float h = 0; d->elev.height(g.mx0 + x / g.S, g.my0 + z / g.S, h, true); return h; };
     Color col{44, 96, 128, 238};
     for (int r = 0; r < nz; r++)
@@ -1073,17 +1149,34 @@ static void buildChunk(World::Impl* d, GeoRef g, int cx, int cy) {
                 w.oneway = (ow == "yes" || ow == "1" || ow == "true") ? 1 : (ow == "-1" ? -1 : 0);
                 if (ow.empty() && (klass == 0 || tagOf(e, "junction") == "roundabout")) w.oneway = 1;
                 int lanesTag = atoi(tagOf(e, "lanes").c_str());
-                { int ov; if (laneOverride(w.id, ov)) lanesTag = ov; }
+                int lanesFwd = atoi(tagOf(e, "lanes:forward").c_str()), lanesBwd = atoi(tagOf(e, "lanes:backward").c_str());
+                if (lanesTag <= 0 && (lanesFwd > 0 || lanesBwd > 0)) lanesTag = std::min(8, lanesFwd + lanesBwd);
+                { int ov; if (laneOverride(w.id, ov)) { lanesTag = ov; lanesFwd = lanesBwd = 0; } }
                 w.lanesExplicit = lanesTag > 0;
                 w.lanes = lanesTag > 0 ? std::min(lanesTag, 8) : (klass >= 6 ? 1 : (w.oneway && klass >= 2 ? 1 : 2));
                 static const float laneW[8] = {3.75f, 3.5f, 3.5f, 3.25f, 3.25f, 2.9f, 3.4f, 2.8f};
                 float width = w.lanes * laneW[klass] + (klass <= 1 ? 1.5f : 0.4f);
                 float wt = std::strtof(tagOf(e, "width").c_str(), nullptr);
-                if (wt >= 2.5f && wt <= 30) width = wt;
+                if (wt >= 2.5f && wt <= 30) { width = wt; w.widthTag = wt; }
                 w.hw = std::min(width * 0.5f, 25.0f);
                 w.flags = ((klass <= 4 || lanesTag >= 2) && w.lanes >= 2 ? 1 : 0) | (klass <= 3 ? 2 : 0) | (w.oneway ? 4 : 0);
+                // Brueckenlage, Tunnel und Stockwerk (layer)
+                w.layer = clampv(atoi(tagOf(e, "layer").c_str()), -5, 5);
+                { std::string bt = tagOf(e, "bridge"), tt = tagOf(e, "tunnel"); w.bridge = !bt.empty() && bt != "no"; w.tunnel = tt == "yes" || tt == "avalanche_protector"; }
+                // Spuren je Richtung: die Mittellinie liegt nach lanes:backward (links der Wegrichtung) statt in der Mitte
+                if (w.oneway == 0 && (w.flags & 1) && lanesTag > 0) {
+                    int bk = lanesBwd > 0 ? lanesBwd : (lanesFwd > 0 ? w.lanes - lanesFwd : 0);
+                    if (bk > 0 && bk < w.lanes && bk * 2 != w.lanes) { w.lanesBack = std::min(bk, 7); w.flags |= w.lanesBack << 5; }
+                }
+                // Abbiegepfeile (turn:lanes): Einbahn = alle Spuren, sonst je Richtung
+                if (w.oneway == 1) w.turnF = tagOf(e, "turn:lanes");
+                else if (w.oneway == -1) w.turnB = tagOf(e, "turn:lanes");
+                else { w.turnF = tagOf(e, "turn:lanes:forward"); w.turnB = tagOf(e, "turn:lanes:backward"); }
                 float def = klass == 0 ? 130 : klass == 1 ? 100 : (klass >= 6 ? 30 : (hw == "living_street" ? 20 : 50));
                 w.maxspeed = parseSpeed(tagOf(e, "maxspeed"), def);
+                w.speedTag = !tagOf(e, "maxspeed").empty();
+                w.link = hw.size() > 5 && hw.compare(hw.size() - 5, 5, "_link") == 0;
+                w.dest = tagOf(e, "destination"); w.ref = tagOf(e, "ref"); w.jref = tagOf(e, "junction:ref");
                 {   // Gehsteig: aus dem Tag, sonst in Ortsstrassen (Tempo <= 50) angenommen
                     std::string sw = tagOf(e, "sidewalk");
                     if (sw.empty()) sw = tagOf(e, "sidewalk:both");
@@ -1211,6 +1304,45 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                 OV.found.push_back(c);
             }
         }
+        { // Fehlende Spurzahlen von Nachbarabschnitten derselben Strasse uebernehmen (statt Klassenstandard: sonst wechselt die Breite zufaellig)
+            static const float laneW[8] = {3.75f, 3.5f, 3.5f, 3.25f, 3.25f, 2.9f, 3.4f, 2.8f};
+            std::unordered_map<int64_t, std::vector<int>> at;
+            for (int wi = 0; wi < (int)ways.size(); wi++) {
+                const WayTmp& w = ways[wi];
+                if (w.nodes.size() < 2 || w.nodes.size() != w.px.size() || w.klass > 5 || w.ring) continue;
+                at[w.nodes.front()].push_back(wi);
+                at[w.nodes.back()].push_back(wi);
+            }
+            for (int iter = 0; iter < 4; iter++) { // ueber mehrere Abschnitte hinweg weitergeben
+                bool any = false;
+                for (int wi = 0; wi < (int)ways.size(); wi++) {
+                    WayTmp& w = ways[wi];
+                    if (w.lanesExplicit || w.inferred || w.nodes.size() != w.px.size() || w.nodes.size() < 2 || w.klass > 5 || w.ring || r.names[w.name].empty()) continue;
+                    int found = 0;
+                    for (int64_t node : {w.nodes.front(), w.nodes.back()}) {
+                        auto it = at.find(node);
+                        if (it == at.end()) continue;
+                        int cand = 0, cnt = 0;
+                        for (int oi : it->second) {
+                            const WayTmp& o = ways[oi];
+                            if (oi == wi || o.klass != w.klass || o.name != w.name || o.oneway != w.oneway) continue;
+                            cnt++;
+                            if (o.lanesExplicit || o.inferred) cand = o.lanes;
+                        }
+                        if (cnt == 1 && cand > 0) found = found == 0 ? cand : std::min(found, cand);   // nur eindeutige Fortsetzungen, nie an Abzweigen raten
+                    }
+                    if (found <= 0) continue;
+                    w.inferred = true; any = true;
+                    if (found != w.lanes) {
+                        w.lanes = found;
+                        float width = w.widthTag > 0 ? w.widthTag : w.lanes * laneW[w.klass] + (w.klass <= 1 ? 1.5f : 0.4f);
+                        w.hw = std::min(width * 0.5f, 25.0f);
+                        if (w.lanes >= 2 && (w.klass <= 4 || found >= 2)) w.flags |= 1; else w.flags &= ~1;
+                    }
+                }
+                if (!any) break;
+            }
+        }
         // ----- Strassen: kleine Strassen zuerst, grosse zuletzt (liegen beim Zeichnen oben) -----
         // Erst alle Gehsteige, dann aller Asphalt: so schneidet kein Gehsteig die Einmuendung einer Seitenstrasse ab.
         std::stable_sort(ways.begin(), ways.end(), [](const WayTmp& a, const WayTmp& b) { return a.klass > b.klass; });
@@ -1230,12 +1362,17 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
             }
             return false;
         };
-        struct JN { float x, z, hw; };
+        struct JN { float x, z, hw; float y = -1e9f; };   // y: Fahrbahnhoehe (Bruecke/Rampe), sonst Gelaende
         std::unordered_map<int64_t, JN> jmap;
-        for (const WayTmp& w : ways) {
+        // ===== Strassengeometrie in drei Schritten: (1) glaetten + teilen, (2) Hoehenfuehrung, (3) Netze bauen =====
+        struct WayGeo { std::vector<float> sx, sz, rx, rz, rd, ry, cumS, wedge; bool bridge = false, tunnel = false; };   // wedge: erlaubte Halbbreite je Stuetzpunkt (Rampenkeil)
+        std::vector<WayGeo> wg(ways.size());
+        for (size_t wi = 0; wi < ways.size(); wi++) { // (1) Linie glaetten (Kreuzungsknoten bleiben exakt), in ~5-m-Schritte teilen
+            const WayTmp& w = ways[wi];
+            WayGeo& G = wg[wi];
             int n = (int)w.px.size();
-            // ----- Linie glaetten: Ecken werden mit quadratischen Kurven gerundet, Kreuzungsknoten bleiben exakt -----
-            std::vector<float> sx, sz;
+            std::vector<float>& sx = G.sx;
+            std::vector<float>& sz = G.sz;
             if (w.ring) { // Kreisverkehr: Spline durch alle Knoten; an den Wegenden mit den Nachbarwegen des Rings fortgesetzt
                 auto neighbour = [&](int64_t node, bool wantPrev, float& qx, float& qz) {
                     for (const WayTmp& o : ways) {
@@ -1287,27 +1424,237 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
             sx.push_back(w.px[n - 1]); sz.push_back(w.pz[n - 1]);
             }
             int sn = (int)sx.size();
-            for (int i = 0; i + 1 < sn; i++) {
-                if (!inside((sx[i] + sx[i + 1]) * 0.5f, (sz[i] + sz[i + 1]) * 0.5f)) continue;
-                r.segs.push_back({sx[i], sz[i], sx[i + 1], sz[i + 1], w.hw, w.maxspeed, (int8_t)w.oneway, (uint8_t)w.klass, (uint8_t)w.lanes, (uint8_t)(w.flags & 1), w.name, (uint8_t)(w.ring ? w.ringOuter : 0), w.id});
-            }
-            std::vector<float> rx, rz, rd;
+            G.cumS.assign(sn, 0.0f);
             float dist = 0;
             for (int i = 0; i + 1 < sn; i++) {
                 float len = std::hypot(sx[i + 1] - sx[i], sz[i + 1] - sz[i]);
+                G.cumS[i] = dist;
                 int steps = std::max(1, (int)std::ceil(len / 5.0f));
                 for (int s = 0; s < steps; s++) {
                     float t = (float)s / steps;
-                    rx.push_back(sx[i] + (sx[i + 1] - sx[i]) * t);
-                    rz.push_back(sz[i] + (sz[i + 1] - sz[i]) * t);
-                    rd.push_back(dist + len * t);
+                    G.rx.push_back(sx[i] + (sx[i + 1] - sx[i]) * t);
+                    G.rz.push_back(sz[i] + (sz[i + 1] - sz[i]) * t);
+                    G.rd.push_back(dist + len * t);
                 }
                 dist += len;
             }
-            rx.push_back(sx[sn - 1]); rz.push_back(sz[sn - 1]); rd.push_back(dist);
-            int m = (int)rx.size();
-            std::vector<float> ry;       // Hoehenprofil der Fahrbahn bei einem Override
-            {
+            G.cumS[sn - 1] = dist;
+            G.rx.push_back(sx[sn - 1]); G.rz.push_back(sz[sn - 1]); G.rd.push_back(dist);
+        }
+        { // (2) Hoehenfuehrung. Basis = Gelaende; Bruecke = Gerade zwischen den Enden (ueber Taelern frei schwebend), Tunnel = unter dem Gelaende.
+          // Bruecken muessen ueber kreuzenden Strassen mit niedrigerem Stockwerk 5,6 m Abstand haben; die Strassen steigen davor mit
+          // begrenzter Steigung an (ueber gemeinsame Knoten hinweg), so entstehen Rampen/Daemme statt unmoeglicher Spruenge.
+            const size_t NW = ways.size();
+            std::vector<size_t> off(NW + 1, 0);
+            for (size_t wi = 0; wi < NW; wi++) off[wi + 1] = off[wi] + wg[wi].rx.size();
+            const size_t TOT = off[NW];
+            std::vector<float> B(TOT), E(TOT, 0.0f), LB(TOT, 0.0f), SM(NW), bx0(NW), bx1(NW), bz0(NW), bz1(NW);
+            bool anyStruct = false;
+            for (size_t wi = 0; wi < NW; wi++) {
+                const WayTmp& w = ways[wi];
+                WayGeo& G = wg[wi];
+                int m = (int)G.rx.size();
+                G.bridge = w.bridge && m >= 2;
+                G.tunnel = w.tunnel && !w.bridge && m >= 2;
+                anyStruct = anyStruct || G.bridge || G.tunnel;
+                SM[wi] = w.klass <= 1 ? 0.055f : (w.klass <= 5 ? 0.075f : 0.10f);
+                bx0[wi] = bz0[wi] = 1e9f; bx1[wi] = bz1[wi] = -1e9f;
+                for (int k = 0; k < m; k++) {
+                    B[off[wi] + k] = H(G.rx[k], G.rz[k]);
+                    bx0[wi] = std::min(bx0[wi], G.rx[k]); bx1[wi] = std::max(bx1[wi], G.rx[k]);
+                    bz0[wi] = std::min(bz0[wi], G.rz[k]); bz1[wi] = std::max(bz1[wi], G.rz[k]);
+                }
+            }
+            if (anyStruct) {
+                const std::vector<float> gH(B); // Gelaendehoehe
+                for (size_t wi = 0; wi < NW; wi++) {
+                    WayGeo& G = wg[wi];
+                    int m = (int)G.rx.size();
+                    if (!G.bridge && !G.tunnel) continue;
+                    float L = std::max(0.1f, G.rd[m - 1]), h0 = gH[off[wi]], h1 = gH[off[wi] + m - 1];
+                    for (int k = 0; k < m; k++) {
+                        size_t gi = off[wi] + k;
+                        if (G.bridge) B[gi] = std::max(h0 + (h1 - h0) * (G.rd[k] / L), gH[gi] + 0.1f);
+                        else B[gi] = gH[gi] - std::min(7.0f, 0.085f * std::min(G.rd[k], L - G.rd[k]));
+                    }
+                }
+                // Stuetzpunkte an derselben Position (gemeinsame OSM-Knoten) bilden eine Gruppe mit gleicher Hoehe
+                std::vector<std::pair<int64_t, size_t>> kv;
+                kv.reserve(TOT);
+                for (size_t wi = 0; wi < NW; wi++)
+                    for (size_t k = 0; k < wg[wi].rx.size(); k++) {
+                        int64_t key = ((int64_t)(int32_t)std::llround((double)wg[wi].rx[k] * 20.0) << 32) | (uint32_t)(int32_t)std::llround((double)wg[wi].rz[k] * 20.0);
+                        kv.push_back({key, off[wi] + k});
+                    }
+                std::sort(kv.begin(), kv.end());
+                std::vector<std::vector<size_t>> members;
+                for (size_t i = 0; i < kv.size();) {
+                    size_t j = i;
+                    while (j < kv.size() && kv[j].first == kv[i].first) j++;
+                    if (j - i >= 2) { members.emplace_back(); for (size_t q = i; q < j; q++) members.back().push_back(kv[q].second); }
+                    i = j;
+                }
+                const float CLEAR = 5.6f;
+                auto computeLB = [&]() { // geforderter Aufschlag der Bruecken ueber kreuzenden, tiefer liegenden Strassen
+                    for (size_t wi = 0; wi < NW; wi++) {
+                        if (!wg[wi].bridge) continue;
+                        const WayTmp& w = ways[wi];
+                        const WayGeo& G = wg[wi];
+                        int la = std::max(1, w.layer), m = (int)G.rx.size();
+                        for (int k = 0; k + 1 < m; k++) {
+                            float ax = G.rx[k], az = G.rz[k], bx = G.rx[k + 1], bz = G.rz[k + 1];
+                            float mnx = std::min(ax, bx) - 1, mxx = std::max(ax, bx) + 1, mnz = std::min(az, bz) - 1, mxz = std::max(az, bz) + 1;
+                            for (size_t wj = 0; wj < NW; wj++) {
+                                if (wj == wi) continue;
+                                const WayTmp& o = ways[wj];
+                                int lo = o.bridge ? std::max(1, o.layer) : o.layer;
+                                if (lo >= la) continue;
+                                if (bx0[wj] - o.hw > mxx || bx1[wj] + o.hw < mnx || bz0[wj] - o.hw > mxz || bz1[wj] + o.hw < mnz) continue;
+                                const WayGeo& O = wg[wj];
+                                int mo = (int)O.rx.size();
+                                for (int j = 0; j + 1 < mo; j++) {
+                                    float ta, tb;
+                                    if (!segCross(ax, az, bx, bz, O.rx[j], O.rz[j], O.rx[j + 1], O.rz[j + 1], ta, tb)) continue;
+                                    if ((ta < 0.01f || ta > 0.99f) && (tb < 0.01f || tb > 0.99f)) continue; // gemeinsamer Endpunkt, keine Kreuzung
+                                    float px = ax + (bx - ax) * ta, pz = az + (bz - az) * ta;
+                                    size_t gj = off[wj] + j;
+                                    float yo = (B[gj] + E[gj]) * (1 - tb) + (B[gj + 1] + E[gj + 1]) * tb;
+                                    float need = yo + CLEAR, reach = o.hw + 2.5f;
+                                    for (int q = std::max(0, k - 2); q <= std::min(m - 1, k + 3); q++) {
+                                        if (std::hypot(G.rx[q] - px, G.rz[q] - pz) > reach) continue;
+                                        size_t gq = off[wi] + q;
+                                        LB[gq] = std::max(LB[gq], need - B[gq]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                for (int outer = 0; outer < 3; outer++) { // 3 Durchlaeufe: uebereinanderliegende Stockwerke
+                    computeLB();
+                    for (size_t gi = 0; gi < TOT; gi++) E[gi] = std::max(E[gi], LB[gi]);
+                    for (int round = 0; round < 80; round++) { // Aufschlag klingt mit der Steigungsgrenze ab, an gemeinsamen Knoten gleich
+                        bool changed = false;
+                        for (size_t wi = 0; wi < NW; wi++) {
+                            const WayGeo& G = wg[wi];
+                            int m = (int)G.rx.size();
+                            size_t o0 = off[wi];
+                            for (int k = 1; k < m; k++) { float need = E[o0 + k - 1] - SM[wi] * (G.rd[k] - G.rd[k - 1]); if (need > E[o0 + k] + 1e-4f) { E[o0 + k] = need; changed = true; } }
+                            for (int k = m - 2; k >= 0; k--) { float need = E[o0 + k + 1] - SM[wi] * (G.rd[k + 1] - G.rd[k]); if (need > E[o0 + k] + 1e-4f) { E[o0 + k] = need; changed = true; } }
+                        }
+                        for (const auto& mem : members) {
+                            float top = -1e9f;
+                            for (size_t gi : mem) top = std::max(top, B[gi] + E[gi]);
+                            for (size_t gi : mem) { float e2 = top - B[gi]; if (e2 > E[gi] + 1e-4f) { E[gi] = e2; changed = true; } }
+                        }
+                        if (!changed) break;
+                    }
+                }
+                for (size_t wi = 0; wi < NW; wi++) { // Fahrbahnhoehe nur dort setzen, wo sie vom Gelaende abweicht
+                    WayGeo& G = wg[wi];
+                    int m = (int)G.rx.size();
+                    float mx = 0;
+                    for (int k = 0; k < m; k++) mx = std::max(mx, E[off[wi] + k]);
+                    if (!(G.bridge || G.tunnel || mx > 0.12f)) continue;
+                    G.ry.resize(m);
+                    for (int k = 0; k < m; k++) G.ry[k] = B[off[wi] + k] + E[off[wi] + k];
+                    for (int pass = 0; pass < 3; pass++) // Knicke an den Rampenfuessen ausrunden (nur nach oben, Mindesthoehen bleiben erhalten)
+                        for (int k = 1; k + 1 < m; k++) { float avg = 0.25f * G.ry[k - 1] + 0.5f * G.ry[k] + 0.25f * G.ry[k + 1]; if (avg > G.ry[k]) G.ry[k] = avg; }
+                }
+            }
+        }
+        { // Auf- und Abfahrten: die OSM-Linie einer Rampe (*_link) beginnt auf der Mittellinie der Hauptfahrbahn und wuerde sie ueberlagern.
+          // Mathematisch: der seitliche Abstand d(s) der Rampenlinie von der Hauptfahrbahn muss mindestens
+          //   req(s) = hwHaupt + 0,4 m + hwRampe * w(s),  w(s) = smoothstep(s / 90 m)
+          // betragen (s = Strecke vom Abzweig). Wo d kleiner ist, wird die Linie um genau die Differenz nach aussen geschoben;
+          // gleichzeitig waechst die Rampenbreite keilfoermig mit w(s). Ergebnis: die Rampe loest sich sauber vom Fahrbahnrand.
+          // Die Navigations-/Verkehrslinie (sx/sz) behaelt ihren Anfangspunkt im Knoten, damit das Strassennetz verbunden bleibt.
+            auto sq = [](float v) { return v * v; };
+            for (size_t li = 0; li < ways.size(); li++) {
+                const WayTmp& L = ways[li];
+                if (!L.link || L.klass > 2 || L.nodes.size() != L.px.size() || L.nodes.size() < 2) continue;
+                WayGeo& GL = wg[li];
+                int ml = (int)GL.rx.size(), sn2 = (int)GL.sx.size();
+                if (ml < 3 || sn2 < 3) continue;
+                float Lw = GL.rd[ml - 1];
+                if ((int)GL.wedge.size() != ml) GL.wedge.assign(ml, 1e9f);
+                for (int end = 0; end < 2; end++) {
+                    int64_t N = end == 0 ? L.nodes.front() : L.nodes.back();
+                    int mi = -1, idx = -1;
+                    for (size_t q = 0; q < ways.size() && mi < 0; q++) { // Hauptfahrbahn: Richtungsfahrbahn, die den Knoten enthaelt
+                        const WayTmp& M = ways[q];
+                        if (q == li || M.link || M.klass > 3 || M.oneway == 0 || M.nodes.size() != M.px.size()) continue;
+                        for (size_t t = 0; t < M.nodes.size(); t++) if (M.nodes[t] == N) { mi = (int)q; idx = (int)t; break; }
+                    }
+                    if (mi < 0) continue;
+                    const WayTmp& M = ways[mi];
+                    const WayGeo& GM = wg[mi];
+                    int mm = (int)GM.rx.size();
+                    if (mm < 2) continue;
+                    float npx = M.px[idx], npz = M.pz[idx];
+                    int kk = 0;
+                    float bd = 1e18f;
+                    for (int k = 0; k < mm; k++) { float dd = sq(GM.rx[k] - npx) + sq(GM.rz[k] - npz); if (dd < bd) { bd = dd; kk = k; } }
+                    int lo = kk, hi = kk;
+                    while (lo > 0 && GM.rd[kk] - GM.rd[lo] < 350.0f) lo--;
+                    while (hi < mm - 1 && GM.rd[hi] - GM.rd[kk] < 350.0f) hi++;
+                    int k2 = std::min(kk + 1, mm - 1), k1 = std::max(kk - 1, 0);
+                    float tx = GM.rx[k2] - GM.rx[k1], tz = GM.rz[k2] - GM.rz[k1], tn = std::hypot(tx, tz);
+                    if (tn < 1e-4f) continue;
+                    float lnx = -tz / tn, lnz = tx / tn;   // rechte Normale der Hauptfahrbahn
+                    float sideSign = 1.0f;                 // Rampe liegt rechts (+1) oder links (-1) der Fahrtrichtung
+                    for (int k = 0; k < ml; k++) {
+                        float s = end == 0 ? GL.rd[k] : Lw - GL.rd[k];
+                        if (s >= 40.0f) { sideSign = ((GL.rx[k] - npx) * lnx + (GL.rz[k] - npz) * lnz) >= 0 ? 1.0f : -1.0f; break; }
+                    }
+                    auto shiftPt = [&](float& x, float& z, float s) {
+                        if (s > 230.0f) return;
+                        float u = clampv(s / 90.0f, 0.0f, 1.0f), wv = u * u * (3.0f - 2.0f * u);
+                        float req = M.hw + 0.4f + L.hw * wv;
+                        float bestD = 1e18f, qx = 0, qz = 0;
+                        for (int j = lo; j < hi; j++) {
+                            float vx = GM.rx[j + 1] - GM.rx[j], vz = GM.rz[j + 1] - GM.rz[j], l2 = vx * vx + vz * vz;
+                            float t = l2 > 1e-6f ? clampv(((x - GM.rx[j]) * vx + (z - GM.rz[j]) * vz) / l2, 0.0f, 1.0f) : 0.0f;
+                            float px = GM.rx[j] + vx * t, pz = GM.rz[j] + vz * t, dd = sq(x - px) + sq(z - pz);
+                            if (dd < bestD) { bestD = dd; qx = px; qz = pz; }
+                        }
+                        float d = std::sqrt(bestD), ux, uz;
+                        if (d < 0.05f) { ux = lnx * sideSign; uz = lnz * sideSign; } else { ux = (x - qx) / d; uz = (z - qz) / d; }
+                        if (d < req) { x += ux * (req - d); z += uz * (req - d); }
+                    };
+                    for (int k = 0; k < ml; k++) { // Fahrbahnband (dicht): verschieben und Keilbreite setzen
+                        float s = end == 0 ? GL.rd[k] : Lw - GL.rd[k];
+                        shiftPt(GL.rx[k], GL.rz[k], s);
+                        float u = clampv(s / 90.0f, 0.0f, 1.0f), wv = u * u * (3.0f - 2.0f * u);
+                        GL.wedge[k] = std::min(GL.wedge[k], std::max(0.6f, L.hw * wv));
+                    }
+                    for (int i = 1; i + 1 < sn2; i++) { // Stuetzpunkte fuer Segmente/Verkehr: Endpunkte bleiben im Knoten
+                        float s = end == 0 ? GL.cumS[i] : GL.cumS[sn2 - 1] - GL.cumS[i];
+                        shiftPt(GL.sx[i], GL.sz[i], s);
+                    }
+                }
+            }
+        }
+        // Wegenden je Knoten (fuer Spurverengungen und Schilder)
+        std::unordered_map<int64_t, std::vector<int>> endsAt;
+        for (int wi = 0; wi < (int)ways.size(); wi++) {
+            const WayTmp& w = ways[wi];
+            if (w.nodes.size() < 2 || w.nodes.size() != w.px.size()) continue;
+            endsAt[w.nodes.front()].push_back(wi);
+            endsAt[w.nodes.back()].push_back(wi);
+        }
+        for (size_t wi = 0; wi < ways.size(); wi++) { // (3) Segmente, Fahrbahn-/Gehsteignetze, Bauwerke, Schilder
+            const WayTmp& w = ways[wi];
+            WayGeo& G = wg[wi];
+            int n = (int)w.px.size();
+            const std::vector<float>& sx = G.sx;
+            const std::vector<float>& sz = G.sz;
+            const std::vector<float>& rx = G.rx;
+            const std::vector<float>& rz = G.rz;
+            const std::vector<float>& rd = G.rd;
+            std::vector<float>& ry = G.ry;      // Fahrbahnhoehe, leer = folgt dem Gelaende
+            int sn = (int)sx.size(), m = (int)rx.size();
+            {   // Hoehen-Override aus dem Studio (Taste 5) ersetzt die automatische Hoehenfuehrung
                 int hm = 0; float hd = 0;
                 if (m >= 2 && heightOverride(w.id, hm, hd) && hm != 0) {
                     ry.resize(m);
@@ -1318,14 +1665,71 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                         float tot = std::max(0.01f, rd[m - 1]);
                         for (int k = 0; k < m; k++) ry[k] = hA + (hB - hA) * (rd[k] / tot);
                     } else for (int k = 0; k < m; k++) ry[k] = H(rx[k], rz[k]) + hd;
-                    RoadPatch pt;
-                    pt.px = rx; pt.pz = rz; pt.py = ry; pt.hw = w.hw;
-                    r.patches.push_back(pt);
                 }
             }
+            auto yAtDist = [&](float dd) { // Fahrbahnhoehe bei Bogenlaenge dd
+                int lo = 0, hi = m - 1;
+                while (hi - lo > 1) { int mid = (lo + hi) / 2; if (rd[mid] <= dd) lo = mid; else hi = mid; }
+                float t = (dd - rd[lo]) / std::max(1e-4f, rd[hi] - rd[lo]);
+                return ry[lo] + (ry[hi] - ry[lo]) * clampv(t, 0.0f, 1.0f);
+            };
+            for (int i = 0; i + 1 < sn; i++) {
+                if (!inside((sx[i] + sx[i + 1]) * 0.5f, (sz[i] + sz[i + 1]) * 0.5f)) continue;
+                RoadSeg sg{sx[i], sz[i], sx[i + 1], sz[i + 1], w.hw, w.maxspeed, (int8_t)w.oneway, (uint8_t)w.klass, (uint8_t)w.lanes, (uint8_t)(w.flags & 1), w.name, (uint8_t)(w.ring ? w.ringOuter : 0), w.id};
+                if (!ry.empty()) { sg.ya = yAtDist(G.cumS[i]); sg.yb = yAtDist(G.cumS[i + 1]); }
+                r.segs.push_back(sg);
+            }
             bool hasSw = (w.flags & 8) != 0;
-            if ((int)w.nodes.size() == n) for (int i = 0; i < n; i++) if (junction[w.nodes[i]] >= 3 && !w.ring) { JN& jn = jmap[w.nodes[i]]; jn.x = w.px[i]; jn.z = w.pz[i]; jn.hw = std::max(jn.hw, w.hw); }
+            if (!ry.empty()) { // Fahrflaeche fuer die Physik (Bruecke, Tunnel, Rampe)
+                RoadPatch pt;
+                pt.px = rx; pt.pz = rz; pt.py = ry; pt.hw = w.hw + (hasSw ? 1.9f : 0.0f);
+                for (int k = 0; k < m; k++) { pt.x0 = std::min(pt.x0, rx[k]); pt.x1 = std::max(pt.x1, rx[k]); pt.z0 = std::min(pt.z0, rz[k]); pt.z1 = std::max(pt.z1, rz[k]); }
+                r.patches.push_back(std::move(pt));
+            }
+            if ((int)w.nodes.size() == n) for (int i = 0; i < n; i++) if (junction[w.nodes[i]] >= 3 && !w.ring && w.klass > 1) {   // Autobahn-/Schnellstrassenknoten bekommen keine runde Asphaltscheibe (Rampen werden getrennt gefuehrt)
+                JN& jn = jmap[w.nodes[i]]; jn.x = w.px[i]; jn.z = w.pz[i]; jn.hw = std::max(jn.hw, w.hw);
+                if (!ry.empty()) { float bd = 1e18f; for (int k = 0; k < m; k++) { float dd = (rx[k] - jn.x) * (rx[k] - jn.x) + (rz[k] - jn.z) * (rz[k] - jn.z); if (dd < bd) { bd = dd; jn.y = ry[k]; } } }
+            }
             float hwq = std::min(255.0f, w.hw * 10.0f) / 10.0f;
+            // Spurverengung/-erweiterung: der breitere Abschnitt einer Strasse verjuengt sich zum Knoten hin auf die Breite der Fortsetzung
+            // (Keil mit weichem Verlauf, 28 m innerorts, 50 m, 90 m auf Schnellstrassen) statt eines Sprungs an der Wegegrenze
+            std::vector<float> hwv(m, hwq);
+            if ((int)G.wedge.size() == m) for (int k = 0; k < m; k++) hwv[k] = std::min(hwv[k], std::min(255.0f, G.wedge[k] * 10.0f) / 10.0f);   // Rampenkeil
+            if (!w.ring && (int)w.nodes.size() == n && w.klass <= 5 && m >= 2) {
+                float Lw = rd[m - 1], taperLen = w.klass <= 1 ? 90.0f : (w.klass <= 3 ? 50.0f : 28.0f);
+                for (int side = 0; side < 2; side++) {
+                    int64_t node = side == 0 ? w.nodes.front() : w.nodes.back();
+                    auto it = endsAt.find(node);
+                    if (it == endsAt.end()) continue;
+                    float tx = side == 0 ? rx[1] - rx[0] : rx[m - 2] - rx[m - 1], tz = side == 0 ? rz[1] - rz[0] : rz[m - 2] - rz[m - 1];
+                    float tn = std::hypot(tx, tz);
+                    if (tn < 1e-4f) continue;
+                    tx /= tn; tz /= tn;
+                    float bestHw = -1;
+                    for (int oi : it->second) {
+                        const WayTmp& o = ways[oi];
+                        if (oi == (int)wi || o.klass != w.klass || o.name != w.name || r.names[w.name].empty() || o.oneway != w.oneway || o.ring) continue;
+                        const WayGeo& OG = wg[oi];
+                        int om = (int)OG.rx.size();
+                        if (om < 2) continue;
+                        bool oStart = o.nodes.front() == node;
+                        float ox = oStart ? OG.rx[1] - OG.rx[0] : OG.rx[om - 2] - OG.rx[om - 1], oz = oStart ? OG.rz[1] - OG.rz[0] : OG.rz[om - 2] - OG.rz[om - 1];
+                        float ol = std::hypot(ox, oz);
+                        if (ol < 1e-4f) continue;
+                        ox /= ol; oz /= ol;
+                        if (tx * ox + tz * oz > -0.6f) continue;   // laeuft nicht weiter, sondern zweigt ab
+                        bestHw = bestHw < 0 ? o.hw : std::min(bestHw, o.hw);
+                    }
+                    if (bestHw < 0 || bestHw >= w.hw - 0.3f) continue;   // nur der breitere Abschnitt verjuengt sich
+                    float len = std::min(taperLen, Lw * 0.45f);
+                    for (int k = 0; k < m; k++) {
+                        float s = side == 0 ? rd[k] : Lw - rd[k];
+                        if (s >= len) continue;
+                        float u = s / len, sm = u * u * (3 - 2 * u);
+                        hwv[k] = std::min(hwv[k], std::min(255.0f, (bestHw + (w.hw - bestHw) * sm) * 10.0f) / 10.0f);
+                    }
+                }
+            }
             auto ribbon = [&](float half, int flags, std::vector<Vertex>& dst) {
                 Color col{(uint8_t)w.lanes, (uint8_t)flags, (uint8_t)w.klass, (uint8_t)std::min(255.0f, w.hw * 10.0f)};
                 auto edge = [&](int k, float side, Vertex& o) {
@@ -1344,8 +1748,14 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                     if (l < 1e-3f) { mx = n1x; mz = n1z; l = 1; }
                     mx /= l; mz /= l;
                     float ch = std::max(0.6f, mx * n0x + mz * n0z); // Gehrung: Breite bleibt in Kurven gleich
-                    float x = rx[k] + mx * half * side / ch, z = rz[k] + mz * half * side / ch;
-                    o = {{x, (ry.empty() ? H(x, z) : ry[k]) + 0.03f, z}, {0, 1, 0}, {half * side, rd[k]}, col};
+                    float hk = half + (hwv[k] - hwq);   // Breite an diesem Punkt (Keil bei Spurwechsel)
+                    float x = rx[k] + mx * hk * side / ch, z = rz[k] + mz * hk * side / ch;
+                    // Bruecke/Tunnel: ebene Fahrbahn exakt auf Projekthoehe; Rampe/Damm: nie unter dem Gelaende (Haenge)
+                    // Auf dem Boden: nie unter dem Gelaende der Fahrbahnmitte, sonst schaut ein Hoecker durch den Asphalt
+                    float yy = ry.empty() ? std::max(H(x, z), H(rx[k], rz[k])) : ((G.bridge || G.tunnel) ? ry[k] : std::max(ry[k], H(x, z)));
+                    Color ck = col;
+                    ck.a = (uint8_t)std::min(255.0f, hwv[k] * 10.0f);
+                    o = {{x, yy + 0.03f, z}, {0, 1, 0}, {hk * side, rd[k]}, ck};
                 };
                 for (int k = 0; k + 1 < m; k++) {
                     if (!inside((rx[k] + rx[k + 1]) * 0.5f, (rz[k] + rz[k + 1]) * 0.5f)) continue;
@@ -1357,6 +1767,143 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
             };
             if (hasSw) ribbon(hwq + 1.9f, w.flags | 16, sideV);
             ribbon(hasSw ? hwq + 0.15f : hwq, w.flags, asphV);
+            // ----- Bauwerke: Bruecke (geneigte Platte, Gelaender, Pfeiler), Tunnelroehre, Damm/Boeschung bei erhoehter Fahrbahn -----
+            // Alle Flaechen folgen der Fahrbahnneigung (ry je Stuetzpunkt) und den gleichen Rand-Punkten wie das Asphaltband; waagerechte Quader
+            // wuerden auf Rampen Stufen bilden und die Fahrbahn samt Markierungen verdecken.
+            if (!ry.empty() && m >= 2) {
+                const float Wd = hwq + (hasSw ? 1.9f : 0.0f);   // halbe Breite inkl. Gehsteig = Rand der Fahrbahnplatte
+                const Color conc{158, 158, 152, 0}, concD{116, 116, 112, 0}, tunC{104, 104, 100, 0}, fillC{92, 106, 68, 0};
+                auto edgeXZ = [&](int k, float side, float half, float& x, float& z) { // gleiche Gehrung wie das Asphaltband
+                    float n0x = 0, n0z = 1, n1x = 0, n1z = 1;
+                    bool h0 = false, h1 = false;
+                    if (k > 0) { float tx = rx[k] - rx[k - 1], tz = rz[k] - rz[k - 1], l = std::hypot(tx, tz); if (l > 1e-4f) { n0x = -tz / l; n0z = tx / l; h0 = true; } }
+                    if (k < m - 1) { float tx = rx[k + 1] - rx[k], tz = rz[k + 1] - rz[k], l = std::hypot(tx, tz); if (l > 1e-4f) { n1x = -tz / l; n1z = tx / l; h1 = true; } }
+                    if (!h0 && !h1) { n0x = 0; n0z = 1; n1x = 0; n1z = 1; }
+                    else if (!h0) { n0x = n1x; n0z = n1z; }
+                    else if (!h1) { n1x = n0x; n1z = n0z; }
+                    float mx = n0x + n1x, mz = n0z + n1z, l = std::hypot(mx, mz);
+                    if (l < 1e-3f) { mx = n1x; mz = n1z; l = 1; }
+                    mx /= l; mz /= l;
+                    float ch = std::max(0.6f, mx * n0x + mz * n0z);
+                    x = rx[k] + mx * half * side / ch; z = rz[k] + mz * half * side / ch;
+                };
+                auto P = [](float x, float y, float z) { return Vec3{x, y, z}; };
+                float nextPier = 10.0f;
+                for (int k = 0; k + 1 < m; k++) {
+                    float x0 = rx[k], z0 = rz[k], x1 = rx[k + 1], z1 = rz[k + 1];
+                    float tx = x1 - x0, tz = z1 - z0, tl = std::hypot(tx, tz);
+                    if (tl < 0.05f || !inside((x0 + x1) * 0.5f, (z0 + z1) * 0.5f)) continue;
+                    tx /= tl; tz /= tl;
+                    float nx = -tz, nz = tx, mx = (x0 + x1) * 0.5f, mz = (z0 + z1) * 0.5f;
+                    float ya = ry[k], yb = ry[k + 1], ym = (ya + yb) * 0.5f;
+                    float gc = H(mx, mz), gl = H(mx - nx * Wd, mz - nz * Wd), gr = H(mx + nx * Wd, mz + nz * Wd);
+                    float lx0, lz0, lx1, lz1, rx0, rz0, rx1, rz1;
+                    edgeXZ(k, -1, Wd, lx0, lz0); edgeXZ(k + 1, -1, Wd, lx1, lz1);
+                    edgeXZ(k, 1, Wd, rx0, rz0); edgeXZ(k + 1, 1, Wd, rx1, rz1);
+                    if (G.tunnel) { // Roehre: Waende und Decke folgen der Neigung; die Decke liegt unter dem Gelaende, am Portal ragt sie als Galerie heraus
+                        float c0 = std::max(ya + 3.4f, std::min(ya + 5.4f, H(x0, z0) - 0.5f)), c1 = std::max(yb + 3.4f, std::min(yb + 5.4f, H(x1, z1) - 0.5f));
+                        pushQuadN(r.bldV, P(lx0, ya, lz0), P(lx1, yb, lz1), P(lx1, c1, lz1), P(lx0, c0, lz0), Vec3{nx, 0, nz}, tunC);
+                        pushQuadN(r.bldV, P(rx0, ya, rz0), P(rx1, yb, rz1), P(rx1, c1, rz1), P(rx0, c0, rz0), Vec3{-nx, 0, -nz}, tunC);
+                        pushQuadN(r.bldV, P(lx0, c0, lz0), P(lx1, c1, lz1), P(rx1, c1, rz1), P(rx0, c0, rz0), Vec3{0, -1, 0}, concD);
+                        pushQuadN(r.bldV, P(lx0, c0 + 0.4f, lz0), P(lx1, c1 + 0.4f, lz1), P(rx1, c1 + 0.4f, rz1), P(rx0, c0 + 0.4f, rz0), Vec3{0, 1, 0}, tunC);
+                        pushQuadN(r.bldV, P(lx0 - nx * 0.4f, ya, lz0 - nz * 0.4f), P(lx1 - nx * 0.4f, yb, lz1 - nz * 0.4f), P(lx1 - nx * 0.4f, c1 + 0.4f, lz1 - nz * 0.4f), P(lx0 - nx * 0.4f, c0 + 0.4f, lz0 - nz * 0.4f), Vec3{-nx, 0, -nz}, tunC);
+                        pushQuadN(r.bldV, P(rx0 + nx * 0.4f, ya, rz0 + nz * 0.4f), P(rx1 + nx * 0.4f, yb, rz1 + nz * 0.4f), P(rx1 + nx * 0.4f, c1 + 0.4f, rz1 + nz * 0.4f), P(rx0 + nx * 0.4f, c0 + 0.4f, rz0 + nz * 0.4f), Vec3{nx, 0, nz}, tunC);
+                        continue;
+                    }
+                    float clear = ym - std::min(gc, std::min(gl, gr));
+                    if (G.bridge && clear > 2.6f) { // freie Spannweite: geneigte Platte (1,1 m), Pfeiler alle ~22 m
+                        const float T = 1.1f;
+                        pushQuadN(r.bldV, P(lx0, ya - 0.03f, lz0), P(lx1, yb - 0.03f, lz1), P(lx1, yb - T, lz1), P(lx0, ya - T, lz0), Vec3{-nx, 0, -nz}, conc);
+                        pushQuadN(r.bldV, P(rx0, ya - 0.03f, rz0), P(rx1, yb - 0.03f, rz1), P(rx1, yb - T, rz1), P(rx0, ya - T, rz0), Vec3{nx, 0, nz}, conc);
+                        pushQuadN(r.bldV, P(lx0, ya - T, lz0), P(lx1, yb - T, lz1), P(rx1, yb - T, rz1), P(rx0, ya - T, rz0), Vec3{0, -1, 0}, concD);
+                        if (rd[k] >= nextPier && clear > 4.5f) {
+                            float pw = clampv(Wd * 0.45f, 0.9f, 2.6f);
+                            // nie auf eine Strasse unter der Bruecke stellen
+                            bool onRoadBelow = false;
+                            int la = std::max(1, w.layer);
+                            for (size_t wj = 0; wj < ways.size() && !onRoadBelow; wj++) {
+                                if (wj == wi) continue;
+                                const WayTmp& o = ways[wj];
+                                if ((o.bridge ? std::max(1, o.layer) : o.layer) >= la) continue;
+                                const WayGeo& O = wg[wj];
+                                float reach = o.hw + (o.flags & 8 ? 1.9f : 0.0f) + 1.5f + pw;
+                                for (size_t j = 0; j + 1 < O.rx.size(); j++) {
+                                    float ax = O.rx[j], az = O.rz[j], bx = O.rx[j + 1], bz = O.rz[j + 1];
+                                    if (mx < std::min(ax, bx) - reach || mx > std::max(ax, bx) + reach || mz < std::min(az, bz) - reach || mz > std::max(az, bz) + reach) continue;
+                                    float vx = bx - ax, vz = bz - az, l2 = vx * vx + vz * vz;
+                                    float tt = l2 > 1e-6f ? clampv(((mx - ax) * vx + (mz - az) * vz) / l2, 0.0f, 1.0f) : 0.0f;
+                                    if (std::hypot(mx - (ax + vx * tt), mz - (az + vz * tt)) < reach) { onRoadBelow = true; break; }
+                                }
+                            }
+                            if (onRoadBelow) nextPier = rd[k] + 5.0f;
+                            else {
+                                nextPier = rd[k] + 22.0f;
+                                float top = ym - T, bot = gc - 0.4f;
+                                pushBox(r.bldV, {mx, (top + bot) * 0.5f, mz}, {0.7f, std::max(0.1f, (top - bot) * 0.5f), pw}, tx, tz, concD);
+                            }
+                        }
+                    } else { // Rampe / Widerlager: aufgeschuettete Boeschung (1:1,6) bis zum Gelaende
+                        for (int sd = -1; sd <= 1; sd += 2) {
+                            float gE = sd < 0 ? gl : gr, up = ym - gE;
+                            if (up <= 0.35f) continue;
+                            float ext = std::min(up * 1.6f, 14.0f);
+                            float ex0 = sd < 0 ? lx0 : rx0, ez0 = sd < 0 ? lz0 : rz0, ex1 = sd < 0 ? lx1 : rx1, ez1 = sd < 0 ? lz1 : rz1;
+                            float fx0 = ex0 + nx * ext * sd, fz0 = ez0 + nz * ext * sd, fx1 = ex1 + nx * ext * sd, fz1 = ez1 + nz * ext * sd;
+                            pushQuadN(r.bldV, P(ex0, ya - 0.03f, ez0), P(ex1, yb - 0.03f, ez1), P(fx1, H(fx1, fz1) - 0.05f, fz1), P(fx0, H(fx0, fz0) - 0.05f, fz0), Vec3{nx * sd, 0.6f, nz * sd}, fillC);
+                        }
+                    }
+                    if (G.bridge) { // Gelaender (0,9 m hoch, 0,3 m dick), folgt der Fahrbahn
+                        for (int sd = -1; sd <= 1; sd += 2) {
+                            float ox0, oz0, ox1, oz1, ix0, iz0, ix1, iz1;
+                            edgeXZ(k, (float)sd, Wd, ox0, oz0); edgeXZ(k + 1, (float)sd, Wd, ox1, oz1);
+                            edgeXZ(k, (float)sd, Wd - 0.3f, ix0, iz0); edgeXZ(k + 1, (float)sd, Wd - 0.3f, ix1, iz1);
+                            const float hgt = 0.9f;
+                            pushQuadN(r.bldV, P(ox0, ya, oz0), P(ox1, yb, oz1), P(ox1, yb + hgt, oz1), P(ox0, ya + hgt, oz0), Vec3{nx * sd, 0, nz * sd}, concD);
+                            pushQuadN(r.bldV, P(ix0, ya, iz0), P(ix1, yb, iz1), P(ix1, yb + hgt, iz1), P(ix0, ya + hgt, iz0), Vec3{-nx * sd, 0, -nz * sd}, concD);
+                            pushQuadN(r.bldV, P(ix0, ya + hgt, iz0), P(ix1, yb + hgt, iz1), P(ox1, yb + hgt, oz1), P(ox0, ya + hgt, oz0), Vec3{0, 1, 0}, conc);
+                        }
+                    }
+                }
+            }
+            // ----- Spurpfeile aus turn:lanes vor Kreuzungen (zweimal: 8 m und 22 m vor der Haltelinie) -----
+            if (!w.ring && w.klass <= 5 && (int)w.nodes.size() == n && w.lanes >= 1 && m >= 3 && (!w.turnF.empty() || !w.turnB.empty())) {
+                auto laneArrows = [&](const std::string& spec, bool fwdDir) {
+                    std::vector<std::string> tok;
+                    { std::string cur; for (char ch : spec) { if (ch == '|') { tok.push_back(cur); cur.clear(); } else cur += ch; } tok.push_back(cur); }
+                    int nl = (int)tok.size();
+                    if (nl < 1 || nl > w.lanes || junction[w.nodes[fwdDir ? n - 1 : 0]] < 3) return;
+                    float L = rd[m - 1];
+                    if (L < 26.0f) return;
+                    float lw = 2.0f * w.hw / (float)w.lanes, sc = clampv(lw / 3.3f, 0.7f, 1.1f);
+                    int first = fwdDir ? w.lanesBack : 0;   // links der Wegrichtung liegen zuerst die Gegenrichtungsspuren
+                    for (float back : {8.0f, 22.0f}) {
+                        if (back > L - 4.0f) continue;
+                        float dp = fwdDir ? L - back : back;
+                        int kk = 0;
+                        while (kk + 2 < m && rd[kk + 1] < dp) kk++;
+                        float sg = rd[kk + 1] - rd[kk], tt = sg > 1e-4f ? clampv((dp - rd[kk]) / sg, 0.0f, 1.0f) : 0.0f;
+                        float px = rx[kk] + (rx[kk + 1] - rx[kk]) * tt, pz = rz[kk] + (rz[kk + 1] - rz[kk]) * tt;
+                        float dx = rx[kk + 1] - rx[kk], dz = rz[kk + 1] - rz[kk], dl = std::hypot(dx, dz);
+                        if (dl < 1e-4f) continue;
+                        dx /= dl; dz /= dl;
+                        float fx = fwdDir ? dx : -dx, fz = fwdDir ? dz : -dz, nx = -dz, nz = dx;   // Fahrtrichtung, rechts der Wegrichtung
+                        for (int j = 0; j < nl; j++) {
+                            const std::string& t = tok[j];
+                            bool thru = t.find("through") != std::string::npos;
+                            bool lf = t.find("left") != std::string::npos && t.find("merge") == std::string::npos;
+                            bool rt = t.find("right") != std::string::npos && t.find("merge") == std::string::npos;
+                            if (!thru && !lf && !rt) continue;
+                            int idx = fwdDir ? first + j : (nl - 1 - j);
+                            if (idx < 0 || idx >= w.lanes) continue;
+                            float lat = -w.hw + ((float)idx + 0.5f) * lw, cxp = px + nx * lat, czp = pz + nz * lat;
+                            float yb = ry.empty() ? H(cxp, czp) : ry[kk];
+                            arrowGlyph(asphV, cxp, czp, yb + 0.045f, fx, fz, thru, lf, rt, sc);
+                        }
+                    }
+                };
+                if (!w.turnF.empty()) laneArrows(w.turnF, true);
+                if (!w.turnB.empty()) laneArrows(w.turnB, false);
+            }
             // ----- Strassenbaeume und Laternen entlang der Gehsteige -----
             if (w.klass >= 2 && w.klass <= 5 && !w.ring && m >= 2) {
                 float nextTree = 8.0f + hash2((int)(w.id & 0xFFFF), 3) * 20.0f, nextLamp = 12.0f + hash2((int)(w.id & 0xFFFF), 7) * 30.0f;
@@ -1366,7 +1913,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                     if (tl < 0.01f) continue;
                     tx /= tl; tz /= tl;
                     float nx = -tz, nz = tx;
-                    while (rd[k] >= nextTree && (hasSw || w.klass >= 4)) {
+                    while (rd[k] >= nextTree && (hasSw || w.klass >= 4) && ry.empty()) {
                         float off = hwq + (hasSw ? 1.0f : 3.2f);
                         float px2 = rx[k] + nx * off * sideT, pz2 = rz[k] + nz * off * sideT;
                         nextTree += (w.klass >= 4 ? 17.0f : 26.0f) + hash2((int)(px2 * 2), (int)(pz2 * 2)) * 8.0f;
@@ -1386,7 +1933,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                         nextLamp += 38.0f;
                         sideL = -sideL;
                         if (!inside(px2, pz2) || lampCount > 1200 || onAnyRoad(px2, pz2, 0.4f)) continue;
-                        pushLamp(r.bldV, px2, H(px2, pz2), pz2, -nx * sg, -nz * sg);
+                        pushLamp(r.bldV, px2, ry.empty() ? H(px2, pz2) : ry[k], pz2, -nx * sg, -nz * sg);
                         lampCount++;
                     }
                 }
@@ -1433,6 +1980,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                     Control c;
                     c.pos = {w.px[i] - dx * off, 0, w.pz[i] - dz * off};
                     c.pos.y = H(c.pos.x, c.pos.z);
+                    if (!ry.empty()) { float bd = 1e18f; for (int q = 0; q < m; q++) { float dd = (rx[q] - c.pos.x) * (rx[q] - c.pos.x) + (rz[q] - c.pos.z) * (rz[q] - c.pos.z); if (dd < bd) { bd = dd; c.pos.y = ry[q]; } } }
                     c.dx = dx; c.dz = dz; c.hw = w.hw; c.type = type; c.oneway = w.oneway != 0;
                     float ang = std::atan2(dz, dx);
                     if (ang < 0) ang += PI;
@@ -1448,12 +1996,119 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                 else add(i < n - 1 - i ? -1 : 1);
             }
         }
+        { // ----- Verkehrsschilder: Tempolimit bei Aenderung, Autobahn-Ausfahrten mit Wegweiserbruecke (Wechselanzeige) und Hinweistafel -----
+            // Punkt auf dem Weg im Abstand dist vom Wegende; tx/tz = Richtung vom Ende weg
+            auto onWay = [&](int wi, bool atStart, float dist, float& px, float& pz, float& tx, float& tz, float& py) {
+                const WayGeo& G = wg[wi];
+                int m = (int)G.rx.size();
+                if (m < 2 || G.rd[m - 1] < dist + 1.0f) return false;
+                float s = atStart ? dist : G.rd[m - 1] - dist;
+                int k = 0;
+                while (k + 2 < m && G.rd[k + 1] < s) k++;
+                float sg = G.rd[k + 1] - G.rd[k], t = sg > 1e-4f ? clampv((s - G.rd[k]) / sg, 0.0f, 1.0f) : 0.0f;
+                px = G.rx[k] + (G.rx[k + 1] - G.rx[k]) * t; pz = G.rz[k] + (G.rz[k + 1] - G.rz[k]) * t;
+                float dx = G.rx[k + 1] - G.rx[k], dz = G.rz[k + 1] - G.rz[k], dl = std::hypot(dx, dz);
+                if (dl < 1e-4f) return false;
+                dx /= dl; dz /= dl;
+                tx = atStart ? dx : -dx; tz = atStart ? dz : -dz;
+                py = G.ry.empty() ? H(px, pz) : G.ry[k];
+                return true;
+            };
+            // (a) Tempolimit-Schilder: am Anfang eines Abschnitts mit anderem, ausdruecklich getaggtem Tempo (rechts der Fahrtrichtung)
+            for (auto& kv : endsAt) {
+                if (kv.second.size() != 2 || (int)r.signs.size() > 400) continue;
+                for (int e = 0; e < 2; e++) {
+                    int wi = kv.second[e], oi = kv.second[1 - e];
+                    if (wi == oi) continue;
+                    const WayTmp& W = ways[wi];
+                    const WayTmp& O = ways[oi];
+                    if (W.ring || O.ring || W.klass > 5 || !W.speedTag || W.maxspeed < 10 || W.maxspeed > 130 || std::fabs(W.maxspeed - O.maxspeed) < 1.0f) continue;
+                    bool atStart = W.nodes.front() == kv.first;
+                    if (atStart ? W.oneway == -1 : W.oneway == 1) continue;   // dort faehrt niemand in W hinein
+                    float px, pz, tx, tz, py;
+                    if (!onWay(wi, atStart, 6.0f, px, pz, tx, tz, py)) continue;
+                    float off = W.hw + ((W.flags & 8) ? 1.9f : 0.3f) + 0.9f;
+                    SignDef s;
+                    s.kind = 0; s.value = (int)W.maxspeed; s.tx = tx; s.tz = tz; s.hw = W.hw;
+                    s.pos = {px - tz * off, py, pz + tx * off};
+                    if (inside(s.pos.x, s.pos.z)) r.signs.push_back(s);
+                }
+            }
+            // (b) Autobahn-Ausfahrten: Wegweiserbruecke 420 m vor der Abzweigung (mit Wechselanzeige) und Hinweistafel am Abzweig
+            for (int li = 0; li < (int)ways.size(); li++) {
+                const WayTmp& L = ways[li];
+                if (!L.link || L.klass != 0 || L.oneway == -1 || L.nodes.size() != L.px.size() || L.nodes.size() < 2 || (L.dest.empty() && L.jref.empty())) continue;
+                int64_t N = L.nodes.front();
+                for (int mi = 0; mi < (int)ways.size(); mi++) {
+                    const WayTmp& M = ways[mi];
+                    if (mi == li || M.klass != 0 || M.link || M.nodes.size() != M.px.size() || M.oneway != 1) continue;
+                    int idx = -1;
+                    for (size_t q = 0; q < M.nodes.size(); q++) if (M.nodes[q] == N) { idx = (int)q; break; }
+                    if (idx < 0) continue;
+                    const WayGeo& G = wg[mi];
+                    int m = (int)G.rx.size(), kk = 0;
+                    float bd = 1e18f;
+                    for (int k = 0; k < m; k++) { float dd = (G.rx[k] - M.px[idx]) * (G.rx[k] - M.px[idx]) + (G.rz[k] - M.pz[idx]) * (G.rz[k] - M.pz[idx]); if (dd < bd) { bd = dd; kk = k; } }
+                    int kb = kk;
+                    while (kb > 0 && G.rd[kk] - G.rd[kb] < 420.0f) kb--;
+                    if (G.rd[kk] - G.rd[kb] < 100.0f) break;                  // zu wenig Strecke vor der Ausfahrt
+                    SignDef g;
+                    g.kind = 1;
+                    { float dx = G.rx[std::min(kb + 1, m - 1)] - G.rx[kb], dz = G.rz[std::min(kb + 1, m - 1)] - G.rz[kb], dl = std::max(1e-4f, std::hypot(dx, dz)); g.tx = dx / dl; g.tz = dz / dl; }
+                    g.pos = {G.rx[kb], G.ry.empty() ? H(G.rx[kb], G.rz[kb]) : G.ry[kb], G.rz[kb]};
+                    g.hw = M.hw; g.lanes = std::max(1, M.lanes); g.value = (int)M.maxspeed;
+                    g.seed = (uint32_t)(M.id * 2654435761ull) ^ (uint32_t)(L.id * 40503ull);
+                    g.ref = L.jref;
+                    { // Ziele (durch ; getrennt), bis zu drei
+                        std::vector<std::string> parts;
+                        std::string cur;
+                        for (char ch : L.dest) { if (ch == ';') { parts.push_back(cur); cur.clear(); } else cur += ch; }
+                        parts.push_back(cur);
+                        std::vector<std::string> ok;
+                        for (std::string& p : parts) { size_t a = p.find_first_not_of(' '), b = p.find_last_not_of(' '); if (a != std::string::npos) ok.push_back(p.substr(a, b - a + 1)); }
+                        if (ok.size() > 0) g.l1 = ok[0];
+                        if (ok.size() > 1) g.l2 = ok[1];
+                        if (ok.size() > 2) g.l3 = ok[2];
+                    }
+                    if (inside(g.pos.x, g.pos.z)) r.signs.push_back(g);
+                    // Hinweistafel am Abzweig, rechts der Fahrbahn
+                    {
+                        int k2 = std::min(kk + 1, m - 1), k1 = std::max(kk - 1, 0);
+                        float dx = G.rx[k2] - G.rx[k1], dz = G.rz[k2] - G.rz[k1], dl = std::max(1e-4f, std::hypot(dx, dz));
+                        dx /= dl; dz /= dl;
+                        SignDef p = g;
+                        p.kind = 2; p.tx = dx; p.tz = dz;
+                        float off = M.hw + 3.6f;
+                        p.pos = {G.rx[kk] - dz * off, G.ry.empty() ? H(G.rx[kk], G.rz[kk]) : G.ry[kk], G.rz[kk] + dx * off};
+                        if (inside(p.pos.x, p.pos.z)) r.signs.push_back(p);
+                    }
+                    break;
+                }
+            }
+        }
+        if (!r.signs.empty()) {
+            int cnt[3] = {0, 0, 0};
+            for (const SignDef& s : r.signs) cnt[clampv(s.kind, 0, 2)]++;
+            logMsg("Schilder in Kachel %d/%d: %d Tempolimit, %d Wegweiserbruecken, %d Hinweistafeln", cx, cy, cnt[0], cnt[1], cnt[2]);
+            for (const SignDef& s : r.signs)
+                if (s.kind == 0) {
+                    logMsg("  Tempolimit %d bei %.5f,%.5f Richtung %.3f,%.3f", s.value, myToLat(g.my0 + s.pos.z / g.S), (g.mx0 + s.pos.x / g.S) * 360.0 - 180.0, s.tx, s.tz);
+                    break;
+                }
+            for (const SignDef& s : r.signs)
+                if (s.kind == 1) {
+                    logMsg("  Wegweiserbruecke bei %.5f,%.5f Richtung %.3f,%.3f: %s | %s | %s (Ausfahrt %s, %d Spuren)", myToLat(g.my0 + s.pos.z / g.S), (g.mx0 + s.pos.x / g.S) * 360.0 - 180.0,
+                           s.tx, s.tz, s.l1.c_str(), s.l2.c_str(), s.l3.c_str(), s.ref.c_str(), s.lanes);
+                    break;
+                }
+        }
         { // Kreuzungen: Asphaltscheibe ueber den Strassenenden (saubere Einmuendungen, keine Linien quer durch die Kreuzung)
             for (auto& kv : jmap) {
                 float Rj = std::min(24.0f, kv.second.hw * 1.2f + 0.7f);
                 Color jc{1, 0, 3, (uint8_t)std::min(255.0f, Rj * 10.0f)};
                 const int NJ = 20;
-                auto JV = [&](float x, float z, float lat) { asphV.push_back({{x, H(x, z) + 0.035f, z}, {0, 1, 0}, {lat, 0}, jc}); };
+                float jy = kv.second.y;   // Kreuzung auf Bruecke/Rampe: ebene Scheibe auf Fahrbahnhoehe
+                auto JV = [&](float x, float z, float lat) { asphV.push_back({{x, (jy > -1e8f ? jy : H(x, z)) + 0.035f, z}, {0, 1, 0}, {lat, 0}, jc}); };
                 for (int i = 0; i < NJ; i++) {
                     float a0 = i * 2 * PI / NJ, a1 = (i + 1) * 2 * PI / NJ;
                     if (!inside(kv.second.x, kv.second.z)) break;
@@ -1520,7 +2175,26 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
         bucketCells(sideV, r.x0, r.z0, r.x1, r.z1, r.sideCells);
         bucketCells(asphV, r.x0, r.z0, r.x1, r.z1, r.roadCells);
         bucketCells(r.bldV, r.x0, r.z0, r.x1, r.z1, r.bldCells);
-        { std::vector<Vertex> wv; buildWater(d, g, cx, cy, r.x0, r.z0, r.x1, r.z1, wv); bucketCells(wv, r.x0, r.z0, r.x1, r.z1, r.waterCells); }
+        std::vector<uint8_t> roadMask;
+        { // Strassen aus dem Wasser aussparen (Bruecken und Tunnel ausgenommen: dort liegt die Fahrbahn ueber bzw. unter dem Wasser)
+            const float CSm = 4.0f;
+            int wnx = (int)std::ceil((r.x1 - r.x0) / CSm), wnz = (int)std::ceil((r.z1 - r.z0) / CSm);
+            if (wnx >= 1 && wnz >= 1 && wnx <= 1000 && wnz <= 1000) {
+                roadMask.assign((size_t)wnx * wnz, 0);
+                for (size_t wi = 0; wi < ways.size(); wi++) {
+                    const WayGeo& G = wg[wi];
+                    if (G.bridge || G.tunnel || ways[wi].klass > 6) continue;
+                    float hwm = ways[wi].hw + ((ways[wi].flags & 8) ? 1.9f : 0.0f) + 0.8f;
+                    for (size_t k = 0; k < G.rx.size(); k++) {
+                        int c0 = (int)std::floor((G.rx[k] - hwm - r.x0) / CSm), c1 = (int)std::floor((G.rx[k] + hwm - r.x0) / CSm);
+                        int q0 = (int)std::floor((G.rz[k] - hwm - r.z0) / CSm), q1 = (int)std::floor((G.rz[k] + hwm - r.z0) / CSm);
+                        for (int q = std::max(0, q0); q <= std::min(wnz - 1, q1); q++)
+                            for (int c = std::max(0, c0); c <= std::min(wnx - 1, c1); c++) roadMask[(size_t)q * wnx + c] = 1;
+                    }
+                }
+            }
+        }
+        { std::vector<Vertex> wv; buildWater(d, g, cx, cy, r.x0, r.z0, r.x1, r.z1, wv, &roadMask); bucketCells(wv, r.x0, r.z0, r.x1, r.z1, r.waterCells); }
         r.bldV.clear(); r.bldV.shrink_to_fit();
         r.ok = true;
     }
@@ -1628,7 +2302,7 @@ void World::update(Vec3 p, double now) {
         uploadCells(r.bldCells, c.bldCells);
         uploadCells(r.waterCells, c.waterCells);
         c.segs = std::move(r.segs); c.names = std::move(r.names);
-        c.controls = std::move(r.controls); c.buildings = std::move(r.buildings); c.pois = std::move(r.pois); c.trees = std::move(r.trees); c.patches = std::move(r.patches);
+        c.controls = std::move(r.controls); c.buildings = std::move(r.buildings); c.pois = std::move(r.pois); c.trees = std::move(r.trees); c.patches = std::move(r.patches); c.signs = std::move(r.signs);
         if (r.ok) logMsg("OSM-Kachel %d/%d: %d Strassenabschnitte, %d Gebaeude, %d Ampeln/Schilder, %d Tankstellen/Supermärkte", r.cx, r.cy, (int)c.segs.size(), (int)c.buildings.size(), (int)c.controls.size(), (int)c.pois.size());
     }
 
@@ -1751,7 +2425,8 @@ bool World::surface(float x, float z, float yRef, float& h) {
     float bestP = -1e9f;
     for (auto& kv : d->chunks) {
         if (kv.second.patches.empty() || x < kv.second.x0 - 40 || x > kv.second.x1 + 40 || z < kv.second.z0 - 40 || z > kv.second.z1 + 40) continue;
-        for (const RoadPatch& p : kv.second.patches)
+        for (const RoadPatch& p : kv.second.patches) {
+            if (x < p.x0 - p.hw - 1 || x > p.x1 + p.hw + 1 || z < p.z0 - p.hw - 1 || z > p.z1 + p.hw + 1) continue;
             for (size_t i = 0; i + 1 < p.px.size(); i++) {
                 float vx = p.px[i + 1] - p.px[i], vz = p.pz[i + 1] - p.pz[i], l2 = vx * vx + vz * vz;
                 if (l2 < 1e-6f) continue;
@@ -1760,6 +2435,7 @@ bool World::surface(float x, float z, float yRef, float& h) {
                 float y = p.py[i] + (p.py[i + 1] - p.py[i]) * t + 0.03f;
                 if (y <= yRef && y > bestP) bestP = y;
             }
+        }
     }
     if (bestP > -1e8f && (h > yRef || bestP > h)) h = bestP; // ueberschriebene Fahrbahn gilt auch, wenn das gemessene Gelaende darueber liegt
     float hh;
@@ -1788,7 +2464,7 @@ Vec3 World::surfaceNormal(float x, float z, float yRef) {
     return n.y < 0.5f ? Vec3{0, 1, 0} : n; // Kanten von Objekten nicht als Steilhang werten
 }
 
-RoadHit World::nearestRoad(float x, float z, float maxDist, int maxKlass) {
+RoadHit World::nearestRoad(float x, float z, float maxDist, int maxKlass, float yRef) {
     RoadHit best;
     float bestScore = 1e9f;
     std::vector<Chunk*> list{&d->custom};
@@ -1805,6 +2481,11 @@ RoadHit World::nearestRoad(float x, float z, float maxDist, int maxKlass) {
             float dd = std::hypot(x - qx, z - qz);
             float score = dd - s.hw * 0.5f - (cp == &d->custom ? 3.0f : 0.0f); // eigene Strassen haben Vorrang
             if (dd > maxDist || score >= bestScore) continue;
+            if (yRef > -1e8f) { // andere Ebene (Bruecke ueber dem Fahrzeug, Tunnel darunter, Unterfuehrung): ignorieren
+                float ys = s.ya > -1e8f ? s.ya + (s.yb - s.ya) * t : yRef, gh;
+                if (s.ya <= -1e8f && height(qx, qz, gh)) ys = gh;
+                if (std::fabs(ys - yRef) > 3.2f) continue;
+            }
             bestScore = score;
             float l = std::sqrt(l2);
             best.found = true; best.dist = dd; best.seg = &s;
@@ -1909,6 +2590,11 @@ void World::forTreesNear(float x, float z, float r, const std::function<void(con
     for (auto& kv : d->chunks)
         for (const TreePos& t : kv.second.trees)
             if (std::fabs(t.x - x) < r && std::fabs(t.z - z) < r) fn(t);
+}
+void World::forSignsNear(float x, float z, float r, const std::function<void(const SignDef&)>& fn) const {
+    for (auto& kv : d->chunks)
+        for (const SignDef& s : kv.second.signs)
+            if (std::fabs(s.pos.x - x) < r && std::fabs(s.pos.z - z) < r) fn(s);
 }
 int World::forestAt(float x, float z) const {
     double mx = g.mx0 + x / g.S, my = g.my0 + z / g.S, n = (double)(1 << d->zoom[1]);

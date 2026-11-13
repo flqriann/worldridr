@@ -97,7 +97,11 @@ inline Mat4 ortho(float l, float r, float b, float t) {
     return m;
 }
 inline Mat4 invert(const Mat4& a) {
-    const float* m = a.m; float inv[16];
+    // In doppelter Genauigkeit: mit Nah-/Fernebene 0,08 m / 40 km ist die Projektionsmatrix schlecht konditioniert,
+    // in float flackert der daraus berechnete Himmel (Blickrichtung je Pixel).
+    double m[16];
+    for (int i = 0; i < 16; i++) m[i] = a.m[i];
+    double inv[16];
     inv[0] = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
     inv[4] = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
     inv[8] = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
@@ -114,11 +118,11 @@ inline Mat4 invert(const Mat4& a) {
     inv[7] = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
     inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
     inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
-    float det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    double det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
     Mat4 r = identity();
-    if (std::fabs(det) < 1e-20f) return r;
-    det = 1.0f / det;
-    for (int i = 0; i < 16; i++) r.m[i] = inv[i] * det;
+    if (std::fabs(det) < 1e-30) return r;
+    det = 1.0 / det;
+    for (int i = 0; i < 16; i++) r.m[i] = (float)(inv[i] * det);
     return r;
 }
 

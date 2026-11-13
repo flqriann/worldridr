@@ -31,6 +31,7 @@ static Batch propsLit, propsUnlit, stopLines, mirrorQuad[3];
 static Target mirrorRT[3], sceneRT;
 static Mesh skyMesh;
 
+static bool lightsOn();
 static bool spawned = false, belt = false, lights = false, debugOverlay = false, autodrive = false;
 static int blinker = 0, camMode = 0; // blinker: -1 links, 1 rechts, 2 Warnblinker
 static bool blinkArmed = false, blinkLit = false;
@@ -138,9 +139,9 @@ static void applyVehicle() {
 static void saveSettings() {
     FILE* f = fopen("settings.cfg", "w");
     if (!f) return;
-    fprintf(f, "quality=%d\nscale=%.2f\nmirrors=%d\ntraffic=%d\npolice=%d\nfaults=%d\nhud=%d\nminimap=%d\nautomatic=%d\ncamera=%d\ncar=%s\nmsaa=%d\nbld=%.0f\nroad=%.0f\npeds=%d\nmapq=%d\n",
+    fprintf(f, "quality=%d\nscale=%.2f\nmirrors=%d\ntraffic=%d\npolice=%d\nfaults=%d\nhud=%d\nminimap=%d\nautomatic=%d\ncamera=%d\ncar=%s\nmsaa=%d\nbld=%.0f\nroad=%.0f\npeds=%d\nmapq=%d\nhour=%.2f\nweather=%d\ntimespeed=%d\n",
             cfg.quality, cfg.renderScale, (int)cfg.mirrors, cfg.traffic, (int)cfg.police, (int)cfg.faultPoints, cfg.hudMode, (int)cfg.minimap, (int)cfg.automatic, camMode,
-            carModelSel >= 0 ? carModelName(carModelSel).c_str() : "builtin", (int)cfg.msaa, cfg.bldDist, cfg.roadDist, cfg.peds, (int)cfg.mapQuestions);
+            carModelSel >= 0 ? carModelName(carModelSel).c_str() : "builtin", (int)cfg.msaa, cfg.bldDist, cfg.roadDist, cfg.peds, (int)cfg.mapQuestions, envir::hour, envir::weather, envir::speedIdx);
     if (carColorSet) fprintf(f, "carcolor=%d,%d,%d\n", carColor[0], carColor[1], carColor[2]);
     // Der Tankstand wird bewusst nicht gespeichert: jede Fahrt beginnt mit vollem Tank (sonst kommt man mit leerem Tank nicht mehr los).
     fprintf(f, "veh=%d\nmoney=%.2f\ndiesel=%d\n", vehKind, econ::money, (int)cfg.diesel);
@@ -181,6 +182,9 @@ static bool loadSettings() {
         else if (k == "bld") cfg.bldDist = (float)n;
         else if (k == "road") cfg.roadDist = (float)n;
         else if (k == "diesel") cfg.diesel = n != 0;
+        else if (k == "hour") envir::hour = clampv((float)n, 0.0f, 24.0f);
+        else if (k == "weather") envir::weather = clampv((int)n, 0, 5);
+        else if (k == "timespeed") envir::speedIdx = clampv((int)n, 0, 3);
         else keys::load(k, v);
     }
     fclose(f);
@@ -324,7 +328,7 @@ static CarVisual ownVisual() {
     v.brake = car.brake > 0.05f;
     v.blinkL = ((blinker == -1 || blinker == 2) && blinkLit) || foot::lockBlink();
     v.blinkR = ((blinker == 1 || blinker == 2) && blinkLit) || foot::lockBlink();
-    v.lights = lights;
+    v.lights = lightsOn();
     v.reverse = car.gear == -1;
     carOwnPaint(v);
     v.driver = car.kind == 0; v.occX = ownSwayLat.x; v.occZ = -ownSwayLong.x; v.headYaw = ownHeadYaw; v.headPitch = ownHeadPitch;
@@ -337,13 +341,25 @@ static CarVisual ownVisual() {
     }
     return v;
 }
+// Geltendes Tempolimit: Strassenlimit, bei aktiver Wechselanzeige davor das strengere (einmal je Bild berechnet)
+static int effectiveLimit() {
+    static double t = -1;
+    static int v = 0;
+    if (simTime != t) {
+        t = simTime;
+        int base = roadHit.found && onRoad ? (int)roadHit.seg->maxspeed : 0;
+        int dyn = base > 0 ? signs::dynamicLimit(car.pos, car.forward()) : 0;
+        v = dyn > 0 ? std::min(base, dyn) : base;
+    }
+    return v;
+}
 static DashState ownDash() {
     DashState d;
     d.kmh = car.speed() * 3.6f; d.rpm = car.rpm(); d.steerInput = car.steer; d.odoKm = car.odo / 1000.0f;
     d.gear = car.gear; d.selector = car.selector; d.automatic = car.automatic;
-    d.limit = roadHit.found && onRoad ? (int)roadHit.seg->maxspeed : 0;
+    d.limit = effectiveLimit();
     d.blinkL = (blinker == -1 || blinker == 2) && blinkLit; d.blinkR = (blinker == 1 || blinker == 2) && blinkLit;
-    d.handbrake = car.handbrake; d.belt = belt; d.engineOn = car.engineOn; d.lights = lights; d.fuel = econ::fuelFrac();
+    d.handbrake = car.handbrake; d.belt = belt; d.engineOn = car.engineOn; d.lights = lightsOn(); d.fuel = econ::fuelFrac();
     d.road = roadHit.found && onRoad ? roadHit.name : "";
     return d;
 }
@@ -385,9 +401,26 @@ static void buildProps(Vec3 cam) {
 }
 
 // ---------- Szene ----------
+static bool lightsOn() { return lights || envir::night() > 0.55f; }   // Lichtautomatik bei Dunkelheit
 static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorPass = false, int mirrorIdx = -1) {
     Mat4 vp = mul(proj, view);
-    gfxCamera(cam, invert(vp));
+    envir::apply();
+    { Vec3 hf = car.forward(); hf.y = 0; hf = normalize(hf);
+      gfxHead(car.pos + hf * 2.0f + Vec3{0, 0.35f, 0}, normalize(hf + Vec3{0, -0.07f, 0}), lightsOn() ? 1.0f : 0.0f); }
+    { // Himmel: Blickrichtung je Pixel direkt aus Projektion und Drehung (keine Matrix-Inverse, kein NaN, keine Kameraposition)
+        const float* V = view.m; const float* P = proj.m;
+        float ax = 1.0f / P[0], ay = 1.0f / P[5], ox = P[8] / P[0], oy = P[9] / P[5];
+        Mat4 s{};
+        for (int i = 0; i < 3; i++) {
+            float M0 = V[i * 4 + 0], M1 = V[i * 4 + 1], M2 = V[i * 4 + 2];
+            s.m[0 + i] = M0 * ax;
+            s.m[4 + i] = M1 * ay;
+            s.m[8 + i] = 0;
+            s.m[12 + i] = M0 * ox + M1 * oy - M2;
+        }
+        s.m[3] = s.m[7] = s.m[11] = 0; s.m[15] = 1;
+        gfxCamera(cam, s);
+    }
     gfxModel(identity());
     glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
@@ -431,6 +464,7 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
     propsLit.draw();
     gfxMode(0, FLAG_FOG);
     propsUnlit.draw();
+    signs::draw(vp, cam, simTime, mirrorPass);
     for (const NetCar& c : netplay::cars()) {
         if (!c.placed) continue;
         CarVisual v;
@@ -439,10 +473,14 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
         for (float& r : v.wheelRot) r = c.wheelRot;
         v.paint = Color{c.paint[0], c.paint[1], c.paint[2], 255}; v.tinted = c.tinted; v.model = c.model; v.kind = c.kind;
         v.blinkL = (c.flags & 1) != 0; v.blinkR = (c.flags & 2) != 0; v.brake = (c.flags & 4) != 0; v.lights = (c.flags & 8) != 0;
+        // Fahrer des Mitspielers mit seiner echten Kopfhaltung (bei VR: Headset), Hemdfarbe aus der Spieler-ID
+        v.driver = c.kind == 0; v.headYaw = c.hyS; v.headPitch = c.hpS;
+        { uint32_t h = c.id * 2654435761u; v.occShirt = Color{(uint8_t)(60 + (h >> 4 & 0x7F)), (uint8_t)(70 + (h >> 11 & 0x7F)), (uint8_t)(90 + (h >> 18 & 0x7F)), 255}; }
         carDraw(v, vp, false, nullptr);
     }
     traffic::draw(vp, cam, mirrorPass ? 160.0f : std::min(700.0f, cfg.bldDist));
     ped::draw(vp, cam, mirrorPass ? 90.0f : std::min(260.0f, cfg.bldDist * 0.5f));
+    if (!mirrorPass) envir::drawPrecip(cam, car.vel, simTime);
     if (mirrorPass && mirrorIdx != 1 && spawned) { // Seitenspiegel zeigen die eigene Karosserie (Flanke und Heck)
         CarVisual self = ownVisual();
         carDraw(self, vp, false, nullptr);
@@ -513,7 +551,7 @@ static void buildHUD(bool cockpit, bool loading) {
         if (!warn.empty()) ui.labelC(cx, by - 58, 14, Color{240, 170, 120, 255}, warn);
     }
     if (roadHit.found && onRoad && spawned && !loading) { // Tempolimit: klein, unaufdringlich
-        int lim = (int)roadHit.seg->maxspeed;
+        int lim = effectiveLimit();
         bool over = std::fabs(car.speed() * 3.6f) > lim + 3;
         float r = calm ? 23.0f : 32.0f, px = W - r - 20, py = r + 18;
         ui.geo.disc(px, py, r, over ? Color{238, 70, 60, 255} : Color{200, 52, 52, 235});
@@ -989,9 +1027,31 @@ static void buildMenu() {
         next();
         if (left(cfg.diesel ? "Motor: Diesel (Turbo)" : "Motor: Benzin (Turbo)")) { cfg.diesel = !cfg.diesel; car.setEngine(cfg.diesel ? 1 : 0); changed = true; }
         next();
+        {
+            static const float presets[6] = {-1.0f, 6.5f, 12.0f, 17.5f, 19.8f, 23.0f};
+            static const char* pn[6] = {"Jetzt", "Morgen", "Mittag", "Abend", "DÃ¤mmerung", "Nacht"};
+            int cur = -1;
+            for (int i = 1; i < 6; i++) if (std::fabs(presets[i] - envir::hour) < 0.26f) cur = i;
+            char b[64];
+            int hh = (int)envir::hour, mm = (int)((envir::hour - hh) * 60);
+            snprintf(b, sizeof b, "Tageszeit: %02d:%02d%s%s", hh, mm, cur > 0 ? "  " : "", cur > 0 ? pn[cur] : "");
+            if (left(b)) {
+                int nx = cur < 0 ? 1 : cur + 1;
+                envir::hour = nx >= 6 ? envir::systemHour() : presets[nx];
+                changed = true;
+            }
+        }
+        next();
+        if (left(std::string("Wetter: ") + envir::weatherName[envir::weather])) { envir::weather = (envir::weather + 1) % 6; changed = true; }
+        next();
         float leftEnd = by;
         if (right(cfg.police ? "Polizei: an" : "Polizei: aus", ry)) { cfg.police = !cfg.police; changed = true; }
         ry += 52;
+        {
+            static const char* sn[4] = {"Uhr steht", "Echtzeit", "30-fach", "120-fach"};
+            if (right(std::string("Zeitablauf: ") + sn[envir::speedIdx], ry)) { envir::speedIdx = (envir::speedIdx + 1) % 4; changed = true; }
+            ry += 52;
+        }
         {
             static const int steps[5] = {0, 5, 10, 20, 30};
             int cur = 0;
@@ -1070,6 +1130,10 @@ int main(int argc, char** argv) {
     std::string shotPath, startLesson, joinAddr;
     bool startEditor = false, startHost = false, showMenu = true, startMap = false, testTp = false;
     double testTpLat = 0, testTpLon = 0, destLat = 0, destLon = 0;
+    bool edCamPending = false;
+    bool driveTest = false;
+    float edCam[5] = {};
+    if (const char* ec = std::getenv("WR_EDCAM")) edCamPending = sscanf(ec, "%f,%f,%f,%f,%f", &edCam[0], &edCam[1], &edCam[2], &edCam[3], &edCam[4]) == 5;
     bool haveDest = false;
     bool revTest = false;
     int serverMax = 16;
@@ -1094,6 +1158,7 @@ int main(int argc, char** argv) {
         else if (a == "--host") startHost = true;
         else if (a == "--nomenu") showMenu = false;
         else if (a == "--map") { startMap = true; showMenu = false; }
+        else if (a == "--drivetest") { driveTest = true; autodrive = true; showMenu = false; cfg.traffic = 0; }
         else if (a == "--revtest") { revTest = true; showMenu = false; cfg.traffic = 0; }
         else if (a == "--dest" && i + 2 < argc) { destLat = atof(argv[i + 1]); destLon = atof(argv[i + 2]); haveDest = true; i += 2; }
         else if (a == "--tp" && i + 2 < argc) { testTpLat = atof(argv[i + 1]); testTpLon = atof(argv[i + 2]); testTp = true; i += 2; } // Selbsttest: nach 4 s teleportieren
@@ -1252,6 +1317,7 @@ int main(int argc, char** argv) {
             spawned = false; spawnTime = -1; statusLine.clear(); tpState = 0;
             car.place({0, 0, 0}, 0);
             if (edit) editor::open({0, 0, 0}, 0);
+            if (std::getenv("WR_EDCAM")) edCamPending = true;
         } else if (tpState == 3) { statusLine = "Ort nicht gefunden"; tpState = 0; }
         else if (tpState == 4) { // Suchergebnis nur auf der Karte zeigen
             std::lock_guard<std::mutex> lk(tpMutex);
@@ -1270,8 +1336,12 @@ int main(int argc, char** argv) {
         Vec3 focus = edit ? editor::cameraPos() : (spawned ? playerPos() : Vec3{});
         world.update(focus, simTime);
         editor::refresh(simTime);
+        if (edCamPending && editor::active() && spawned) { // Test: Studio-Kamera relativ zum Gelaende platzieren (WR_EDCAM="x,hoehe,z,gieren,nicken")
+            float gh;
+            if (world.height(edCam[0], edCam[2], gh)) { editor::setCamera({edCam[0], gh + edCam[1], edCam[2]}, edCam[3], edCam[4]); edCamPending = false; }
+        }
         // Strassenbezug jedes Bild neu bestimmen: Zeiger in nachgeladene/entfernte Kacheln duerfen nicht ueberleben
-        roadHit = spawned ? world.nearestRoad(car.pos.x, car.pos.z, 400) : RoadHit{};
+        roadHit = spawned ? world.nearestRoad(car.pos.x, car.pos.z, 400, 7, car.pos.y - 0.55f) : RoadHit{};
         if (roadHit.found && roadHit.dist > 60) roadHit.found = false;
         bool ready =world.ready(spawned ? car.pos : Vec3{}, simTime);
         if (!spawned && ready) {
@@ -1345,9 +1415,13 @@ int main(int argc, char** argv) {
             if (input.blinkL) { blinker = blinker == -1 ? 0 : -1; blinkArmed = false; }
             if (input.blinkR) { blinker = blinker == 1 ? 0 : 1; blinkArmed = false; }
             if (input.hazard) blinker = blinker == 2 ? 0 : 2;
-            if (input.reset || script.wantReset) { spawnCar(true); script.wantReset = false; }
+            if (input.reset || script.wantReset) {
+                if (car.seized || car.health < 1.0f) { car.repairEngine(); hud.msgs.push_back({"Motor repariert", 4.0f}); }
+                spawnCar(true);
+                script.wantReset = false;
+            }
 
-            roadHit = world.nearestRoad(car.pos.x, car.pos.z, 400);
+            roadHit = world.nearestRoad(car.pos.x, car.pos.z, 400, 7, car.pos.y - 0.55f);
             onRoad = !roadHit.found || roadHit.dist < roadHit.seg->hw + 0.8f;
             if (roadHit.found && roadHit.dist > 60) roadHit.found = false;
             Vec3 f = car.forward();
@@ -1362,13 +1436,44 @@ int main(int argc, char** argv) {
             if (autodrive) { // Selbsttest: folgt der Strasse
                 belt = true; car.handbrake = false; car.autoClutch = true;
                 car.starter = !car.engineOn;
-                if (car.engineOn && !car.automatic) {
+                bool dtHold = driveTest && simTime - spawnTime >= 5.0;
+                if (car.engineOn && !car.automatic && !dtHold) {
                     if (car.gear < 1) car.requestGear(1);
-                    else if (car.rpm() > 3000 && car.gear < 4 && simTime - lastAutoShift > 1.5) { car.shift(1); lastAutoShift = simTime; }
+                    else if (car.rpm() > (driveTest ? 2400 : 3000) && car.gear < (driveTest ? 5 : 4) && simTime - lastAutoShift > (driveTest ? 1.2 : 1.5)) { car.shift(1); lastAutoShift = simTime; }
                 }
                 if (car.automatic) car.selector = 3;
-                car.throttle = car.speed() < 11 ? 0.45f : 0.08f;
+                car.throttle = car.speed() < (driveTest ? 22 : 11) ? 0.45f : 0.08f;
                 car.brake = 0;
+                if (driveTest) { // Selbsttest Motorbremse + Money-Shift: Fahrzeug gezielt auf Tempo setzen und im Schub rollen lassen
+                    double t = simTime - spawnTime;
+                    static double lastDt = 0;
+                    static int phase = -1;
+                    static const float RAT[6] = {3.78f, 2.12f, 1.36f, 1.03f, 0.84f, 0.70f};
+                    auto launch = [&](float v, int g) {
+                        Vec3 fw = car.forward(); fw.y = 0; fw = normalize(fw);
+                        car.vel = fw * v;
+                        for (Wheel& wh : car.w) wh.omega = v / Vehicle::wheelRadius();
+                        car.gear = g; car.engW = v / Vehicle::wheelRadius() * RAT[g - 1] * 3.65f; car.engineOn = true; car.clutch = 0;
+                    };
+                    car.autoClutch = false; car.throttle = 0; car.brake = 0;
+                    if (t >= 5.0 && phase < 0) { phase = 0; launch(27.0f, 5); logMsg("drivetest --- Phase 1: 5. Gang, Schub aus 97 km/h"); }
+                    if (t >= 9.0 && phase == 0) { phase = 1; launch(20.0f, 3); logMsg("drivetest --- Phase 2: 3. Gang, Schub aus 72 km/h"); }
+                    if (t >= 13.0 && phase == 1) { phase = 2; launch(25.0f, 5); logMsg("drivetest --- Phase 3: 5. Gang, jetzt Kupplung treten und in den 2. Gang"); }
+                    if (phase == 2) {
+                        if (t >= 14.0 && t < 14.5) { car.clutch = 1.0f; if (car.gear != 2) car.requestGear(2); }
+                        else if (t >= 14.5) car.clutch = 0.0f;
+                    }
+                    if (t >= 19.0 && phase == 2) { phase = 3; launch(36.0f, 6); logMsg("drivetest --- Phase 4: 6. Gang bei 130 km/h, Kupplung treten, 2. Gang, einkuppeln (echter Money-Shift)"); }
+                    if (phase == 3) {
+                        if (t >= 20.0 && t < 20.5) { car.clutch = 1.0f; if (car.gear != 2) car.requestGear(2); }
+                        else if (t >= 20.5) car.clutch = 0.0f;
+                    }
+                    if (simTime - lastDt > (phase >= 2 ? 0.2 : 0.5) && phase >= 0 && (t < 15.0 || t > 19.0)) {
+                        lastDt = simTime;
+                        logMsg("drivetest t=%.1f v=%.1f km/h gang=%d rpm=%.0f kupplung=%.1f motor=%s gesundheit=%.2f", t, car.speed() * 3.6f, car.gear, car.rpm(), car.clutch,
+                               car.seized ? "KAPUTT" : (car.engineOn ? "an" : "aus"), car.health);
+                    }
+                }
                 if (roadHit.found) {
                     float sgn = (f.x * roadHit.dx + f.z * roadHit.dz) >= 0 ? 1.0f : -1.0f;
                     float errR = sgn * (roadHit.dx * (-f.z) + roadHit.dz * f.x);
@@ -1389,6 +1494,7 @@ int main(int argc, char** argv) {
             car.update(dt, world);
             crashCooldown -= dt;
             if (world.insideBuilding(car.pos.x, car.pos.z) || editor::blocked(car.pos.x, car.pos.z, car.pos.y)) {
+                if (autodrive) logMsg("Kollision mit Gebaeude/Objekt bei x=%.1f z=%.1f y=%.1f (Tempo %.1f)", car.pos.x, car.pos.z, car.pos.y, length(car.vel) * 3.6f);
                 car.pos.x = prev.x; car.pos.z = prev.z;
                 bool hard = length(car.vel) > 1.5f;
                 car.vel = car.vel * -0.15f;
@@ -1396,7 +1502,19 @@ int main(int argc, char** argv) {
             }
             if (car.evStall) script.event("stall");
             if (car.evGrind) { script.event("grind"); car.evGrind = false; }
+            if (car.evOverrev) hud.msgs.push_back({"Drehzahl viel zu hoch - Motor wird besch\xC3\xA4" "digt!", 3.5f});
+            if (car.evBlown) { hud.msgs.push_back({"MOTORSCHADEN (\xC3\x9C" "berdrehen)  -  Taste R: reparieren und zur\xC3\xBC" "ck auf die Stra\xC3\x9F" "e", 9.0f}); script.event("engine_blown"); }
+            if (car.evNonFinite) { logMsg("Fahrzeugphysik: ungueltiger Zustand abgefangen"); }
+            { // Dauerhinweise: Motorschaden bzw. Fahrzeug liegt auf der Seite/dem Dach
+                static double lastHint = 0, flippedSince = -1;
+                if (car.flipped && std::fabs(car.speed()) < 2.0f) { if (flippedSince < 0) flippedSince = simTime; } else flippedSince = -1;
+                if (simTime - lastHint > 20.0 && (car.seized || (flippedSince >= 0 && simTime - flippedSince > 3.0))) {
+                    lastHint = simTime;
+                    hud.msgs.push_back({car.seized ? "Motorschaden - Taste R: reparieren und zur\xC3\xBC" "ck auf die Stra\xC3\x9F" "e" : "Fahrzeug liegt - Taste R: zur\xC3\xBC" "ck auf die Stra\xC3\x9F" "e", 6.0f});
+                }
+            }
             checkControls();
+            envir::update(dt);
             traffic::update(dt);
             nav::update(dt);
             econ::update(dt);
@@ -1427,7 +1545,7 @@ int main(int argc, char** argv) {
             script.carNum("heading", std::fmod(std::atan2(f.x, -f.z) * 180.0 / PI + 360.0, 360.0));
             script.carNum("odo", car.odo);
             script.carNum("lane_offset", laneOffset);
-            script.carNum("speed_limit", roadHit.found && onRoad ? roadHit.seg->maxspeed : 0);
+            script.carNum("speed_limit", effectiveLimit());
             script.carNum("road_class", roadHit.found ? roadHit.seg->klass : -1);
             script.carNum("lat", lat);
             script.carNum("lon", lon);
@@ -1458,6 +1576,8 @@ int main(int argc, char** argv) {
             script.update(dt);
 
             float load = car.engineOn ? clampv(car.throttle * 0.9f + 0.1f, 0.0f, 1.0f) : (car.starter ? 0.5f : 0.0f);
+            audioRain(std::min(1.0f, envir::rainLevel()));
+            audioEngine(4, car.engineType != 0);
             audioSet(car.rpm(), load, std::fabs(car.speed()), input.horn);
             audioSiren(traffic::sirenLevel());
             input.setFFB(car.ffb, dt);
@@ -1468,6 +1588,8 @@ int main(int argc, char** argv) {
                 world.surface(car.pos.x, car.pos.z, car.pos.y, gh);
                 logMsg("t=%.0f v=%.1f km/h rpm=%.0f gang=%d hoehe=%.2f strasse=%d spur=%+.1f mitspieler=%d fussgaenger=%d dist=%.1f bld=%d x=%.1f z=%.1f", simTime, car.speed() * 3.6f, car.rpm(), car.gear,
                        car.pos.y - gh, (int)onRoad, laneOffset, (int)netplay::cars().size(), ped::count(), roadHit.found ? roadHit.dist : -1.0f, (int)world.insideBuilding(car.pos.x, car.pos.z), car.pos.x, car.pos.z);
+                { float th = 0; world.height(car.pos.x, car.pos.z, th);
+                  logMsg("   Gelaende %.1f  Fahrzeug %.1f  Strasse: klass=%d ya=%.1f yb=%.1f", th, car.pos.y, roadHit.found ? (int)roadHit.seg->klass : -1, roadHit.found ? roadHit.seg->ya : 0.0f, roadHit.found ? roadHit.seg->yb : 0.0f); }
                 for (const NetCar& c : netplay::cars())
                     logMsg("   Mitspieler %s: Abstand %.1f m (dx %.1f dy %.1f dz %.1f)", c.name.c_str(), length(c.pos - car.pos), c.pos.x - car.pos.x, c.pos.y - car.pos.y, c.pos.z - car.pos.z);
             }
@@ -1485,7 +1607,8 @@ int main(int argc, char** argv) {
             world.toLatLon(car.pos.x, car.pos.z, me.lat, me.lon);
             me.y = car.pos.y; me.q = car.q; me.steer = car.w[0].steer; me.speed = car.speed(); me.wheelRot = car.w[0].rot;
             { CarVisual ov = ownVisual(); me.model = carModelSel; me.kind = car.kind; me.tinted = ov.tinted; me.paint[0] = ov.paint.r; me.paint[1] = ov.paint.g; me.paint[2] = ov.paint.b; }
-            me.flags = (uint8_t)((((blinker == -1 || blinker == 2) && blinkLit) ? 1 : 0) | (((blinker == 1 || blinker == 2) && blinkLit) ? 2 : 0) | (car.brake > 0.05f ? 4 : 0) | (lights ? 8 : 0));
+            me.headYaw = ownHeadYaw; me.headPitch = ownHeadPitch;   // bei VR: echter Kopf, sonst Kamerablick
+            me.flags = (uint8_t)((((blinker == -1 || blinker == 2) && blinkLit) ? 1 : 0) | (((blinker == 1 || blinker == 2) && blinkLit) ? 2 : 0) | (car.brake > 0.05f ? 4 : 0) | (lightsOn() ? 8 : 0));
             netplay::update(dt, me);
         }
 

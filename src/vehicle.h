@@ -31,6 +31,11 @@ struct Vehicle {
     // Ausgaben
     float ffb = 0;        // Lenkmoment (Nm am Lenkrad, positiv = nach rechts)
     bool evStall = false, evGrind = false;
+    bool evOverrev = false, evBlown = false, evNonFinite = false;   // Ereignisse eines Frames: Ueberdrehen, Motorschaden, ungueltiger Zustand
+    float health = 1.0f;          // Motorzustand 1 = gesund, 0 = Motorschaden
+    bool seized = false;          // Motor festgefressen
+    bool flipped = false;         // Fahrzeug liegt auf der Seite / dem Dach
+    void repairEngine() { health = 1.0f; seized = false; overrevWarned = false; engW = 0; engineOn = false; }
     float odo = 0;
     bool onRoad = true;
 
@@ -55,5 +60,6 @@ private:
     void logic(float dt);
     float shiftTimer = 0, autoEngage = 0, autoShiftCd = 0;
     float manifold = 0, boost = 0; // Saugrohrfuellung und Ladedruck (0..1)
+    bool overrevWarned = false;
     int autoGear = 1;
 };

@@ -18,6 +18,7 @@ struct RoadSeg {
     int name;
     uint8_t ring = 0;   // Kreisverkehr: 1 = Aussenseite rechts der Laufrichtung, 2 = links, 0 = kein Kreisverkehr
     int64_t wid = 0;    // OSM-Weg-ID (fuer Hoehen-Overrides im Studio)
+    float ya = -1e9f, yb = -1e9f;   // Fahrbahnhoehe an den Enden bei Bruecken/Tunneln/Rampen; -1e9 = folgt dem Gelaende
 };
 // Ampel (0), Stoppschild (1), Vorrang geben (2) - jeweils fuer eine Anfahrtsrichtung
 struct Control {
@@ -33,6 +34,17 @@ struct Poi { // Tankstelle (0) oder Supermarkt (1)
     std::string name;
 };
 struct TreePos { float x, y, z, rnd; }; // Strassenbaum (wird als Instanz gezeichnet)
+// Verkehrsschilder aus den Kartendaten. kind: 0 Tempolimit (Rundschild), 1 Autobahn-Wegweiserbruecke mit Wechselanzeige (VMS), 2 Ausfahrt-Hinweistafel am Strassenrand
+struct SignDef {
+    int kind = 0;
+    Vec3 pos;                 // Strassenmitte bzw. Mastfuss (y = Fahrbahn-/Bodenhoehe)
+    float tx = 1, tz = 0;     // Fahrtrichtung, fuer die das Schild gilt (Schild zeigt dem Verkehr entgegen)
+    float hw = 4;             // halbe Fahrbahnbreite (Bruecke: Spannweite)
+    int value = 0;            // Tempolimit bzw. Grundtempo der Autobahn
+    int lanes = 2;
+    uint32_t seed = 0;
+    std::string ref, l1, l2, l3;   // Ausfahrtsnummer und bis zu drei Ziele
+};
 struct MapConflict { // Unklarheit in den Kartendaten (z. B. Spurzahl wechselt von 2 auf 3)
     std::string key, name;
     int64_t idA = 0, idB = 0;
@@ -57,13 +69,15 @@ public:
     void update(Vec3 carPos, double now);
     bool height(float x, float z, float& h);
     Vec3 normal(float x, float z);
-    RoadHit nearestRoad(float x, float z, float maxDist, int maxKlass = 7);
+    // yRef: Hoehe des Fahrzeugs (Boden); Strassen auf anderer Ebene (Bruecke ueber / Tunnel unter dem Fahrzeug) werden ignoriert
+    RoadHit nearestRoad(float x, float z, float maxDist, int maxKlass = 7, float yRef = -1e9f);
     bool insideBuilding(float x, float z);
     void forControls(Vec3 p, float radius, const std::function<void(const Control&)>& fn);
     static int signalState(const Control& c, double t); // 0 rot, 1 rot-gelb, 2 gruen, 3 gelb
     void drawTerrain(int level, const Mat4& vp); // 0 fern, 1 mittel, 2 nah (nur Sichtbares)
     void forPoisNear(float x, float z, float r, const std::function<void(const Poi&)>& fn) const;
     void forTreesNear(float x, float z, float r, const std::function<void(const TreePos&)>& fn) const;
+    void forSignsNear(float x, float z, float r, const std::function<void(const SignDef&)>& fn) const;
     int forestAt(float x, float z) const;   // 1 dunkle Waldflaeche im Satellitenbild, 0 sonst, -1 Bild noch nicht geladen
     bool osmReady(float x, float z) const;  // Strassen/Gebaeude der Kachel sind geladen
     std::vector<MapConflict> takeConflicts();              // neu erkannte Unklarheiten abholen

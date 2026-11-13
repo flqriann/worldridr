@@ -208,11 +208,55 @@ Feste Objekte sind Hindernis und Untergrund: Rampen, Podeste und **Treppen** (Me
 - **Straßenhöhe (Studio, Taste 5):** Straße anklicken und „Boden / Unterführung“ oder ±1 m wählen. Für Unterführungen, die das Höhenmodell
   als Brücke zeigt. Gespeichert in `maps/map_overrides.json`.
 
+## Brücken, Tunnel, Rampen und Spuren
+
+- **Höhenführung:** `bridge=*`, `tunnel=yes` und `layer=*` aus OpenStreetMap werden ausgewertet. Brücken sind eine Gerade zwischen den Enden (über Tälern
+  frei schwebend) mit Fahrbahnplatte, Geländer und Pfeilern (nie auf einer Straße darunter); über kreuzenden tieferen Straßen halten sie 5,6 m Abstand,
+  die Straßen davor steigen mit höchstens 5,5–10 % an (Rampen mit Dammböschung). Tunnel liegen unter dem Gelände in einer Röhre. Die Physik (Auto, Verkehr,
+  Fußgänger) nutzt dieselbe Höhe; die Straßenerkennung (Tempolimit, Spur) ignoriert Straßen auf anderer Ebene.
+- **Spuren:** Die Mittellinie liegt nach `lanes:backward` bzw. `lanes:forward` (z. B. 2+1 Spuren), Abbiegepfeile kommen aus `turn:lanes` (8 m und 22 m vor der
+  Kreuzung). Fehlt `lanes`, wird die Spurzahl von der eindeutigen Fortsetzung derselben Straße übernommen. Ändert sich die Spurzahl wirklich, verjüngt bzw.
+  weitet sich die Straße als Keil (28 m innerorts, 50 m, 90 m auf Schnellstraßen) statt zu springen.
+- Grenzen: Gleise und Flüsse unter Brücken sind nicht in den Daten (kein Mindestabstand, die Brücke läuft nur zwischen ihren Enden); Brücken haben optisch ein
+  Geländer, aber man kann seitlich hinunterfahren. Testhilfe: `WR_EDCAM="x,hoehe,z,gieren,nicken"` setzt die Studio-Kamera (zusammen mit `--editor --tp lat lon`).
+
+## Motor: Motorbremse, Überdrehen, Schaden
+
+- **Motorbremse** aus Reibung nach Chen/Flynn plus Ladungswechselverlusten und Getriebeverlusten: etwa 35 Nm bei 3000/min, 60 Nm bei 6000/min (Diesel mehr).
+  Im 3. Gang bei 72 km/h bremst das Auto im Schub mit etwa 0,7 m/s².
+- **Money-Shift:** Wird der Motor beim Runterschalten über die Kupplung weit über den Begrenzer getrieben, nimmt er Schaden (ab Begrenzer + 300/min),
+  weit darüber (über das 1,35-fache) frisst er sich fest: die Antriebsräder blockieren, das Auto bremst hart. Dazu Fehlerpunkte in Fahrstunden.
+- **Reparieren:** Taste **R** (auch Lenkrad-Reset) repariert den Motor und setzt das Auto zurück auf die Straße. Liegt das Auto auf der Seite, kommt ein Hinweis.
+- Die Fahrphysik begrenzt jetzt Federkräfte, Tempo (306 km/h) und Drehraten und setzt bei ungültigem Zustand (NaN, Katapult) auf den letzten guten Stand zurück.
+- **Motorklang:** Zündimpulse je Zylinder durch Auspuff (Rohrresonanz, Schalldämpfer), Ansauggeräusch, Ventiltrieb/Dieselnageln, Schubbetrieb und unrunder Leerlauf, Reifen- und Windgeräusch, Regen.
+- Test: `run.bat --drivetest` (Schub in verschiedenen Gängen, Money-Shift mit Protokoll in der Konsole).
+
 ## Bäume und Wälder
 
-Straßenbäume und Wälder nutzen die Modelle `assets/trees/tree.glb` (Laubbaum) und `assets/trees/pine.glb` (Kiefer); eigene `.glb`
+Straßenbäume und Wälder nutzen die Modelle `assets/trees/tree.glb` (Laubbaum) und `assets/trees/pine.glb` (Kiefer) sowie vier
+prozedurale Arten (Birke, Fichte, Pappel, Buche mit unregelmäßigen Kronen). Wälder sind Mischwald, Straßenbäume überwiegend Laubbäume; eigene `.glb`
 mit Materialfarben lassen sich einfach austauschen. Wald entsteht dort, wo das Satellitenbild dunkel und grün ist (nicht auf
 Straßen und Gebäuden). Nah wird das volle Modell gezeichnet, weiter weg eine einfache Version (Instanced Rendering).
+
+## Schilder, Wechselverkehrszeichen, Abfahrten
+
+- Tempolimit-Schilder aus `maxspeed`-Änderungen, Autobahn-Wegweiserbrücken mit Anzeige (`destination`, `junction:ref`) 420 m vor Abfahrten. Die
+  Anzeigen wechseln simuliert (Aus / 100 / 80 / 60 + STAU / Spur gesperrt); das angezeigte Limit zählt für HUD und Fahrstunden. Test: `WR_VMS=1..4`.
+- Rampen (`*_link`) werden von der Hauptfahrbahn seitlich getrennt (Abstand wächst über ca. 90 m) statt sich zu überlagern.
+- Mehrspieler: Das Paket enthält jetzt Kopfdrehung der Spieler (VR-Kopf folgt dem echten Kopf); alle müssen dieselbe Version nutzen.
+
+## Tageszeit und Wetter
+
+- Einstellungen → **Tageszeit** (Jetzt / Morgen / Mittag / Abend / Dämmerung / Nacht), **Wetter** (Klar, Wolkig, Regen, Nebel, Gewitter, Schnee) und **Zeitablauf**
+  (Uhr steht, Echtzeit, 30-fach, 120-fach). Sonne, Mond, Sterne, Himmelsfarben, Dämmerung, Nebel, Regen-/Schneepartikel und beleuchtete Fenster folgen daraus.
+- Bei Dunkelheit schalten Licht und Scheinwerferkegel automatisch ein (Taste für Licht wie gewohnt). Nasse Straße und Schnee senken die Haftung (bis ca. 50 %).
+- Mehrspieler: Der Host bestimmt Tageszeit und Wetter für alle.
+
+## Verkehr und Fußgänger im Mehrspiel
+
+Der Host simuliert KI-Verkehr und Fußgänger und schickt sie mit 10 Hz an alle Mitspieler; die sehen genau dieselben Fahrzeuge und Personen (auch Unfälle
+von Fußgängern). Grenze: Der Verkehr entsteht rund um den Host; ein Mitspieler weit entfernt vom Host (oder auf einem eigenständigen Server ohne Host-Spieler)
+sieht keinen gemeinsamen Verkehr, sondern fährt wie im Einzelspiel mit lokal simuliertem. Mitspieler bewegen sich jetzt ohne Ruckeln (Fortschreibung + weiches Nachführen).
 
 ## Mehrspieler (Details)
 

@@ -137,6 +137,8 @@ void gfxMode(int mode, int flags = 0);
 void gfxMVP(const Mat4& mvp);
 void gfxCamera(Vec3 cam, const Mat4& invViewProj);
 void gfxBias(float b);
+void gfxEnv(float day, float overcast, float fogK, float wet, float snow, Vec3 sun);   // Tageslicht, Bewoelkung, Nebeldichte, Naesse, Schnee
+void gfxHead(Vec3 pos, Vec3 dir, float on);                                              // Scheinwerferkegel des eigenen Autos
 void gfxTint(float r, float g, float b);
 void gfxQuality(int q);   // 0 = einfache Shader (kein Detailrauschen), 1+ = volle Details
 GLuint gfxTexture(const uint8_t* px, int w, int h, int comp, bool mips);

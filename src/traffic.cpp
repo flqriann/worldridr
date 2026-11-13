@@ -38,6 +38,8 @@ struct AI {
     bool freeBody = false;   // nach einem Zusammenstoss: frei beweglicher Starrkoerper statt Spurfolge
     Vec3 vel;                // Geschwindigkeit im freien Zustand (x, z)
     float yawRate = 0, freeT = 0, slowT = 0;
+    bool puppet = false;     // Mitspieler-Ansicht: Zustand kommt vom Host
+    Vec3 tgt; float tyaw = 0; double seen = 0;
 };
 std::vector<AI> cars;
 
@@ -442,16 +444,72 @@ namespace traffic {
 
 int count() { return (int)cars.size(); }
 
+namespace { double lastRemoteT = -100; bool wasPuppet = false; }
+bool puppetMode() { return simTime - lastRemoteT < 2.5; }
+void snapshot(std::vector<NpcState>& out) {
+    for (const AI& c : cars) {
+        if (c.puppet) continue;
+        NpcState n{};
+        n.uid = (uint16_t)c.uid;
+        world.toLatLon(c.pos.x, c.pos.z, n.lat, n.lon);
+        n.y = c.pos.y;
+        n.yaw = (int16_t)clampv((int)std::lround(std::remainder(c.yaw, 2 * PI) * 5000.0f), -32000, 32000);
+        n.v = (int16_t)clampv((int)std::lround(c.v * 100.0f), -32000, 32000);
+        n.flags = (c.braking ? 1 : 0) | (c.turn < 0 ? 2 : 0) | (c.turn > 0 ? 4 : 0) | (c.passenger ? 8 : 0) | (c.pullover ? 16 : 0);
+        n.model = (uint8_t)clampv(c.model, 0, 255); n.kind = (uint8_t)c.kind; n.police = (uint8_t)c.police;
+        n.c1[0] = c.paint.r; n.c1[1] = c.paint.g; n.c1[2] = c.paint.b;
+        n.c2[0] = c.shirt.r; n.c2[1] = c.shirt.g; n.c2[2] = c.shirt.b;
+        out.push_back(n);
+    }
+}
+void applyRemote(const NpcState* s, int n) {
+    lastRemoteT = simTime;
+    if (!wasPuppet) { cars.clear(); wasPuppet = true; pc = PoliceCase{}; }
+    for (int i = 0; i < n; i++) {
+        AI* a = nullptr;
+        for (AI& c : cars) if (c.puppet && c.uid == s[i].uid) { a = &c; break; }
+        if (!a) { cars.push_back(AI{}); a = &cars.back(); a->puppet = true; a->uid = s[i].uid; a->seen = -1; }
+        float x, z;
+        world.toLocal(s[i].lat, s[i].lon, x, z);
+        a->tgt = {x, s[i].y, z};
+        a->tyaw = s[i].yaw / 5000.0f;
+        a->v = s[i].v / 100.0f;
+        if (a->seen < 0 || length(a->pos - a->tgt) > 40) { a->pos = a->tgt; a->yaw = a->tyaw; }
+        a->seen = simTime;
+        a->braking = (s[i].flags & 1) != 0;
+        a->turn = (s[i].flags & 2) ? -1 : (s[i].flags & 4) ? 1 : 0;
+        a->passenger = (s[i].flags & 8) != 0; a->pullover = (s[i].flags & 16) != 0;
+        a->model = s[i].model; a->kind = s[i].kind; a->police = s[i].police;
+        a->paint = Color{s[i].c1[0], s[i].c1[1], s[i].c1[2], 255};
+        a->shirt = Color{s[i].c2[0], s[i].c2[1], s[i].c2[2], 255};
+    }
+}
+static void stepPuppets(float dt) {
+    for (size_t i = 0; i < cars.size();) {
+        AI& c = cars[i];
+        if (!c.puppet || simTime - c.seen > 2.0) { cars.erase(cars.begin() + i); continue; }
+        Vec3 fwd{-std::sin(c.tyaw), 0, -std::cos(c.tyaw)};
+        Vec3 t = c.tgt + fwd * (c.v * (float)std::min(0.3, simTime - c.seen));
+        float k = 1.0f - std::exp(-dt * 12.0f);
+        c.pos += (t - c.pos) * k;
+        c.yaw += std::remainder(c.tyaw - c.yaw, 2 * PI) * k;
+        c.wheelRot += c.v / 0.32f * dt;
+        i++;
+    }
+}
+
 void update(float dt) {
     if (builtGen != world.geo().gen) { builtGen = world.geo().gen; cars.clear(); builtVersion = -1; pc = PoliceCase{}; }
     if (wanted <= 0) { cars.clear(); pc = PoliceCase{}; return; }
+    if (puppetMode()) { stepPuppets(dt); return; }   // Mitspieler: der Host simuliert den Verkehr
+    if (wasPuppet) { wasPuppet = false; cars.clear(); }
     if (builtVersion != world.roadVersion()) { builtVersion = world.roadVersion(); rebuild(); }
     if ((int)cars.size() < wanted) spawn();
 
     Vec3 pf = car.forward();
     pf.y = 0;
     pf = normalize(pf);
-    RoadHit ph = world.nearestRoad(car.pos.x, car.pos.z, 12);
+    RoadHit ph = world.nearestRoad(car.pos.x, car.pos.z, 12, 7, car.pos.y - 0.55f);
     if (!cfg.police) { for (size_t i = 0; i < cars.size();) { if (cars[i].police) cars.erase(cars.begin() + i); else i++; } pc = PoliceCase{}; }
     else policeLogic(dt, ph); // kann Fahrzeuge anlegen: deshalb vor dem Sammeln der Teilnehmer
 
@@ -683,6 +741,7 @@ void draw(const Mat4& vp, Vec3 cam, float maxDist) {
         if (v.kind == 0) { v.driver = true; v.passenger = c.passenger && !c.police; v.occX = c.sl.x; v.occZ = -c.sg.x; v.headYaw = c.headYaw; v.occShirt = c.police ? Color{60, 80, 120, 255} : c.shirt; }
         v.lean = clampv(-c.steerVis * c.v * 0.16f, -0.55f, 0.55f);
         v.brake = c.braking;
+        v.lights = envir::night() > 0.55f || c.police == 2;
         v.blinkL = (c.turn < 0 || c.pullover) && blink;
         v.blinkR = (c.turn > 0 || c.pullover) && blink;
         carDraw(v, vp, false, nullptr);

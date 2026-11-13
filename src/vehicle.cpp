@@ -1,5 +1,6 @@
 #include "vehicle.h"
 #include "world.h"
+namespace envir { float grip(); }
 
 namespace {
 float MASS = 1300.0f;
@@ -154,7 +155,7 @@ void Vehicle::logic(float dt) {
 }
 
 void Vehicle::update(float dt, World& world) {
-    evStall = false; // evGrind setzt requestGear(); das Hauptprogramm wertet es aus und loescht es
+    evStall = evOverrev = evBlown = evNonFinite = false; // evGrind setzt requestGear(); das Hauptprogramm wertet es aus und loescht es
     dt = clampv(dt, 0.0f, 0.05f);
     int grounded = 0;
     for (Wheel& wh : w) {
@@ -167,7 +168,7 @@ void Vehicle::update(float dt, World& world) {
             wh.gn = world.surfaceNormal(m.x, m.z, yRef);
             grounded++;
         }
-        wh.mu = onRoad ? 1.0f : 0.62f;
+        wh.mu = (onRoad ? 1.0f : 0.62f) * envir::grip();
         wh.crr = onRoad ? 0.012f : 0.07f;
     }
     if (grounded < 4) return; // Gelaende noch nicht geladen: Auto anhalten
@@ -181,8 +182,15 @@ void Vehicle::update(float dt, World& world) {
     float h = dt / n;
     ffb = 0;
     Vec3 p0 = pos;
+    Quat q0 = q;
     for (int i = 0; i < n; i++) substep(h);
     ffb /= n;
+    // Ungueltiger Zustand (NaN/Unendlich, Katapult in die Luft): auf den letzten guten Stand zuruecksetzen statt weiterzurechnen
+    auto bad = [](float v) { return !std::isfinite(v); };
+    bool broken = bad(pos.x) || bad(pos.y) || bad(pos.z) || bad(vel.x) || bad(vel.y) || bad(vel.z) || bad(q.w) || bad(q.x) || bad(q.y) || bad(q.z) ||
+                  bad(angVel.x) || bad(angVel.y) || bad(angVel.z) || bad(engW) || std::fabs(pos.y - p0.y) > 60.0f;
+    if (broken) { pos = p0; q = q0; vel = {}; angVel = {}; engW = std::max(0.0f, std::isfinite(engW) ? engW : 0.0f); evNonFinite = true; }
+    { Vec3 up2 = qrot(q, {0, 1, 0}); flipped = up2.y < 0.25f; }   // auf der Seite / auf dem Dach
     odo += length(Vec3{pos.x - p0.x, 0, pos.z - p0.z});
     for (Wheel& wh : w) wh.rot = std::fmod(wh.rot + wh.omega * dt, 2 * PI);
 }
@@ -205,13 +213,13 @@ void Vehicle::substep(float dt) {
         float c = 0;
         if (dn > 0.25f) {
             float dist = dot(mw - wh.gp, wh.gn) / dn;
-            c = SUS_REST + R - dist;
+            c = std::min(SUS_REST + R - dist, 0.70f);   // extreme Eindringtiefe begrenzen (sonst katapultiert die Feder das Auto)
             if (c > 0) {
                 wh.contact = true;
                 float cv = clampv((c - wh.comp) / dt, -4.0f, 4.0f);
                 float f = wh.k * c + wh.c * cv;
                 if (c > SUS_MAX) f += wh.k * 12.0f * (c - SUS_MAX);
-                fs[i] = std::max(f, 0.0f);
+                fs[i] = clampv(f, 0.0f, 4.0f * MASS * 9.81f);   // nie mehr als das 4-fache des Fahrzeuggewichts pro Rad
                 cp[i] = mw - up * dist;
             }
         }
@@ -229,7 +237,10 @@ void Vehicle::substep(float dt) {
     float Tc = 0, Keff = 0;
     if (ratio != 0 && engage > 0) {
         float wg = 0.5f * (w[0].omega + w[1].omega) * ratio;
-        float raw = CLUTCH_K * (engW - wg), cap = CLUTCH_CAP * engage;
+        // Beim Einkuppeln mit grosser Drehzahldifferenz (Runterschalten bei hohem Tempo) uebertraegt die Kupplung kurzzeitig ein
+        // Vielfaches des Nennmoments (Schwungrad-/Zweimassen-Effekt): das Auto wird deutlich haerter abgebremst
+        float slipW = std::fabs(engW - wg);
+        float raw = CLUTCH_K * (engW - wg), cap = CLUTCH_CAP * engage * (1.0f + 1.6f * std::min(1.0f, slipW / 120.0f));
         if (std::fabs(raw) > cap) Tc = raw > 0 ? cap : -cap;
         else { Tc = raw; Keff = CLUTCH_K; }
     }
@@ -241,9 +252,15 @@ void Vehicle::substep(float dt) {
     //  - Reib- und Pumpverluste entsprechen ca. 1 .. 2 bar Reibmitteldruck (15 Nm bei 2000, 29 Nm bei 6000 U/min).
     float r = rpm();
     float n = std::max(r, 300.0f) / 1000.0f;
-    float fric = (8.0f + 0.0035f * r) * TQ * FRICK;
+    // Reibung nach Chen/Flynn: FMEP = 0,97 + 0,15 n + 0,05 n^2 (bar, n in 1000/min), Drehmoment = FMEP * Hubraum / (4 pi);
+    // dazu Nebenaggregate. Das ergibt die Motorbremse im Schub: ca. 35 Nm bei 3000/min, 42 Nm bei 4000, 60 Nm bei 6000.
+    float fmep = 0.97f + 0.15f * n + 0.05f * n * n;
+    float fric = (fmep * 11.14f * (ENG == 1 && kind == 0 ? 1.16f : 1.0f) + 3.0f + 0.001f * r) * TQ * FRICK;
     float Te;
-    if (engineOn) {
+    if (seized) { // festgefressener Motor: blockiert den Antriebsstrang
+        engineOn = false;
+        Te = -420.0f * clampv(engW / 6.0f, 0.0f, 1.0f);
+    } else if (engineOn) {
         bool diesel = ENG == 1 && kind == 0;
         float area = 1.2f * throttle + 25.0f * throttle * throttle * throttle;
         float req = diesel ? throttle : 1.0f - std::exp(-area / n); // Diesel: Einspritzmenge folgt dem Pedal, keine Drosselklappe
@@ -255,8 +272,10 @@ void Vehicle::substep(float dt) {
         float tau = boostTarget < boost ? 0.15f : (diesel ? clampv(1.4f - 0.35f * n, 0.25f, 1.0f) : clampv(1.5f - 0.33f * n, 0.22f, 1.1f)); // Turboloch
         boost += (boostTarget - boost) * std::min(1.0f, dt / tau);
         float fill = diesel ? 0.55f * manifold + 0.45f * boost : std::min(manifold, 0.6f) + 0.4f * boost;
-        float pump = (1.0f - fill) * (diesel ? 2.0f + 0.0008f * r : 4.0f + 0.0012f * r) * TQ;                  // Drosselverluste = Motorbremse
+        // Ladungswechselverluste bei geschlossener Drossel (Unterdruck ca. 0,7 bar * Hubraum / 4 pi = 8 Nm); der Diesel hat keine Drossel, aber hoehere Verdichtungsarbeit
+        float pump = (1.0f - fill) * (diesel ? 5.5f + 0.0010f * r : 8.4f + 0.0008f * r) * TQ;
         Te = fill * (torqueCurve(r) + fric) - fric - pump;
+        if (health < 1.0f) Te *= 0.55f + 0.45f * health;   // angeschlagener Motor laeuft schlecht
     } else {
         manifold = boost = 0;
         Te = -(fric + (4.0f + 0.0012f * r) * TQ) * clampv(engW / 2.0f, 0.0f, 1.0f);
@@ -266,11 +285,15 @@ void Vehicle::substep(float dt) {
     // --- Reifen ---
     for (int i = 0; i < 4; i++) {
         Wheel& wh = w[i];
-        float Tdrive = wh.driven ? Tc * ratio * 0.5f * 0.93f : 0.0f; // 7 % Verluste in Getriebe und Differential
+        // 7 % Verluste in Getriebe und Differential: im Zug kommt weniger an, im Schub muss das Rad mehr aufbringen (staerkere Motorbremse)
+        float Tdrive = wh.driven ? Tc * ratio * 0.5f * (Tc * ratio >= 0 ? 0.93f : 1.0f / 0.93f) : 0.0f;
         float Dc = wh.driven ? Keff * ratio * ratio : 0.0f;
         float Fx = 0, Dt = 0;
         float Tb = brake * (wh.front ? BRAKE_F : BRAKE_R);
         if (!wh.front && (handbrake || (automatic && selector == 0))) Tb += BRAKE_H;
+        // Festgefressener Motor bei eingelegtem Gang und geschlossener Kupplung: die Antriebsraeder blockieren
+        bool lockUp = seized && wh.driven && ratio != 0.0f && engage > 0.15f;
+        if (lockUp) Tb += 9000.0f;
         wh.slip = 0;
         if (wh.contact) {
             Vec3 nrm = wh.gn;
@@ -301,8 +324,8 @@ void Vehicle::substep(float dt) {
                 float trail = 0.022f + 0.04f * std::max(0.0f, 1.0f - std::fabs(sy) * 0.8f);
                 ffb += -Fy * trail / STEER_RATIO * 0.25f; // 0.25 = Servounterstuetzung
             }
-            if (Tb > 0 && vx > 3.0f && sr < -0.2f) Tb *= 0.25f;  // ABS
-            if (Tb > 0 && vx < -3.0f && sr > 0.2f) Tb *= 0.25f;
+            if (!lockUp && Tb > 0 && vx > 3.0f && sr < -0.2f) Tb *= 0.25f;  // ABS
+            if (!lockUp && Tb > 0 && vx < -3.0f && sr > 0.2f) Tb *= 0.25f;
         }
         float Ieff = I_WHEEL + dt * (Dt + Dc);
         float wn = wh.omega + dt * (Tdrive - R * Fx) / Ieff;
@@ -315,22 +338,34 @@ void Vehicle::substep(float dt) {
     // --- Motor ---
     engW += dt * (Te - Tc) / (I_ENGINE + dt * 2.0f * Keff);
     if (engW < 0) engW = 0;
+    // Money-Shift / Ueberdrehen: wird der Motor ueber die Kupplung vom Rad weit ueber den Drehzahlbegrenzer getrieben
+    // (z. B. 5. -> 2. Gang bei hohem Tempo), nehmen Ventiltrieb und Kurbeltrieb Schaden. Weit darueber: sofort Motorschaden.
+    {
+        float rr = engW * 9.5493f, lim = RLIMIT;
+        if (!seized && rr > lim + 300.0f) {
+            health -= dt * clampv((rr - lim - 300.0f) / 1100.0f, 0.0f, 3.0f) * 0.8f;
+            if (!overrevWarned) { overrevWarned = true; evOverrev = true; }
+        } else if (rr < lim) overrevWarned = false;
+        if (!seized && (rr > lim * 1.35f || health <= 0.0f)) { health = 0.0f; seized = true; engineOn = false; evBlown = true; }
+    }
     // Abwuergen: erst wenn die Drehzahl laenger unter der Schwelle bleibt (Schwungrad, Leerlaufregler); sehr niedrig sofort
     if (engineOn && engW * 9.5493f < STALL) stallTimer += dt; else stallTimer = 0;
     if (engineOn && (stallTimer > STALLT || engW * 9.5493f < STALL * 0.45f)) { engineOn = false; evStall = true; stallTimer = 0; }
     // Anlasser: nach ca. 0,8 s Kurbeln springt der Motor an, auch wenn der Anlasser gegen Getriebe-/Fahrwiderstand nur ~400 U/min schafft
     static float crankT = 0;
     if (!engineOn && starter) crankT += dt; else crankT = 0;
-    if (!engineOn && starter && (engW * 9.5493f > START || (crankT > 0.8f && engW * 9.5493f > 220.0f))) { engineOn = true; crankT = 0; }
+    if (!engineOn && !seized && starter && (engW * 9.5493f > START || (crankT > 0.8f && engW * 9.5493f > 220.0f))) { engineOn = true; crankT = 0; }
 
     // --- Starrkoerper integrieren ---
     vel += F * (dt / MASS);
+    { float sp2 = length(vel); if (sp2 > 85.0f) vel = vel * (85.0f / sp2); }   // 306 km/h: harte Obergrenze gegen numerische Ausreisser
     Quat qc = qconj(q);
     Vec3 wb = qrot(qc, angVel), tb = qrot(qc, T);
     Vec3 Iw{INERTIA.x * wb.x, INERTIA.y * wb.y, INERTIA.z * wb.z};
     Vec3 gy = cross(wb, Iw);
     wb += Vec3{(tb.x - gy.x) / INERTIA.x, (tb.y - gy.y) / INERTIA.y, (tb.z - gy.z) / INERTIA.z} * dt;
     wb = wb * (1.0f - 0.05f * dt);
+    { float aw = length(wb); if (aw > 14.0f) wb = wb * (14.0f / aw); }          // Drehrate begrenzen (Ueberschlag/Aufprall)
     angVel = qrot(q, wb);
     pos += vel * dt;
     Quat dq = qmul(Quat{0, angVel.x, angVel.y, angVel.z}, q);
