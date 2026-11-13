@@ -2,6 +2,8 @@
 // Strassen mit Kurven bauen, alles in maps/welt.json speichern. Positionen sind Geokoordinaten.
 #include "game.h"
 #include "net.h"
+#include "editor_mesh.h"
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <fstream>
@@ -15,7 +17,7 @@ namespace fs = std::filesystem;
 namespace {
 const double DPI = 3.14159265358979323846;
 const char* MAP_FILE = "maps/welt.json";
-const char* SHAPE_NAMES[] = {"Block", "Zylinder", "Keil (Rampe)", "Kugel", "Modell"};
+const char* SHAPE_NAMES[] = {"Block", "Zylinder", "Keil (Rampe)", "Kugel", "Modell", "Mesh"};
 
 struct Obj {
     int shape = 0;
@@ -27,6 +29,9 @@ struct Obj {
     std::string texture, model;
     bool solid = true;
     Vec3 pos;              // lokal, abgeleitet
+    std::string name;
+    EMesh mesh;            // shape 5: frei bearbeitbares Mesh (Eckpunkte und Flaechen mit eigenen Farben)
+    std::shared_ptr<Mesh> emesh;
 };
 struct RPoint { double lat, lon; float lift; float x, z; };
 struct Road {
@@ -81,6 +86,71 @@ void toLocal(double lat, double lon, float& x, float& z) {
 Quat rotOf(const Obj& o) { return qmul(qaxis({0, 1, 0}, o.rot.x), qmul(qaxis({1, 0, 0}, o.rot.y), qaxis({0, 0, 1}, o.rot.z))); }
 Mat4 matOf(const Obj& o) { return mul(fromQuatPos(rotOf(o), o.pos), scaleM(o.scale.x, o.scale.y, o.scale.z)); }
 void say(const std::string& s) { statusMsg = s; statusUntil = simTime + 3; }
+
+// ---------- Studio-Zustand: Mesh-Bearbeitung, Raster, Farben, Explorer ----------
+std::vector<Color> customPal;                 // eigene Lieblingsfarben (werden in der Karte gespeichert)
+std::vector<std::string> redoStack;
+bool editMode = false;                        // Mesh-Bearbeitung (Tab) am ausgewaehlten Objekt
+int pickMode = 2;                             // 0 Eckpunkt, 1 Kante, 2 Flaeche
+std::vector<char> selV, selF;                 // ausgewaehlte Eckpunkte / Flaechen des bearbeiteten Meshes
+struct Modal {                                // Blender-artiges Verschieben / Drehen / Skalieren (G, R, S)
+    bool active = false;
+    int type = 0, axis = -1;                  // type 0 G, 1 R, 2 S; axis -1 frei, 0..2 x/y/z, 3 Flaechennormale
+    Vec3 dirLocal{0, 1, 0};
+    std::vector<int> ids;
+    std::vector<Vec3> start;
+    Vec3 pivot;
+    float sx = 0, sy = 0;
+    bool drag = false, pushed = true;         // drag: Pfeil mit gedrueckter Maustaste gezogen; pushed: Undo-Schritt gehoert dazu
+    std::string num, info;                    // getippte Zahl, Anzeige
+    Vec3 pivotW, hit0, normalW;
+} mo;
+bool lmbReleased = false;
+Vec3 dragStart;                               // Objekt-Gizmo: Ausgangswert beim Ziehen
+float dragAcc = 0;
+float gridStep = 0.5f;
+bool gridOn = true;
+Color brush{205, 205, 205, 255};              // aktuelle Farbe (Objekt oder ausgewaehlte Flaechen)
+int explorerScroll = 0;
+bool boxSelecting = false, mmb = false, dragMoved = false;
+float boxX0 = 0, boxY0 = 0;
+int nameCounter = 0;
+
+void rebuildMesh(Obj& o) {
+    std::vector<Vertex> v;
+    emesh::triangulate(o.mesh, v);
+    o.emesh.reset(new Mesh, [](Mesh* m) { m->destroy(); delete m; });
+    o.emesh->create(v.data(), (int)v.size());
+}
+// Block/Zylinder/Keil/Kugel in ein Mesh umwandeln (Skalierung wird eingebacken), damit man Flaechen und Eckpunkte bearbeiten kann
+bool convertToMesh(Obj& o) {
+    if (o.shape == 5) return true;
+    if (o.shape == 4) return false;
+    EMesh m;
+    if (o.shape == 0) m = emesh::block(o.scale);
+    else if (o.shape == 1) m = emesh::cylinder(o.scale);
+    else if (o.shape == 2) m = emesh::wedge(o.scale);
+    else m = emesh::sphere(o.scale);
+    for (EFace& f : m.f) f.c = o.color;
+    o.mesh = std::move(m);
+    o.shape = 5;
+    o.scale = {1, 1, 1};
+    rebuildMesh(o);
+    return true;
+}
+std::string newName(const std::string& base) { return base + " " + std::to_string(++nameCounter); }
+Vec3 snapV(Vec3 p) {
+    if (!gridOn) return p;
+    return {std::round(p.x / gridStep) * gridStep, std::round(p.y / gridStep) * gridStep, std::round(p.z / gridStep) * gridStep};
+}
+float snapF(float v) { return gridOn ? std::round(v / gridStep) * gridStep : v; }
+std::string gridLabel() {
+    char b[48];
+    if (!gridOn) return "Raster: aus";
+    snprintf(b, sizeof b, "Raster: %g m", gridStep);
+    for (char* p = b; *p; p++) if (*p == '.') *p = ',';
+    return b;
+}
 
 // ---------- Grundformen ----------
 void makeShapes() {
@@ -240,6 +310,7 @@ Model& modelOf(const std::string& name) {
 void boundsOf(const Obj& o, Vec3& lo, Vec3& hi) {
     lo = {-0.5f, -0.5f, -0.5f}; hi = {0.5f, 0.5f, 0.5f};
     if (o.shape == 4) { Model& m = modelOf(o.model); lo = m.bmin; hi = m.bmax; }
+    if (o.shape == 5) emesh::bounds(o.mesh, lo, hi);
     lo = {lo.x * o.scale.x, lo.y * o.scale.y, lo.z * o.scale.z};
     hi = {hi.x * o.scale.x, hi.y * o.scale.y, hi.z * o.scale.z};
 }
@@ -248,10 +319,20 @@ void boundsOf(const Obj& o, Vec3& lo, Vec3& hi) {
 json serialize() {
     json j;
     j["objects"] = json::array();
-    for (const Obj& o : objs)
-        j["objects"].push_back({{"shape", o.shape}, {"lat", o.lat}, {"lon", o.lon}, {"alt", o.alt}, {"rot", {o.rot.x, o.rot.y, o.rot.z}},
-                                {"scale", {o.scale.x, o.scale.y, o.scale.z}}, {"color", {o.color.r, o.color.g, o.color.b}}, {"texture", o.texture},
-                                {"model", o.model}, {"solid", o.solid}, {"tile", o.tile}});
+    for (const Obj& o : objs) {
+        json je = {{"shape", o.shape}, {"lat", o.lat}, {"lon", o.lon}, {"alt", o.alt}, {"rot", {o.rot.x, o.rot.y, o.rot.z}},
+                   {"scale", {o.scale.x, o.scale.y, o.scale.z}}, {"color", {o.color.r, o.color.g, o.color.b}}, {"texture", o.texture},
+                   {"model", o.model}, {"solid", o.solid}, {"tile", o.tile}, {"name", o.name}};
+        if (o.shape == 5) { // frei bearbeitbares Mesh: Eckpunkte und Flaechen mit Farbe
+            json mv = json::array(), mf = json::array();
+            for (const Vec3& p : o.mesh.v) mv.push_back({p.x, p.y, p.z});
+            for (const EFace& f : o.mesh.f) mf.push_back({{"i", f.v}, {"c", {f.c.r, f.c.g, f.c.b}}});
+            je["mesh"] = {{"v", mv}, {"f", mf}};
+        }
+        j["objects"].push_back(je);
+    }
+    j["palette"] = json::array();
+    for (const Color& c : customPal) j["palette"].push_back({c.r, c.g, c.b});
     j["roads"] = json::array();
     for (const Road& r : roads) {
         json pts = json::array();
@@ -271,8 +352,25 @@ void deserialize(const json& j) {
                 o.scale = Vec3(e["scale"][0].get<float>(), e["scale"][1].get<float>(), e["scale"][2].get<float>());
                 o.color = Color{e["color"][0].get<uint8_t>(), e["color"][1].get<uint8_t>(), e["color"][2].get<uint8_t>(), 255};
                 o.texture = e.value("texture", ""); o.model = e.value("model", ""); o.solid = e.value("solid", true); o.tile = e.value("tile", 2.0f);
+                o.name = e.value("name", "");
+                if (o.shape == 5 && e.contains("mesh")) {
+                    for (const json& p : e["mesh"]["v"]) o.mesh.v.push_back({p[0].get<float>(), p[1].get<float>(), p[2].get<float>()});
+                    for (const json& fj : e["mesh"]["f"]) {
+                        EFace f;
+                        f.v = fj["i"].get<std::vector<int>>();
+                        f.c = Color{fj["c"][0].get<uint8_t>(), fj["c"][1].get<uint8_t>(), fj["c"][2].get<uint8_t>(), 255};
+                        bool ok = f.v.size() >= 3;
+                        for (int i : f.v) if (i < 0 || i >= (int)o.mesh.v.size()) ok = false;
+                        if (ok) o.mesh.f.push_back(f);
+                    }
+                    rebuildMesh(o);
+                }
+                if (o.name.empty()) o.name = newName(o.shape == 4 ? o.model : SHAPE_NAMES[o.shape]);
                 objs.push_back(o);
             }
+        customPal.clear();
+        if (j.contains("palette"))
+            for (const json& p : j["palette"]) customPal.push_back(Color{p[0].get<uint8_t>(), p[1].get<uint8_t>(), p[2].get<uint8_t>(), 255});
         if (j.contains("roads"))
             for (const json& e : j["roads"]) {
                 Road r;
@@ -285,15 +383,25 @@ void deserialize(const json& j) {
 }
 void pushUndo() {
     undoStack.push_back(serialize().dump());
-    if (undoStack.size() > 40) undoStack.erase(undoStack.begin());
+    if (undoStack.size() > 60) undoStack.erase(undoStack.begin());
+    redoStack.clear();
     modified = true;
 }
 void undo() {
     if (undoStack.empty()) return;
+    redoStack.push_back(serialize().dump());
     deserialize(json::parse(undoStack.back(), nullptr, false));
     undoStack.pop_back();
-    sel = selRoad = selPt = -1; drawing = false;
+    sel = selRoad = selPt = -1; drawing = false; editMode = false; mo.active = false;
     say("R\xC3\xBC" "ckg\xC3\xA4ngig");
+}
+void redo() {
+    if (redoStack.empty()) return;
+    undoStack.push_back(serialize().dump());
+    deserialize(json::parse(redoStack.back(), nullptr, false));
+    redoStack.pop_back();
+    sel = selRoad = selPt = -1; drawing = false; editMode = false; mo.active = false;
+    say("Wiederholt");
 }
 
 // ---------- Strassen aufbauen ----------
@@ -441,7 +549,16 @@ bool rayGround(Vec3 ro, Vec3 rd, Vec3& hit, bool withObjects) {
     }
     return false;
 }
+Vec3 toWorld(const Obj& o, Vec3 p) { return o.pos + qrot(rotOf(o), Vec3{p.x * o.scale.x, p.y * o.scale.y, p.z * o.scale.z}); }
+Vec3 toObj(const Obj& o, Vec3 w) { Vec3 l = qrot(qconj(rotOf(o)), w - o.pos); return {l.x / o.scale.x, l.y / o.scale.y, l.z / o.scale.z}; }
+Vec3 dirToObj(const Obj& o, Vec3 d) { Vec3 l = qrot(qconj(rotOf(o)), d); return {l.x / o.scale.x, l.y / o.scale.y, l.z / o.scale.z}; }
 bool rayObj(Vec3 ro, Vec3 rd, const Obj& o, float& tHit) {
+    if (o.shape == 5) { // Mesh: genau gegen die Flaechen testen
+        float t;
+        if (emesh::pickFace(o.mesh, toObj(o, ro), dirToObj(o, rd), t) < 0) return false;
+        tHit = t;
+        return true;
+    }
     Quat qi = qconj(rotOf(o));
     Vec3 lo, hi, p = qrot(qi, ro - o.pos), d = qrot(qi, rd);
     boundsOf(o, lo, hi);
@@ -470,12 +587,382 @@ float distToSeg(float px, float py, float ax, float ay, float bx, float by) {
 }
 Vec3 pointPos(const RPoint& p) { float h = 0; world.height(p.x, p.z, h); return {p.x, h + p.lift + 0.6f, p.z}; }
 
-void insertObject(int shape, const std::string& model) {
+const char* MESH_NAMES[] = {"Treppe", "Dach", "Pyramide", "Kegel", "Platte", "L-Winkel"};
+const int NMESH = 6;
+EMesh makeMesh(int kind) {
+    switch (kind) {
+    case 0: return emesh::stairs({3, 2, 4});
+    case 1: return emesh::roof({4, 2, 6});
+    case 2: return emesh::pyramid({3, 3, 3});
+    case 3: return emesh::cone({2, 2, 2});
+    case 4: return emesh::plate({4, 0.3f, 4});
+    default: return emesh::lshape({4, 2, 4});
+    }
+}
+bool shiftHeld() { const bool* k = SDL_GetKeyboardState(nullptr); return k[SDL_SCANCODE_LSHIFT] || k[SDL_SCANCODE_RSHIFT]; }
+bool snapOn() { const bool* k = SDL_GetKeyboardState(nullptr); return gridOn != (k[SDL_SCANCODE_LCTRL] || k[SDL_SCANCODE_RCTRL]); }
+float snapQ(float v) { return snapOn() ? std::round(v / gridStep) * gridStep : v; }
+
+// Mesh als begehbare / befahrbare Flaeche: Strahl nach unten bzw. oben gegen die Flaechen
+bool meshNear(const Obj& o, float x, float z, float& cy, float& R) {
+    Vec3 lo, hi;
+    boundsOf(o, lo, hi);
+    Vec3 c = toWorld(o, Vec3{(lo.x + hi.x) * 0.5f / o.scale.x, (lo.y + hi.y) * 0.5f / o.scale.y, (lo.z + hi.z) * 0.5f / o.scale.z});
+    R = 0.5f * length(hi - lo) + 0.5f;
+    cy = c.y;
+    return std::hypot(x - c.x, z - c.z) <= R;
+}
+bool meshDown(const Obj& o, float x, float z, float yRef, float& h) {
+    float cy, R;
+    if (!meshNear(o, x, z, cy, R)) return false;
+    yRef = std::min(yRef, cy + R + 1.0f);
+    float t;
+    if (emesh::pickFace(o.mesh, toObj(o, {x + 0.00137f, yRef, z + 0.00091f}), dirToObj(o, {0, -1, 0}), t) < 0) return false;
+    h = yRef - t;
+    return true;
+}
+int meshCountUp(const Obj& o, float x, float y, float z) {
+    Vec3 ro = toObj(o, {x + 0.00137f, y, z + 0.00091f}), rd = dirToObj(o, {0, 1, 0});
+    int n = 0;
+    for (const EFace& f : o.mesh.f)
+        for (size_t k = 1; k + 1 < f.v.size(); k++) {
+            float t;
+            if (emesh::rayTri(ro, rd, o.mesh.v[f.v[0]], o.mesh.v[f.v[k]], o.mesh.v[f.v[k + 1]], t)) n++;
+        }
+    return n;
+}
+
+// ---------- Mesh-Bearbeitung ----------
+Obj* editObj() { return (editMode && sel >= 0 && sel < (int)objs.size() && objs[sel].shape == 5) ? &objs[sel] : nullptr; }
+void fitSel(Obj& o) { selV.resize(o.mesh.v.size(), 0); selF.resize(o.mesh.f.size(), 0); }
+void clearSel(Obj& o) { selV.assign(o.mesh.v.size(), 0); selF.assign(o.mesh.f.size(), 0); }
+std::vector<int> activeVerts(const Obj& o) {
+    std::vector<int> r;
+    if (pickMode == 2) {
+        std::vector<char> m(o.mesh.v.size(), 0);
+        for (size_t i = 0; i < o.mesh.f.size() && i < selF.size(); i++)
+            if (selF[i]) for (int v : o.mesh.f[i].v) m[v] = 1;
+        for (size_t i = 0; i < m.size(); i++) if (m[i]) r.push_back((int)i);
+    } else
+        for (size_t i = 0; i < selV.size() && i < o.mesh.v.size(); i++) if (selV[i]) r.push_back((int)i);
+    return r;
+}
+Vec3 selCenterWorld(const Obj& o) {
+    std::vector<int> ids = activeVerts(o);
+    if (ids.empty()) return o.pos;
+    Vec3 c{};
+    for (int i : ids) c += toWorld(o, o.mesh.v[i]);
+    return c * (1.0f / (float)ids.size());
+}
+Vec3 worldAxis(int a) { return a == 0 ? Vec3{1, 0, 0} : a == 1 ? Vec3{0, 1, 0} : Vec3{0, 0, 1}; }
+Vec3 camForward() { return normalize(xformDir(editor::camera(), {0, 0, -1})); }
+
+void setPickMode(int m) {
+    if (m == pickMode) return;
+    if (Obj* o = editObj()) {
+        fitSel(*o);
+        if (pickMode == 2) { // Flaechen -> Eckpunkte
+            std::vector<int> ids = activeVerts(*o);
+            selV.assign(o->mesh.v.size(), 0);
+            for (int i : ids) selV[i] = 1;
+        } else if (m == 2) { // Eckpunkte -> Flaechen, deren Ecken alle gewaehlt sind
+            selF.assign(o->mesh.f.size(), 0);
+            for (size_t i = 0; i < o->mesh.f.size(); i++) {
+                bool all = true;
+                for (int v : o->mesh.f[i].v) if (!selV[v]) all = false;
+                selF[i] = all;
+            }
+        }
+    }
+    pickMode = m;
+}
+void enterEdit() {
+    if (sel < 0 || sel >= (int)objs.size()) return;
+    Obj& o = objs[sel];
+    if (o.shape == 4) { say("3D-Modelle (.obj) lassen sich nicht bearbeiten"); return; }
+    if (o.shape != 5) { pushUndo(); convertToMesh(o); }
+    editMode = true; mo.active = false; drawing = false;
+    clearSel(o);
+}
+void leaveEdit() { editMode = false; mo.active = false; }
+
+void applyColor(Color c) {
+    brush = c;
+    if (sel < 0 || sel >= (int)objs.size()) return;
+    Obj& o = objs[sel];
+    o.color = c;
+    if (o.shape != 5) return;
+    fitSel(o);
+    bool any = false;
+    if (editMode) // gewaehlte Flaechen (bei Punkten/Kanten: alle Flaechen, die einen gewaehlten Punkt nutzen)
+        for (size_t i = 0; i < o.mesh.f.size(); i++) {
+            bool hit = false;
+            if (pickMode == 2) hit = selF[i] != 0;
+            else for (int v : o.mesh.f[i].v) if (selV[v]) hit = true;
+            if (hit) { o.mesh.f[i].c = c; any = true; }
+        }
+    if (!any) for (EFace& f : o.mesh.f) f.c = c; // nichts gewaehlt: ganzes Objekt
+    rebuildMesh(o);
+}
+
+Vec3 modalAxis() {
+    if (mo.axis >= 0 && mo.axis < 3) return worldAxis(mo.axis);
+    if (mo.axis == 3) return mo.normalW;
+    return {0, 0, 0};
+}
+void modalBegin(int type, int axis, bool drag, bool pushU = true) {
+    Obj* o = editObj();
+    if (!o) return;
+    fitSel(*o);
+    std::vector<int> ids = activeVerts(*o);
+    if (ids.empty()) { say("Zuerst etwas ausw\xC3\xA4hlen (Klick oder Rahmen ziehen)"); return; }
+    if (pushU) pushUndo();
+    mo = Modal{};
+    mo.active = true; mo.type = type; mo.axis = axis; mo.drag = drag; mo.pushed = pushU; mo.ids = ids;
+    for (int i : ids) mo.start.push_back(o->mesh.v[i]);
+    mo.pivotW = selCenterWorld(*o);
+    mo.sx = mouseX; mo.sy = mouseY;
+    Vec3 n{};
+    if (pickMode == 2)
+        for (size_t i = 0; i < o->mesh.f.size() && i < selF.size(); i++)
+            if (selF[i]) n += qrot(rotOf(*o), emesh::faceNormal(o->mesh, (int)i));
+    mo.normalW = length(n) > 1e-4f ? normalize(n) : Vec3{0, 1, 0};
+    Vec3 ro, rd;
+    mouseRay(ro, rd);
+    Vec3 f = camForward();
+    float den = dot(rd, f);
+    mo.hit0 = std::fabs(den) > 1e-4f ? ro + rd * (dot(mo.pivotW - ro, f) / den) : mo.pivotW;
+}
+Vec3 rotAround(Vec3 v, Vec3 k, float a) { return v * std::cos(a) + cross(k, v) * std::sin(a) + k * (dot(k, v) * (1 - std::cos(a))); }
+void modalApply(Obj& o) {
+    Vec3 ax = modalAxis(), fwd = camForward();
+    bool hasAx = mo.axis >= 0, hasNum = !mo.num.empty();
+    float num = 0;
+    if (hasNum) { std::string s = mo.num; for (char& c : s) if (c == ',') c = '.'; num = (float)atof(s.c_str()); }
+    float psx = 0, psy = 0;
+    bool pv = project(mo.pivotW, psx, psy);
+    char b[96];
+    std::vector<Vec3> w(mo.ids.size());
+    for (size_t k = 0; k < mo.ids.size(); k++) w[k] = toWorld(o, mo.start[k]);
+    if (mo.type == 0) {
+        Vec3 delta{};
+        if (hasAx) {
+            float d = 0;
+            if (hasNum) d = num;
+            else {
+                float L = std::max(0.5f, length(mo.pivotW - camP) * 0.2f), sx, sy, tx, ty;
+                if (project(mo.pivotW, sx, sy) && project(mo.pivotW + ax * L, tx, ty)) {
+                    float a2 = (tx - sx) * (tx - sx) + (ty - sy) * (ty - sy);
+                    if (a2 > 1) d = ((mouseX - mo.sx) * (tx - sx) + (mouseY - mo.sy) * (ty - sy)) / a2 * L;
+                }
+                if (snapOn()) {
+                    if (mo.axis < 3) { float base = dot(mo.pivotW, ax); d = snapQ(base + d) - base; }
+                    else d = snapQ(d);
+                }
+            }
+            delta = ax * d;
+            snprintf(b, sizeof b, "Verschieben %.2f m", d);
+        } else {
+            Vec3 ro, rd;
+            mouseRay(ro, rd);
+            float den = dot(rd, fwd);
+            if (std::fabs(den) > 1e-4f) delta = (ro + rd * (dot(mo.pivotW - ro, fwd) / den)) - mo.hit0;
+            if (snapOn()) { Vec3 t = mo.pivotW + delta; delta = Vec3{snapQ(t.x), snapQ(t.y), snapQ(t.z)} - mo.pivotW; }
+            snprintf(b, sizeof b, "Verschieben %.2f / %.2f / %.2f", delta.x, delta.y, delta.z);
+        }
+        for (size_t k = 0; k < w.size(); k++) w[k] += delta;
+    } else if (mo.type == 1) {
+        Vec3 k = hasAx ? ax : fwd;
+        float ang = 0;
+        if (hasNum) ang = num * PI / 180;
+        else if (pv) {
+            float a0 = std::atan2(mo.sy - psy, mo.sx - psx), a1 = std::atan2(mouseY - psy, mouseX - psx);
+            ang = a1 - a0;
+            while (ang > PI) ang -= 2 * PI;
+            while (ang < -PI) ang += 2 * PI;
+            if (snapOn()) ang = std::round(ang / (PI / 12)) * (PI / 12);
+        }
+        float sgn = dot(k, fwd) >= 0 ? 1.0f : -1.0f;
+        if (!hasNum) ang *= sgn;
+        for (size_t i = 0; i < w.size(); i++) w[i] = mo.pivotW + rotAround(w[i] - mo.pivotW, k, ang);
+        snprintf(b, sizeof b, "Drehen %.0f\xC2\xB0", ang * 180 / PI);
+    } else {
+        float f = 1;
+        if (hasNum) f = num;
+        else if (pv) {
+            float d0 = std::hypot(mo.sx - psx, mo.sy - psy), d1 = std::hypot(mouseX - psx, mouseY - psy);
+            f = d0 > 4 ? d1 / d0 : 1;
+        }
+        for (size_t i = 0; i < w.size(); i++) {
+            Vec3 r = w[i] - mo.pivotW;
+            if (hasAx) r = r + ax * (dot(r, ax) * (f - 1)); else r = r * f;
+            w[i] = mo.pivotW + r;
+        }
+        snprintf(b, sizeof b, "Skalieren x%.2f", f);
+    }
+    mo.info = b;
+    if (hasNum) mo.info += "   (Zahl: " + mo.num + ")";
+    for (size_t k = 0; k < mo.ids.size(); k++) o.mesh.v[mo.ids[k]] = toObj(o, w[k]);
+    rebuildMesh(o);
+}
+void modalFinish(bool ok) {
+    Obj* o = editObj();
+    if (o && !ok) {
+        for (size_t k = 0; k < mo.ids.size(); k++) o->mesh.v[mo.ids[k]] = mo.start[k];
+        rebuildMesh(*o);
+        if (mo.pushed && !undoStack.empty()) undoStack.pop_back();
+    }
+    mo.active = false;
+}
+
+void editDelete(Obj& o) {
+    fitSel(o);
+    std::vector<char> del(o.mesh.f.size(), 0);
+    bool any = false;
+    for (size_t i = 0; i < o.mesh.f.size(); i++) {
+        if (pickMode == 2) del[i] = selF[i];
+        else for (int v : o.mesh.f[i].v) if (selV[v]) del[i] = 1;
+        if (del[i]) any = true;
+    }
+    if (!any) return;
+    pushUndo();
+    emesh::deleteFaces(o.mesh, del);
+    if (o.mesh.f.empty()) { objs.erase(objs.begin() + sel); sel = -1; leaveEdit(); return; }
+    clearSel(o);
+    rebuildMesh(o);
+}
+void editExtrude(Obj& o) {
+    fitSel(o);
+    if (pickMode != 2) { say("Zum Extrudieren eine Fl\xC3\xA4" "che w\xC3\xA4hlen (Taste 3)"); return; }
+    bool any = false;
+    for (char s : selF) if (s) any = true;
+    if (!any) { say("Zuerst eine Fl\xC3\xA4" "che ausw\xC3\xA4hlen"); return; }
+    pushUndo();
+    emesh::extrudeFaces(o.mesh, selF);
+    fitSel(o);
+    rebuildMesh(o);
+    modalBegin(0, 3, false, false);
+}
+void editSubdivide(Obj& o) {
+    fitSel(o);
+    if (pickMode != 2) { say("Zum Teilen eine Fl\xC3\xA4" "che w\xC3\xA4hlen (Taste 3)"); return; }
+    bool any = false;
+    for (char s : selF) if (s) any = true;
+    if (!any) return;
+    pushUndo();
+    for (int i = (int)selF.size() - 1; i >= 0; i--) if (selF[i]) emesh::subdivideFace(o.mesh, i);
+    clearSel(o);
+    rebuildMesh(o);
+}
+void editFlip(Obj& o) {
+    fitSel(o);
+    pushUndo();
+    bool any = false;
+    for (char s : selF) if (s) any = true;
+    for (size_t i = 0; i < o.mesh.f.size(); i++) if (!any || (pickMode == 2 && selF[i])) std::reverse(o.mesh.f[i].v.begin(), o.mesh.f[i].v.end());
+    rebuildMesh(o);
+}
+void editMakeFace(Obj& o) {
+    fitSel(o);
+    std::vector<int> ids;
+    for (size_t i = 0; i < selV.size(); i++) if (selV[i]) ids.push_back((int)i);
+    if (pickMode == 2 || ids.size() < 3) { say("F: mindestens 3 Eckpunkte w\xC3\xA4hlen (Taste 1)"); return; }
+    Vec3 c{};
+    for (int i : ids) c += o.mesh.v[i];
+    c = c * (1.0f / (float)ids.size());
+    Vec3 n{};
+    for (size_t i = 0; i + 1 < ids.size() && length(n) < 1e-6f; i++) n = cross(o.mesh.v[ids[i]] - c, o.mesh.v[ids[i + 1]] - c);
+    if (length(n) < 1e-6f) return;
+    n = normalize(n);
+    Vec3 u = normalize(o.mesh.v[ids[0]] - c), wv = cross(n, u);
+    std::sort(ids.begin(), ids.end(), [&](int a, int b) {
+        Vec3 pa = o.mesh.v[a] - c, pb = o.mesh.v[b] - c;
+        return std::atan2(dot(pa, wv), dot(pa, u)) < std::atan2(dot(pb, wv), dot(pb, u));
+    });
+    pushUndo();
+    EFace f;
+    f.v = ids; f.c = brush;
+    o.mesh.f.push_back(f);
+    int fi = (int)o.mesh.f.size() - 1;
+    if (dot(emesh::faceNormal(o.mesh, fi), dirToObj(o, camForward())) > 0) std::reverse(o.mesh.f[fi].v.begin(), o.mesh.f[fi].v.end());
+    fitSel(o);
+    rebuildMesh(o);
+}
+void editSelectAll(Obj& o) {
+    fitSel(o);
+    bool any = false;
+    for (char s : selV) if (s) any = true;
+    for (char s : selF) if (s) any = true;
+    char val = any ? 0 : 1;
+    std::fill(selV.begin(), selV.end(), val);
+    std::fill(selF.begin(), selF.end(), val);
+}
+// Klick im Bearbeitungsmodus: Eckpunkt / Kante / Flaeche unter der Maus. false = nichts getroffen
+bool editClick(Obj& o, Vec3 ro, Vec3 rd, bool add) {
+    fitSel(o);
+    if (pickMode == 2) {
+        float t;
+        int fi = emesh::pickFace(o.mesh, toObj(o, ro), dirToObj(o, rd), t);
+        if (fi < 0) return false;
+        char was = selF[fi];
+        if (!add) std::fill(selF.begin(), selF.end(), 0);
+        selF[fi] = add ? !was : 1;
+        return true;
+    }
+    if (pickMode == 0) {
+        int best = -1;
+        float bd = 14;
+        for (size_t i = 0; i < o.mesh.v.size(); i++) {
+            float sx, sy;
+            if (project(toWorld(o, o.mesh.v[i]), sx, sy) && std::hypot(sx - mouseX, sy - mouseY) < bd) { bd = std::hypot(sx - mouseX, sy - mouseY); best = (int)i; }
+        }
+        if (best < 0) return false;
+        char was = selV[best];
+        if (!add) std::fill(selV.begin(), selV.end(), 0);
+        selV[best] = add ? !was : 1;
+        return true;
+    }
+    int ba = -1, bb = -1;
+    float bd = 10;
+    for (const EFace& f : o.mesh.f)
+        for (size_t k = 0; k < f.v.size(); k++) {
+            int a = f.v[k], b = f.v[(k + 1) % f.v.size()];
+            float ax, ay, bx, by;
+            if (project(toWorld(o, o.mesh.v[a]), ax, ay) && project(toWorld(o, o.mesh.v[b]), bx, by)) {
+                float d = distToSeg(mouseX, mouseY, ax, ay, bx, by);
+                if (d < bd) { bd = d; ba = a; bb = b; }
+            }
+        }
+    if (ba < 0) return false;
+    bool both = selV[ba] && selV[bb];
+    if (!add) std::fill(selV.begin(), selV.end(), 0);
+    selV[ba] = selV[bb] = add ? !both : 1;
+    return true;
+}
+void boxSelect(Obj& o, float x0, float y0, float x1, float y1, bool add) {
+    fitSel(o);
+    if (x0 > x1) std::swap(x0, x1);
+    if (y0 > y1) std::swap(y0, y1);
+    if (!add) { std::fill(selV.begin(), selV.end(), 0); std::fill(selF.begin(), selF.end(), 0); }
+    auto inside = [&](Vec3 p) { float sx, sy; return project(toWorld(o, p), sx, sy) && sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1; };
+    if (pickMode == 2) { for (size_t i = 0; i < o.mesh.f.size(); i++) if (inside(emesh::faceCenter(o.mesh, (int)i))) selF[i] = 1; }
+    else for (size_t i = 0; i < o.mesh.v.size(); i++) if (inside(o.mesh.v[i])) selV[i] = 1;
+}
+
+void insertObject(int shape, const std::string& model, int meshKind = -1) {
     pushUndo();
     Obj o;
-    o.shape = shape; o.model = model;
+    o.shape = shape; o.model = model; o.color = brush;
     if (shape == 2) o.scale = {4, 1, 6};
     if (shape == 4) o.scale = {1, 1, 1};
+    if (shape == 5) {
+        o.mesh = makeMesh(meshKind);
+        for (EFace& f : o.mesh.f) f.c = brush;
+        o.scale = {1, 1, 1};
+        rebuildMesh(o);
+    }
+    o.name = newName(shape == 4 ? model : shape == 5 ? MESH_NAMES[meshKind] : SHAPE_NAMES[shape]);
+    editMode = false; mo.active = false;
     Mat4 cm = editor::camera();
     Vec3 ro = camP, rd = normalize(xformDir(cm, {0, 0, -1})), hit;
     if (!rayGround(ro, rd, hit, true) || length(hit - ro) > 150) { hit = ro + rd * 15; float h; if (world.height(hit.x, hit.z, h)) hit.y = h; }
@@ -567,6 +1054,11 @@ bool surface(float x, float z, float yRef, float& h) {
         }
     }
     for (const Obj& o : objs) {
+        if (o.shape == 5 && o.solid) {
+            float hh;
+            if (meshDown(o, x, z, yRef, hh) && hh <= yRef && hh > best) best = hh;
+            continue;
+        }
         if (!o.solid || o.shape >= 3 || std::fabs(o.rot.y) > 0.05f || std::fabs(o.rot.z) > 0.05f) continue;
         if (std::fabs(x - o.pos.x) > o.scale.x + o.scale.z || std::fabs(z - o.pos.z) > o.scale.x + o.scale.z) continue;
         Vec3 l = qrot(qaxis({0, 1, 0}, -o.rot.x), {x - o.pos.x, 0, z - o.pos.z});
@@ -583,6 +1075,12 @@ bool blocked(float x, float z, float y) {
     float feet = y - 0.54f;
     for (const Obj& o : objs) {
         if (!o.solid) continue;
+        if (o.shape == 5) { // Mesh: nur sperren, wo wirklich Material ist (Treppen lassen sich so hochgehen)
+            float cy, R;
+            if (!meshNear(o, x, z, cy, R)) continue;
+            if ((meshCountUp(o, x, feet + 0.45f, z) & 1) || (meshCountUp(o, x, y + 0.6f, z) & 1)) return true;
+            continue;
+        }
         Vec3 lo, hi;
         boundsOf(o, lo, hi);
         float reach = std::max(hi.x - lo.x, hi.z - lo.z) + 2;
@@ -597,6 +1095,27 @@ bool blocked(float x, float z, float y) {
     return false;
 }
 
+Vec3 focusPoint() {
+    if (Obj* eo = editObj()) return selCenterWorld(*eo);
+    if (sel >= 0 && sel < (int)objs.size()) return objs[sel].pos;
+    return camP + camForward() * 20.0f;
+}
+void frameSelection() {
+    if (sel < 0 || sel >= (int)objs.size()) return;
+    const Obj& o = objs[sel];
+    Vec3 lo, hi;
+    boundsOf(o, lo, hi);
+    Vec3 c = toWorld(o, Vec3{(lo.x + hi.x) * 0.5f / o.scale.x, (lo.y + hi.y) * 0.5f / o.scale.y, (lo.z + hi.z) * 0.5f / o.scale.z});
+    float r = std::max(1.0f, 0.5f * length(hi - lo));
+    camP = c - camForward() * (r * 2.4f + 2.0f);
+}
+bool escape() {
+    if (mo.active) { modalFinish(false); return true; }
+    if (editMode) { leaveEdit(); return true; }
+    if (drawing) { drawing = false; if (!roads.empty() && roads.back().pts.size() < 2) roads.pop_back(); dirty = true; nextBuild = 0; return true; }
+    return false;
+}
+
 void event(const SDL_Event& e) {
     if (e.type == SDL_EVENT_MOUSE_MOTION) {
         mouseX = e.motion.x; mouseY = e.motion.y;
@@ -605,33 +1124,85 @@ void event(const SDL_Event& e) {
             camPitch = clampv(camPitch - e.motion.yrel * 0.0035f, -1.5f, 1.5f);
             if (std::fabs(e.motion.xrel) + std::fabs(e.motion.yrel) > 2) rmbMoved = true;
         }
+        if (mmb) { // Mittlere Maustaste: um die Auswahl kreisen, mit Shift verschieben
+            Vec3 pivot = focusPoint();
+            float dist = std::max(1.0f, length(pivot - camP));
+            if (shiftHeld()) {
+                Mat4 cm = camera();
+                Vec3 r = xformDir(cm, {1, 0, 0}), u = xformDir(cm, {0, 1, 0});
+                camP += (r * (-e.motion.xrel) + u * e.motion.yrel) * (dist * 0.0016f);
+            } else {
+                camYaw -= e.motion.xrel * 0.005f;
+                camPitch = clampv(camPitch - e.motion.yrel * 0.005f, -1.5f, 1.5f);
+                camP = pivot - camForward() * dist;
+            }
+        }
     } else if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
         mouseX = e.button.x; mouseY = e.button.y;
         if (e.button.button == SDL_BUTTON_LEFT) { lmbPressed = true; lmbDown = true; }
-        if (e.button.button == SDL_BUTTON_RIGHT) { rmb = true; rmbMoved = false; }
+        if (e.button.button == SDL_BUTTON_MIDDLE) mmb = true;
+        if (e.button.button == SDL_BUTTON_RIGHT) {
+            if (mo.active) modalFinish(false); // Rechtsklick bricht Verschieben/Drehen/Skalieren ab
+            else { rmb = true; rmbMoved = false; }
+        }
     } else if (e.type == SDL_EVENT_MOUSE_BUTTON_UP) {
-        if (e.button.button == SDL_BUTTON_LEFT) { lmbDown = false; dragAxis = -1; dragBody = dragPoint = false; }
+        if (e.button.button == SDL_BUTTON_LEFT) { lmbDown = false; lmbReleased = true; dragAxis = -1; dragBody = dragPoint = false; }
+        if (e.button.button == SDL_BUTTON_MIDDLE) mmb = false;
         if (e.button.button == SDL_BUTTON_RIGHT) {
             rmb = false;
             if (!rmbMoved && drawing) { drawing = false; if (!roads.empty() && roads.back().pts.size() < 2) roads.pop_back(); dirty = true; nextBuild = 0; }
         }
     } else if (e.type == SDL_EVENT_MOUSE_WHEEL) {
-        camP += normalize(xformDir(camera(), {0, 0, -1})) * (e.wheel.y * 4.0f);
+        if (ui.captured) explorerScroll -= (int)(e.wheel.y * 2); // ueber den Leisten: Liste scrollen
+        else { // zum Mauszeiger zoomen
+            Vec3 ro, rd, hit;
+            mouseRay(ro, rd);
+            float dist = rayGround(ro, rd, hit, true) ? length(hit - ro) : 25.0f;
+            camP += rd * (clampv(dist * 0.15f, 0.4f, 80.0f) * e.wheel.y);
+        }
     } else if (e.type == SDL_EVENT_KEY_DOWN) {
-        bool ctrl = (e.key.mod & SDL_KMOD_CTRL) != 0;
+        bool ctrl = (e.key.mod & SDL_KMOD_CTRL) != 0, shift = (e.key.mod & SDL_KMOD_SHIFT) != 0;
         SDL_Keycode k = e.key.key;
+        if (mo.active) { // waehrend Verschieben/Drehen/Skalieren: Achse sperren, Zahl tippen, bestaetigen
+            if (k == SDLK_X || k == SDLK_Y || k == SDLK_Z) { int a = k == SDLK_X ? 0 : k == SDLK_Y ? 1 : 2; mo.axis = mo.axis == a ? -1 : a; }
+            else if (k == SDLK_N && pickMode == 2) mo.axis = mo.axis == 3 ? -1 : 3;
+            else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) modalFinish(true);
+            else if (k >= SDLK_0 && k <= SDLK_9) mo.num += (char)('0' + (k - SDLK_0));
+            else if (k == SDLK_PERIOD || k == SDLK_COMMA) mo.num += '.';
+            else if (k == SDLK_MINUS && mo.num.empty()) mo.num += '-';
+            else if (k == SDLK_BACKSPACE && !mo.num.empty()) mo.num.pop_back();
+            return;
+        }
         if (ctrl && k == SDLK_S) save();
+        else if (ctrl && k == SDLK_Z && shift) redo();
         else if (ctrl && k == SDLK_Z) undo();
-        else if (ctrl && k == SDLK_D && sel >= 0) {
+        else if (ctrl && k == SDLK_Y) redo();
+        else if (ctrl && k == SDLK_D && sel >= 0 && sel < (int)objs.size() && !editMode) {
             pushUndo();
             Obj o = objs[sel];
-            o.pos += Vec3{o.scale.x + 0.5f, 0, 0};
+            o.pos += Vec3{std::max(1.0f, o.scale.x) + 0.5f, 0, 0};
+            o.name = newName(o.shape == 4 ? o.model : o.shape == 5 ? "Mesh" : SHAPE_NAMES[o.shape]);
             syncGeo(o);
             objs.push_back(o);
             sel = (int)objs.size() - 1;
-        } else if (k == SDLK_DELETE || k == SDLK_BACKSPACE) {
+        } else if (Obj* eo = editObj()) { // Bearbeitungsmodus (Blender-Tasten)
+            if (k == SDLK_TAB) leaveEdit();
+            else if (k >= SDLK_1 && k <= SDLK_3) setPickMode(k - SDLK_1);
+            else if (k == SDLK_G) modalBegin(0, -1, false);
+            else if (k == SDLK_R) modalBegin(1, -1, false);
+            else if (k == SDLK_S) modalBegin(2, -1, false);
+            else if (k == SDLK_E) editExtrude(*eo);
+            else if (k == SDLK_X || k == SDLK_DELETE || k == SDLK_BACKSPACE) editDelete(*eo);
+            else if (k == SDLK_F) editMakeFace(*eo);
+            else if (k == SDLK_A) editSelectAll(*eo);
+            else if (k == SDLK_U) editSubdivide(*eo);
+            else if (k == SDLK_V) editFlip(*eo);
+            else if (k == SDLK_H) frameSelection();
+        } else if (k == SDLK_TAB) { if (sel >= 0) enterEdit(); }
+        else if (k == SDLK_F) frameSelection();
+        else if (k == SDLK_DELETE || k == SDLK_BACKSPACE) {
             if (drawing && !roads.empty()) { roads.back().pts.pop_back(); if (roads.back().pts.empty()) { roads.pop_back(); drawing = false; } dirty = true; nextBuild = 0; }
-            else if (sel >= 0) { pushUndo(); objs.erase(objs.begin() + sel); sel = -1; }
+            else if (sel >= 0 && sel < (int)objs.size()) { pushUndo(); objs.erase(objs.begin() + sel); sel = -1; }
             else if (selRoad >= 0 && selPt >= 0) {
                 pushUndo();
                 Road& r = roads[selRoad];
@@ -644,17 +1215,17 @@ void event(const SDL_Event& e) {
             if (!roads.empty() && roads.back().pts.size() < 2) roads.pop_back();
             dirty = true; nextBuild = 0;
         } else if (k == SDLK_PAGEUP || k == SDLK_PAGEDOWN) {
-            float d = k == SDLK_PAGEUP ? 0.25f : -0.25f;
-            if (sel >= 0) { pushUndo(); objs[sel].pos.y += d; syncGeo(objs[sel]); }
+            float d = k == SDLK_PAGEUP ? gridStep : -gridStep;
+            if (sel >= 0 && sel < (int)objs.size()) { pushUndo(); objs[sel].pos.y += d; syncGeo(objs[sel]); }
             else if (selRoad >= 0 && selPt >= 0) { pushUndo(); roads[selRoad].pts[selPt].lift = std::max(0.0f, roads[selRoad].pts[selPt].lift + d * 2); dirty = true; nextBuild = 0; }
-        } else if (!ctrl && k >= SDLK_1 && k <= SDLK_4) tool = k - SDLK_1;
+        } else if (!ctrl && k >= SDLK_1 && k <= SDLK_4) { tool = k - SDLK_1; if (tool != 3) drawing = false; }
     }
 }
 
 void update(float dt, const Mat4& vp, float ww, float wh) {
     lastVP = vp; vw = ww; vh = wh;
     const bool* keys = SDL_GetKeyboardState(nullptr);
-    if (!keys[SDL_SCANCODE_LCTRL] && !keys[SDL_SCANCODE_RCTRL]) {
+    if (rmb && !keys[SDL_SCANCODE_LCTRL] && !keys[SDL_SCANCODE_RCTRL]) { // fliegen nur mit gedrueckter rechter Maustaste (wie in Roblox Studio)
         Mat4 cm = camera();
         Vec3 f = normalize(xformDir(cm, {0, 0, -1})), r = normalize(xformDir(cm, {1, 0, 0}));
         float sp = (keys[SDL_SCANCODE_LSHIFT] ? 60.0f : 14.0f) * dt;
@@ -670,10 +1241,40 @@ void update(float dt, const Mat4& vp, float ww, float wh) {
 
     float dmx = mouseX - lastMX, dmy = mouseY - lastMY;
     lastMX = mouseX; lastMY = mouseY;
-    bool click = lmbPressed && !ui.captured;
-    lmbPressed = false;
+    bool rawClick = lmbPressed, click = lmbPressed && !ui.captured, released = lmbReleased;
+    lmbPressed = false; lmbReleased = false;
     Vec3 ro, rd, hit;
     mouseRay(ro, rd);
+    Obj* eo = editObj();
+    if (mo.active && !eo) mo.active = false;
+    if (editMode && !eo) editMode = false;
+
+    if (mo.active) {
+        modalApply(*eo);
+        if (mo.drag ? released : rawClick) modalFinish(true);
+        return;
+    }
+    if (eo) { // ---- Bearbeitungsmodus ----
+        fitSel(*eo);
+        if (click) {
+            bool handled = false;
+            std::vector<int> ids = activeVerts(*eo);
+            if (!ids.empty()) { // Pfeil am Auswahlzentrum gegriffen?
+                Vec3 c = selCenterWorld(*eo);
+                float L = gizmoLen(c), sx, sy, tx, ty;
+                for (int a = 0; a < 3 && !handled; a++)
+                    if (project(c, sx, sy) && project(c + worldAxis(a) * L, tx, ty) && distToSeg(mouseX, mouseY, sx, sy, tx, ty) < 12) { modalBegin(0, a, true); handled = true; }
+            }
+            if (!handled && !editClick(*eo, ro, rd, shiftHeld())) { boxSelecting = true; boxX0 = mouseX; boxY0 = mouseY; }
+        }
+        if (released && boxSelecting) {
+            boxSelecting = false;
+            if (std::fabs(mouseX - boxX0) + std::fabs(mouseY - boxY0) > 6) boxSelect(*eo, boxX0, boxY0, mouseX, mouseY, shiftHeld());
+            else if (!shiftHeld()) clearSel(*eo);
+        }
+        return;
+    }
+    boxSelecting = false;
 
     if (click) {
         if (tool == 3) { // Strasse: Punkt setzen
@@ -697,11 +1298,16 @@ void update(float dt, const Mat4& vp, float ww, float wh) {
             }
         } else {
             bool handled = false;
-            if (sel >= 0) { // Achsengriff getroffen?
-                Vec3 c = objs[sel].pos;
+            if (sel >= 0 && sel < (int)objs.size()) { // Achsengriff getroffen?
+                Obj& o = objs[sel];
+                Vec3 c = o.pos;
                 float L = gizmoLen(c), sx, sy, tx, ty;
                 for (int a = 0; a < 3 && !handled; a++)
-                    if (project(c, sx, sy) && project(c + axisDir(a, &objs[sel]) * L, tx, ty) && distToSeg(mouseX, mouseY, sx, sy, tx, ty) < 12) { dragAxis = a; handled = true; pushUndo(); }
+                    if (project(c, sx, sy) && project(c + axisDir(a, &o) * L, tx, ty) && distToSeg(mouseX, mouseY, sx, sy, tx, ty) < 12) {
+                        dragAxis = a; handled = true; pushUndo();
+                        dragAcc = 0;
+                        dragStart = tool == 0 ? o.pos : tool == 2 ? o.scale : o.rot;
+                    }
             }
             if (!handled) { // Strassen-Stuetzpunkt?
                 float best = 16;
@@ -727,22 +1333,31 @@ void update(float dt, const Mat4& vp, float ww, float wh) {
             }
         }
     }
-    bool snap = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL];
-    if (lmbDown && sel >= 0 && dragAxis >= 0 && (dmx != 0 || dmy != 0)) {
+    if (lmbDown && sel >= 0 && sel < (int)objs.size() && dragAxis >= 0 && (dmx != 0 || dmy != 0)) {
         Obj& o = objs[sel];
         Vec3 ax = axisDir(dragAxis, &o);
         float L = gizmoLen(o.pos), sx, sy, tx, ty;
         if (project(o.pos, sx, sy) && project(o.pos + ax * L, tx, ty)) {
             float ax2 = (tx - sx) * (tx - sx) + (ty - sy) * (ty - sy);
             float d = ax2 > 1 ? (dmx * (tx - sx) + dmy * (ty - sy)) / ax2 * L : 0;
-            if (tool == 0) o.pos += ax * d;
-            else if (tool == 2) { float* s = dragAxis == 0 ? &o.scale.x : dragAxis == 1 ? &o.scale.y : &o.scale.z; *s = std::max(0.05f, *s + d * 2); }
-            else { float* r = dragAxis == 1 ? &o.rot.x : dragAxis == 0 ? &o.rot.y : &o.rot.z; *r += dmx * 0.01f; }
+            if (tool == 0) { dragAcc += d; o.pos = dragStart + ax * snapQ(dragAcc); }
+            else if (tool == 2) {
+                dragAcc += d;
+                float base = dragAxis == 0 ? dragStart.x : dragAxis == 1 ? dragStart.y : dragStart.z;
+                float* s = dragAxis == 0 ? &o.scale.x : dragAxis == 1 ? &o.scale.y : &o.scale.z;
+                *s = std::max(0.1f, snapQ(base + dragAcc * 2));
+            } else {
+                dragAcc += dmx * 0.01f;
+                float base = dragAxis == 1 ? dragStart.x : dragAxis == 0 ? dragStart.y : dragStart.z;
+                float v = base + dragAcc;
+                if (snapOn()) v = std::round(v / (PI / 12)) * (PI / 12);
+                (dragAxis == 1 ? o.rot.x : dragAxis == 0 ? o.rot.y : o.rot.z) = v;
+            }
             syncGeo(o);
         }
-    } else if (lmbDown && dragBody && sel >= 0 && (dmx != 0 || dmy != 0) && rayGround(ro, rd, hit, false)) {
+    } else if (lmbDown && dragBody && sel >= 0 && sel < (int)objs.size() && (dmx != 0 || dmy != 0) && rayGround(ro, rd, hit, false)) {
         Obj& o = objs[sel];
-        if (snap) { hit.x = std::round(hit.x * 2) / 2; hit.z = std::round(hit.z * 2) / 2; }
+        if (snapOn()) { hit.x = snapQ(hit.x); hit.z = snapQ(hit.z); }
         float th = hit.y;
         world.height(hit.x, hit.z, th);
         o.pos = {hit.x, th + dragOffset, hit.z};
@@ -753,84 +1368,245 @@ void update(float dt, const Mat4& vp, float ww, float wh) {
         world.toLatLon(hit.x, hit.z, p.lat, p.lon);
         dirty = true; nextBuild = 0;
     }
-    if (!lmbDown && sel >= 0 && snap && tool == 1) { // Drehung auf 15 Grad einrasten
-        Obj& o = objs[sel];
-        const float st = PI / 12;
-        o.rot = {std::round(o.rot.x / st) * st, std::round(o.rot.y / st) * st, std::round(o.rot.z / st) * st};
-    }
 }
+
+// ---------- Oberflaeche ----------
+namespace {
+int activeSlider = -1;
+// Waagerechter Regler 0..255 (Farbkanal); true solange er veraendert wird
+bool slider(int id, float x, float y, float w, float& v, Color tint) {
+    ui.geo.rrect(x, y + 8, w, 8, 4, Color{36, 40, 50, 255});
+    float fw = w * v / 255.0f;
+    ui.geo.rrect(x, y + 8, std::max(8.0f, fw), 8, 4, tint);
+    ui.geo.rrect(x + fw - 6, y + 4, 12, 16, 5, col::white);
+    bool over = ui.over(x - 6, y, w + 12, 24);
+    if (over) ui.captured = true;
+    if (over && ui.clicked) { activeSlider = id; pushUndo(); ui.clicked = false; }
+    if (!ui.down) activeSlider = -1;
+    if (activeSlider != id) return false;
+    v = clampv((ui.mx - x) / w * 255.0f, 0.0f, 255.0f);
+    return true;
+}
+std::string hexOf(Color c) { char b[16]; snprintf(b, sizeof b, "#%02X%02X%02X", c.r, c.g, c.b); return b; }
+// Farbblock: Vorschau, RGB-Regler, feste und eigene Farben. Gibt die naechste freie y-Position zurueck
+float colorBlock(float px, float y) {
+    ui.label(px + 14, y + 14, 14, col::gray, "Farbe");
+    ui.geo.rrect(px + 70, y + 1, 60, 20, 5, brush);
+    ui.label(px + 138, y + 16, 13, col::white, hexOf(brush));
+    if (ui.button(px + 204, y - 2, 54, 24, "+ Merken", false, 12) && customPal.size() < 12) { pushUndo(); customPal.push_back(brush); }
+    y += 28;
+    float ch[3] = {(float)brush.r, (float)brush.g, (float)brush.b};
+    const Color tints[3] = {{230, 70, 60, 255}, {80, 200, 90, 255}, {80, 140, 240, 255}};
+    bool changed = false;
+    for (int i = 0; i < 3; i++) { changed |= slider(i + 1, px + 34, y, 212, ch[i], tints[i]); ui.label(px + 14, y + 17, 13, col::gray, i == 0 ? "R" : i == 1 ? "G" : "B"); y += 24; }
+    if (changed) applyColor(Color{(uint8_t)(ch[0] + 0.5f), (uint8_t)(ch[1] + 0.5f), (uint8_t)(ch[2] + 0.5f), 255});
+    static const Color pal[12] = {{235, 235, 235, 255}, {150, 150, 150, 255}, {60, 60, 64, 255}, {200, 60, 50, 255}, {230, 140, 40, 255}, {235, 205, 60, 255},
+                                  {80, 170, 80, 255}, {50, 130, 200, 255}, {110, 80, 180, 255}, {140, 95, 60, 255}, {215, 195, 160, 255}, {20, 20, 22, 255}};
+    auto swatches = [&](const Color* cs, int n) {
+        for (int i = 0; i < n; i++) {
+            float bx = px + 14 + (i % 6) * 41.0f, by = y + (i / 6) * 26.0f;
+            ui.geo.rrect(bx, by, 36, 22, 5, cs[i]);
+            if (ui.over(bx, by, 36, 22)) { ui.captured = true; if (ui.clicked) { pushUndo(); applyColor(cs[i]); ui.clicked = false; } }
+        }
+        y += ((n + 5) / 6) * 26.0f;
+    };
+    y += 2;
+    swatches(pal, 12);
+    if (!customPal.empty()) { ui.label(px + 14, y + 12, 12, col::gray, "Eigene Farben"); y += 16; swatches(customPal.data(), (int)customPal.size()); }
+    return y + 4;
+}
+} // namespace
 
 void buildUI() {
     float W = ui.W, H = ui.H;
-    // Kopfleiste
-    ui.panel(0, 0, W, 46, Color{14, 16, 22, 240}, 0);
-    ui.label(14, 30, 20, col::accent, "worldridr Studio");
-    float x = 190;
-    if (ui.button(x, 7, 104, 32, modified ? "Speichern *" : "Speichern")) save();
-    x += 112;
-    if (ui.button(x, 7, 96, 32, "Testfahrt")) testDrive = true;
-    x += 104;
-    if (ui.button(x, 7, 112, 32, "R\xC3\xBC" "ckg\xC3\xA4ngig")) undo();
-    x += 140;
-    const char* tools[4] = {"Bewegen", "Drehen", "Skalieren", "Stra\xC3\x9F" "e"};
-    for (int i = 0; i < 4; i++) {
-        if (ui.button(x, 7, 100, 32, std::string(1, (char)('1' + i)) + "  " + tools[i], tool == i)) { tool = i; if (i != 3) drawing = false; }
-        x += 106;
-    }
-    // Linke Leiste: Einfuegen oder Strassentypen
-    float lh = tool == 3 ? 76 + NTYPES * 38.0f : 76 + (4 + modelList.size()) * 38.0f;
-    ui.panel(10, 58, 232, lh);
-    ui.label(24, 86, 17, col::accent, tool == 3 ? "Stra\xC3\x9F" "entyp" : "Einf\xC3\xBC" "gen");
-    float y = 100;
-    if (tool == 3) {
-        for (int i = 0; i < NTYPES; i++) { if (ui.button(20, y, 212, 32, TYPES[i].name, roadType == i, 15)) roadType = i; y += 38; }
-    } else {
-        for (int i = 0; i < 4; i++) { if (ui.button(20, y, 212, 32, SHAPE_NAMES[i])) insertObject(i, ""); y += 38; }
-        for (const std::string& m : modelList) { if (ui.button(20, y, 212, 32, m, false, 14)) insertObject(4, m); y += 38; }
-    }
-    ui.label(24, y + 14, 12, col::gray, tool == 3 ? "Klick = Punkt, Enter/Rechtsklick = fertig" : "Modelle: .obj nach assets/models");
-    // Rechte Leiste: Eigenschaften
     char buf[160];
+    Obj* eo = editObj();
+    static int lastSel = -2;
+    if (sel != lastSel) { lastSel = sel; if (sel >= 0 && sel < (int)objs.size()) brush = objs[sel].color; }
+    if (explorerScroll < 0) explorerScroll = 0;
+
+    // ---- Kopfleiste ----
+    ui.panel(0, 0, W, 46, Color{14, 16, 22, 240}, 0);
+    ui.label(14, 30, 20, col::accent, "Studio");
+    float x = 100;
+    if (ui.button(x, 7, 100, 32, modified ? "Speichern *" : "Speichern", false, 15)) save();
+    x += 106;
+    if (ui.button(x, 7, 90, 32, "Testfahrt", false, 15)) testDrive = true;
+    x += 100;
+    if (ui.button(x, 7, 72, 32, "Zur\xC3\xBC" "ck", false, 15)) undo();
+    x += 78;
+    if (ui.button(x, 7, 84, 32, "Wiederh.", false, 15)) redo();
+    x += 100;
+    if (!eo) {
+        const char* tools[4] = {"Bewegen", "Drehen", "Skalieren", "Stra\xC3\x9F" "e"};
+        for (int i = 0; i < 4; i++) {
+            if (ui.button(x, 7, 100, 32, std::string(1, (char)('1' + i)) + "  " + tools[i], tool == i, 15)) { tool = i; if (i != 3) drawing = false; }
+            x += 104;
+        }
+    } else {
+        const char* pm[3] = {"1  Punkt", "2  Kante", "3  Fl\xC3\xA4" "che"};
+        for (int i = 0; i < 3; i++) {
+            if (ui.button(x, 7, 100, 32, pm[i], pickMode == i, 15)) setPickMode(i);
+            x += 104;
+        }
+    }
+    {
+        static const float steps[4] = {0.25f, 0.5f, 1.0f, 2.0f};
+        if (ui.button(W - 304, 7, 140, 32, gridLabel(), gridOn, 15)) {
+            if (!gridOn) { gridOn = true; gridStep = 0.25f; }
+            else {
+                int i = 0;
+                while (i < 4 && std::fabs(steps[i] - gridStep) > 1e-3f) i++;
+                if (i >= 3) gridOn = false; else gridStep = steps[i + 1];
+            }
+        }
+        bool canEdit = eo || (sel >= 0 && sel < (int)objs.size() && objs[sel].shape != 4);
+        if (ui.button(W - 158, 7, 148, 32, eo ? "Fertig (Tab)" : "Bearbeiten (Tab)", eo != nullptr, 15) && (canEdit)) { if (eo) leaveEdit(); else enterEdit(); }
+    }
+
+    // ---- Linke Leiste: Einfuegen / Strassentyp, darunter der Explorer ----
+    float lh;
+    if (tool == 3 && !eo) lh = 56 + NTYPES * 38.0f + 30;
+    else lh = 56 + 5 * 36.0f + (modelList.empty() ? 0 : 26 + modelList.size() * 34.0f) + 28;
+    ui.panel(10, 58, 232, lh);
+    if (tool == 3 && !eo) {
+        ui.label(24, 82, 17, col::accent, "Stra\xC3\x9F" "entyp");
+        float y = 94;
+        for (int i = 0; i < NTYPES; i++) { if (ui.button(20, y, 212, 32, TYPES[i].name, roadType == i, 15)) roadType = i; y += 38; }
+        ui.label(24, y + 14, 12, col::gray, "Klick = Punkt, Enter/Rechtsklick = fertig");
+    } else {
+        ui.label(24, 82, 17, col::accent, "Einf\xC3\xBC" "gen");
+        static const char* gridNames[10] = {"Block", "Zylinder", "Keil", "Kugel", "Treppe", "Dach", "Pyramide", "Kegel", "Platte", "L-Winkel"};
+        for (int i = 0; i < 10; i++) {
+            float bx = 20 + (i % 2) * 108.0f, by = 94 + (i / 2) * 36.0f;
+            if (ui.button(bx, by, 104, 30, gridNames[i], false, 14)) { if (i < 4) insertObject(i, ""); else insertObject(5, "", i - 4); }
+        }
+        float y = 94 + 5 * 36.0f;
+        if (!modelList.empty()) {
+            ui.label(24, y + 14, 13, col::gray, "3D-Modelle");
+            y += 22;
+            for (const std::string& m : modelList) { if (ui.button(20, y, 212, 28, m, false, 13)) insertObject(4, m); y += 34; }
+        }
+        ui.label(24, y + 14, 12, col::gray, "Modelle: .obj nach assets/models");
+    }
+    // Explorer (Objektliste)
+    {
+        float ey = 58 + lh + 8, eh = H - 36 - ey;
+        if (eh > 110) {
+            ui.panel(10, ey, 232, eh);
+            snprintf(buf, sizeof buf, "Explorer  (%d)", (int)objs.size());
+            ui.label(24, ey + 24, 15, col::accent, buf);
+            int rows = std::max(1, (int)((eh - 44) / 25));
+            int maxScroll = std::max(0, (int)objs.size() - rows);
+            explorerScroll = std::min(explorerScroll, maxScroll);
+            float yy = ey + 36;
+            for (int i = explorerScroll; i < (int)objs.size() && i < explorerScroll + rows; i++) {
+                if (ui.button(20, yy, 212, 22, objs[i].name, sel == i, 13)) { if (sel != i) leaveEdit(); sel = i; selRoad = selPt = -1; }
+                yy += 25;
+            }
+            if (objs.empty()) ui.label(24, ey + 58, 13, col::gray, "Noch nichts gebaut");
+            if (maxScroll > 0) ui.labelR(228, ey + 24, 12, col::gray, "Mausrad = scrollen");
+        }
+    }
+
+    // ---- Rechte Leiste: Eigenschaften / Bearbeiten ----
+    float px = W - 282;
     if (sel >= 0 && sel < (int)objs.size()) {
         Obj& o = objs[sel];
-        float px = W - 282, ph = 372 + textureList.size() * 26.0f;
-        ui.panel(px, 58, 272, ph);
-        ui.label(px + 14, 86, 17, col::accent, std::string("Eigenschaften: ") + (o.shape == 4 ? o.model : SHAPE_NAMES[o.shape]));
-        snprintf(buf, sizeof buf, "Gr\xC3\xB6\xC3\x9F" "e  %.2f x %.2f x %.2f m", o.scale.x, o.scale.y, o.scale.z);
-        ui.label(px + 14, 110, 14, col::white, buf);
-        snprintf(buf, sizeof buf, "H\xC3\xB6he %.2f m   Drehung %.0f\xC2\xB0", o.pos.y, o.rot.x * 180 / PI);
-        ui.label(px + 14, 130, 14, col::white, buf);
-        const char* dims[3] = {"Breite", "H\xC3\xB6he", "L\xC3\xA4nge"};
-        float* sv[3] = {&o.scale.x, &o.scale.y, &o.scale.z};
-        for (int i = 0; i < 3; i++) {
-            float yy = 142 + i * 32.0f;
-            ui.label(px + 14, yy + 21, 14, col::gray, dims[i]);
-            if (ui.button(px + 96, yy, 36, 26, "-")) { pushUndo(); *sv[i] = std::max(0.1f, *sv[i] - 0.5f); }
-            if (ui.button(px + 138, yy, 36, 26, "+")) { pushUndo(); *sv[i] += 0.5f; }
-            if (ui.button(px + 180, yy, 36, 26, "x2", false, 13)) { pushUndo(); *sv[i] *= 2; }
-        }
-        ui.label(px + 14, 256, 14, col::gray, "Farbe");
-        static const Color pal[12] = {{235, 235, 235, 255}, {150, 150, 150, 255}, {60, 60, 64, 255}, {200, 60, 50, 255}, {230, 140, 40, 255}, {235, 205, 60, 255},
-                                      {80, 170, 80, 255}, {50, 130, 200, 255}, {110, 80, 180, 255}, {140, 95, 60, 255}, {215, 195, 160, 255}, {20, 20, 22, 255}};
-        for (int i = 0; i < 12; i++) {
-            float bx = px + 14 + (i % 6) * 41.0f, byy = 264 + (i / 6) * 30.0f;
-            ui.geo.rrect(bx, byy, 36, 25, 5, pal[i]);
-            if (ui.over(bx, byy, 36, 25)) { ui.captured = true; if (ui.clicked) { pushUndo(); o.color = pal[i]; ui.clicked = false; } }
-        }
-        if (ui.button(px + 14, 332, 118, 28, o.solid ? "Fest: ja" : "Fest: nein", o.solid, 14)) { pushUndo(); o.solid = !o.solid; }
-        if (ui.button(px + 140, 332, 118, 28, "L\xC3\xB6schen", false, 14)) { pushUndo(); objs.erase(objs.begin() + sel); sel = -1; return; }
-        snprintf(buf, sizeof buf, "Textur (Kachel %.1f m)", o.tile);
-        ui.label(px + 14, 386, 14, col::gray, buf);
-        if (ui.button(px + 190, 368, 30, 24, "-")) o.tile = std::max(0.25f, o.tile * 0.5f);
-        if (ui.button(px + 226, 368, 30, 24, "+")) o.tile = std::min(64.0f, o.tile * 2);
-        float ty = 398;
-        if (ui.button(px + 14, ty, 244, 22, "keine", o.texture.empty(), 13)) { pushUndo(); o.texture.clear(); }
-        for (const std::string& t : textureList) {
-            ty += 26;
-            if (ui.button(px + 14, ty, 244, 22, t, o.texture == t, 13)) { pushUndo(); o.texture = t; }
+        float y = 58;
+        if (eo) {
+            // Info + Werkzeuge des Bearbeitungsmodus
+            int ns = 0;
+            for (char s : selF) if (s) ns++;
+            std::vector<int> av = activeVerts(o);
+            ui.panel(px, 58, 272, 420 + (customPal.empty() ? 0 : 16 + ((customPal.size() + 5) / 6) * 26), col::dark);
+            ui.label(px + 14, 82, 17, col::accent, "Bearbeiten: " + o.name);
+            snprintf(buf, sizeof buf, "%d Punkte, %d Fl\xC3\xA4" "chen  |  gew\xC3\xA4hlt: %d", (int)o.mesh.v.size(), (int)o.mesh.f.size(), pickMode == 2 ? ns : (int)av.size());
+            ui.label(px + 14, 104, 13, col::white, buf);
+            y = 114;
+            struct Op { const char* t; int id; };
+            static const Op ops[10] = {{"Verschieben (G)", 0}, {"Drehen (R)", 1}, {"Skalieren (S)", 2}, {"Extrudieren (E)", 3}, {"Teilen (U)", 4},
+                                       {"L\xC3\xB6schen (X)", 5}, {"Fl\xC3\xA4" "che aus Punkten (F)", 6}, {"Umdrehen (V)", 7}, {"Alles / nichts (A)", 8}, {"Ansicht (H)", 9}};
+            for (int i = 0; i < 10; i++) {
+                float bx = px + 14 + (i % 2) * 124.0f, by = y + (i / 2) * 32.0f;
+                if (ui.button(bx, by, 120, 28, ops[i].t, false, 12)) {
+                    switch (ops[i].id) {
+                    case 0: modalBegin(0, -1, false); break;
+                    case 1: modalBegin(1, -1, false); break;
+                    case 2: modalBegin(2, -1, false); break;
+                    case 3: editExtrude(o); break;
+                    case 4: editSubdivide(o); break;
+                    case 5: editDelete(o); return;
+                    case 6: editMakeFace(o); break;
+                    case 7: editFlip(o); break;
+                    case 8: editSelectAll(o); break;
+                    default: frameSelection(); break;
+                    }
+                }
+            }
+            y += 5 * 32.0f + 14;
+            ui.label(px + 14, y + 4, 12, col::gray, "Farbe gilt f\xC3\xBC" "r die gew\xC3\xA4hlten Fl\xC3\xA4" "chen");
+            y += 12;
+            colorBlock(px, y);
+        } else {
+            ui.panel(px, 58, 272, 510 + (customPal.empty() ? 0 : 16 + ((customPal.size() + 5) / 6) * 26), col::dark);
+            ui.label(px + 14, 82, 17, col::accent, o.name);
+            y = 92;
+            // Zeilen mit Wert und -/+ (Schrittweite = Raster)
+            auto rowf = [&](const char* name, float val, float step, float minV, float& target, const char* fmt, float shown) {
+                char b[48];
+                snprintf(b, sizeof b, fmt, shown);
+                ui.label(px + 14, y + 19, 14, col::gray, name);
+                ui.label(px + 92, y + 19, 14, col::white, b);
+                if (ui.button(px + 196, y, 28, 26, "-", false, 15)) { pushUndo(); target = std::max(minV, val - step); syncGeo(o); }
+                if (ui.button(px + 228, y, 28, 26, "+", false, 15)) { pushUndo(); target = val + step; syncGeo(o); }
+                y += 29;
+            };
+            float st = gridOn ? gridStep : 0.1f;
+            rowf("X", o.pos.x, st, -1e9f, o.pos.x, "%.2f m", o.pos.x);
+            rowf("H\xC3\xB6he", o.pos.y, st, -1e9f, o.pos.y, "%.2f m", o.pos.y);
+            rowf("Z", o.pos.z, st, -1e9f, o.pos.z, "%.2f m", o.pos.z);
+            {   // Drehung in 15-Grad-Schritten
+                snprintf(buf, sizeof buf, "%.0f\xC2\xB0", o.rot.x * 180 / PI);
+                ui.label(px + 14, y + 19, 14, col::gray, "Drehung");
+                ui.label(px + 92, y + 19, 14, col::white, buf);
+                if (ui.button(px + 196, y, 28, 26, "-", false, 15)) { pushUndo(); o.rot.x -= PI / 12; }
+                if (ui.button(px + 228, y, 28, 26, "+", false, 15)) { pushUndo(); o.rot.x += PI / 12; }
+                y += 29;
+            }
+            const char* dn = o.shape == 5 ? "Skala B" : "Breite";
+            rowf(dn, o.scale.x, st, 0.1f, o.scale.x, "%.2f", o.scale.x);
+            rowf(o.shape == 5 ? "Skala H" : "H\xC3\xB6he", o.scale.y, st, 0.1f, o.scale.y, "%.2f", o.scale.y);
+            rowf(o.shape == 5 ? "Skala L" : "L\xC3\xA4nge", o.scale.z, st, 0.1f, o.scale.z, "%.2f", o.scale.z);
+            y += 6;
+            y = colorBlock(px, y);
+            if (ui.button(px + 14, y, 78, 28, o.solid ? "Fest: ja" : "Fest: nein", o.solid, 13)) { pushUndo(); o.solid = !o.solid; }
+            if (ui.button(px + 96, y, 80, 28, "Duplizieren", false, 12)) {
+                pushUndo();
+                Obj c = o;
+                c.pos += Vec3{std::max(1.0f, o.scale.x) + 0.5f, 0, 0};
+                c.name = newName(o.shape == 4 ? o.model : o.shape == 5 ? "Mesh" : SHAPE_NAMES[o.shape]);
+                syncGeo(c);
+                objs.push_back(c);
+                sel = (int)objs.size() - 1;
+                return;
+            }
+            if (ui.button(px + 180, y, 78, 28, "L\xC3\xB6schen", false, 13)) { pushUndo(); objs.erase(objs.begin() + sel); sel = -1; return; }
+            y += 36;
+            // Textur: durchschalten
+            int ti = -1;
+            for (size_t i = 0; i < textureList.size(); i++) if (textureList[i] == o.texture) ti = (int)i;
+            ui.label(px + 14, y + 14, 14, col::gray, "Textur");
+            ui.label(px + 70, y + 14, 13, col::white, o.texture.empty() ? "keine" : o.texture);
+            if (ui.button(px + 196, y - 2, 28, 24, "<", false, 14)) { pushUndo(); ti--; if (ti < -1) ti = (int)textureList.size() - 1; o.texture = ti < 0 ? "" : textureList[ti]; }
+            if (ui.button(px + 228, y - 2, 28, 24, ">", false, 14)) { pushUndo(); ti++; if (ti >= (int)textureList.size()) ti = -1; o.texture = ti < 0 ? "" : textureList[ti]; }
+            y += 26;
+            snprintf(buf, sizeof buf, "Kachelgr\xC3\xB6\xC3\x9F" "e %.1f m", o.tile);
+            ui.label(px + 14, y + 14, 13, col::gray, buf);
+            if (ui.button(px + 196, y - 2, 28, 24, "-", false, 14)) o.tile = std::max(0.25f, o.tile * 0.5f);
+            if (ui.button(px + 228, y - 2, 28, 24, "+", false, 14)) o.tile = std::min(64.0f, o.tile * 2);
         }
     } else if (selRoad >= 0 && selRoad < (int)roads.size() && selPt >= 0) {
-        float px = W - 282;
         ui.panel(px, 58, 272, 150);
         ui.label(px + 14, 86, 17, col::accent, "Stra\xC3\x9F" "enpunkt");
         ui.label(px + 14, 110, 14, col::white, TYPES[roads[selRoad].type].name);
@@ -841,10 +1617,29 @@ void buildUI() {
         if (ui.button(px + 178, 144, 80, 28, "Typ >", false, 14)) { pushUndo(); roads[selRoad].type = (roads[selRoad].type + 1) % NTYPES; dirty = true; nextBuild = 0; }
         ui.label(px + 14, 194, 12, col::gray, "Ziehen = verschieben, Entf = Punkt l\xC3\xB6schen");
     }
-    // Fusszeile
+
+    // ---- Auswahlrahmen und Anzeige waehrend Verschieben/Drehen/Skalieren ----
+    if (boxSelecting && lmbDown) {
+        float x0 = std::min(boxX0, mouseX), y0 = std::min(boxY0, mouseY), x1 = std::max(boxX0, mouseX), y1 = std::max(boxY0, mouseY);
+        Color f{255, 210, 60, 40}, l{255, 210, 60, 220};
+        ui.geo.rect(x0, y0, x1 - x0, y1 - y0, f);
+        ui.geo.rect(x0, y0, x1 - x0, 1.5f, l); ui.geo.rect(x0, y1 - 1.5f, x1 - x0, 1.5f, l);
+        ui.geo.rect(x0, y0, 1.5f, y1 - y0, l); ui.geo.rect(x1 - 1.5f, y0, 1.5f, y1 - y0, l);
+    }
+    if (mo.active) {
+        ui.panel(W / 2 - 250, 56, 500, 54, col::dark);
+        ui.labelC(W / 2, 80, 18, col::accent, mo.info);
+        ui.labelC(W / 2, 100, 12, col::gray, "X / Y / Z Achse sperren  |  Zahl tippen  |  Klick / Enter = ok  |  Esc / Rechtsklick = abbrechen");
+    }
+
+    // ---- Fusszeile ----
     ui.panel(0, H - 30, W, 30, Color{14, 16, 22, 230}, 0);
-    std::string hint = simTime < statusUntil ? statusMsg
-        : "Rechte Maustaste + WASD/QE = fliegen  |  Shift = schnell  |  Klick = ausw\xC3\xA4hlen, ziehen = verschieben  |  Strg+D duplizieren  |  Bild auf/ab = H\xC3\xB6he  |  Strg+S speichern  |  Esc = Men\xC3\xBC";
+    std::string hint;
+    if (simTime < statusUntil) hint = statusMsg;
+    else if (mo.active) hint = "G/R/S: Maus bewegen, X/Y/Z sperrt die Achse, N = Fl\xC3\xA4" "chennormale, Zahl tippen f\xC3\xBCr exakten Wert";
+    else if (eo) hint = "Klick = w\xC3\xA4hlen  |  Shift = mehrere  |  Rahmen ziehen  |  G/R/S bewegen, drehen, skalieren  |  E extrudieren  |  X l\xC3\xB6schen  |  F Fl\xC3\xA4" "che  |  Tab fertig";
+    else if (tool == 3) hint = "Klick = Stra\xC3\x9F" "enpunkt setzen  |  Enter / Rechtsklick = fertig  |  Entf = letzten Punkt entfernen";
+    else hint = "Rechte Maustaste + WASD/QE fliegen  |  Mittlere Taste kreisen (+Shift schieben)  |  F auf Auswahl  |  Tab = Mesh bearbeiten  |  Strg+D  |  Strg+S";
     ui.label(12, H - 10, 13, simTime < statusUntil ? col::accent : col::gray, hint);
     snprintf(buf, sizeof buf, "%d Objekte, %d Stra\xC3\x9F" "en", (int)objs.size(), (int)roads.size());
     ui.labelR(W - 12, H - 10, 13, col::gray, buf);
@@ -854,14 +1649,17 @@ void drawWorld() {
     gfxModel(identity());
     gfxMode(0, FLAG_LIT | FLAG_FOG);
     solidMesh.draw();
-    gfxMode(7);
     for (const Obj& o : objs) {
         if (std::fabs(o.pos.x) > 12000 || std::fabs(o.pos.z) > 12000) continue;
+        bool mesh = o.shape == 5 && o.emesh;
+        gfxMode(mesh ? 9 : 7);
         gfxModel(matOf(o));
-        gfxTint(o.color.r / 255.0f, o.color.g / 255.0f, o.color.b / 255.0f);
+        if (mesh) gfxTint(1, 1, 1); else gfxTint(o.color.r / 255.0f, o.color.g / 255.0f, o.color.b / 255.0f);
         gfxTile(o.tile);
         gfxBindTexture(texOf(o.texture));
-        if (o.shape == 4) modelOf(o.model).mesh.draw(); else shapes[o.shape].draw();
+        if (o.shape == 4) modelOf(o.model).mesh.draw();
+        else if (o.shape == 5) { if (o.emesh) o.emesh->draw(); }
+        else shapes[o.shape].draw();
     }
     gfxModel(identity());
 }
@@ -870,7 +1668,58 @@ void drawGizmos(const Mat4& vp) {
     gizmo.clear();
     Mat4 I = identity();
     Color yellow{255, 210, 60, 255};
-    if (sel >= 0 && sel < (int)objs.size()) {
+    const Color ac[3] = {{240, 70, 60, 255}, {90, 220, 90, 255}, {80, 140, 255, 255}};
+    if (Obj* eo = editObj()) {
+        const Obj& o = *eo;
+        fitSel(*eo);
+        float dist = length(toWorld(o, {0, 0, 0}) - camP);
+        float t0 = std::max(0.006f, dist * 0.0022f);
+        Color edge{22, 24, 30, 255}, vtx{250, 250, 252, 255}, face{255, 160, 40, 255};
+        std::set<std::pair<int, int>> done;
+        auto ekey = [](int a, int b) { return std::make_pair(std::min(a, b), std::max(a, b)); };
+        // Gewaehlte Flaechen: Fuellung + gelbe Kanten
+        for (size_t fi = 0; fi < o.mesh.f.size(); fi++) {
+            const EFace& f = o.mesh.f[fi];
+            if (pickMode == 2 && selF[fi]) {
+                Vec3 n = qrot(rotOf(o), emesh::faceNormal(o.mesh, (int)fi));
+                Vec3 off = n * (t0 * 1.5f);
+                for (size_t k = 1; k + 1 < f.v.size(); k++)
+                    gizmo.tri(toWorld(o, o.mesh.v[f.v[0]]) + off, toWorld(o, o.mesh.v[f.v[k]]) + off, toWorld(o, o.mesh.v[f.v[k + 1]]) + off, n, Color{face.r, face.g, face.b, 120});
+                for (size_t k = 0; k < f.v.size(); k++) {
+                    int a = f.v[k], b = f.v[(k + 1) % f.v.size()];
+                    done.insert(ekey(a, b));
+                    gizmo.beam(I, toWorld(o, o.mesh.v[a]), toWorld(o, o.mesh.v[b]), t0 * 1.8f, yellow);
+                }
+            }
+        }
+        for (const EFace& f : o.mesh.f)
+            for (size_t k = 0; k < f.v.size(); k++) {
+                int a = f.v[k], b = f.v[(k + 1) % f.v.size()];
+                if (!done.insert(ekey(a, b)).second) continue;
+                bool s = pickMode != 2 && selV[a] && selV[b];
+                gizmo.beam(I, toWorld(o, o.mesh.v[a]), toWorld(o, o.mesh.v[b]), s ? t0 * 1.8f : t0, s ? yellow : edge);
+            }
+        for (size_t i = 0; i < o.mesh.v.size(); i++) {
+            bool s = pickMode != 2 && selV[i];
+            if (pickMode == 2 && !s) continue;
+            float sz = t0 * (s ? 3.2f : 2.2f);
+            gizmo.box(I, toWorld(o, o.mesh.v[i]), {sz, sz, sz}, s ? yellow : vtx);
+        }
+        std::vector<int> ids = activeVerts(o);
+        if (!ids.empty()) {
+            Vec3 c = selCenterWorld(o);
+            float L = gizmoLen(c);
+            if (mo.active) {
+                Vec3 ax = modalAxis();
+                if (mo.axis >= 0) gizmo.beam(I, c - ax * 400.0f, c + ax * 400.0f, L * 0.012f, mo.axis < 3 ? ac[mo.axis] : yellow);
+            } else
+                for (int a = 0; a < 3; a++) {
+                    Vec3 d = worldAxis(a);
+                    gizmo.beam(I, c, c + d * L, L * 0.022f, ac[a]);
+                    gizmo.box(I, c + d * L, {L * 0.06f, L * 0.06f, L * 0.06f}, ac[a]);
+                }
+        }
+    } else if (sel >= 0 && sel < (int)objs.size()) {
         const Obj& o = objs[sel];
         Vec3 lo, hi;
         boundsOf(o, lo, hi);
@@ -881,7 +1730,6 @@ void drawGizmos(const Mat4& vp) {
         const int ed[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3}, {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
         for (auto& e : ed) gizmo.beam(R, c[e[0]], c[e[1]], t, yellow);
         float L = gizmoLen(o.pos);
-        const Color ac[3] = {{240, 70, 60, 255}, {90, 220, 90, 255}, {80, 140, 255, 255}};
         for (int a = 0; a < 3; a++) {
             Vec3 d = axisDir(a, &o);
             gizmo.beam(I, o.pos, o.pos + d * L, L * (dragAxis == a ? 0.035f : 0.022f), ac[a]);

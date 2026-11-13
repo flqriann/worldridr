@@ -998,6 +998,7 @@ void carDraw(const CarVisual& vIn, const Mat4& vp, bool cockpit, const DashState
         mSteer.draw();
         gfxModel(v.M);
         gfxMode(0, 0);
+        gfxBias(1.2e-6f); // Zifferblaetter minimal vor die Instrumententafel legen (kein Flimmern)
         mDashGeo.draw();
         dynGeo.draw();
         glEnable(GL_BLEND);
@@ -1008,6 +1009,7 @@ void carDraw(const CarVisual& vIn, const Mat4& vp, bool cockpit, const DashState
         dynText.draw();
         glDepthMask(GL_TRUE);
         glDisable(GL_BLEND);
+        gfxBias(0);
     } else {
         drawOccupants(v);
         glEnable(GL_BLEND);

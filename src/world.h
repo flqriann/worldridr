@@ -31,6 +31,7 @@ struct Poi { // Tankstelle (0) oder Supermarkt (1)
     float x = 0, z = 0, ux = 1, uz = 0, price = 1.6f;
     std::string name;
 };
+struct TreePos { float x, y, z, rnd; }; // Strassenbaum (wird als Instanz gezeichnet)
 struct MapConflict { // Unklarheit in den Kartendaten (z. B. Spurzahl wechselt von 2 auf 3)
     std::string key, name;
     int64_t idA = 0, idB = 0;
@@ -61,6 +62,9 @@ public:
     static int signalState(const Control& c, double t); // 0 rot, 1 rot-gelb, 2 gruen, 3 gelb
     void drawTerrain(int level, const Mat4& vp); // 0 fern, 1 mittel, 2 nah (nur Sichtbares)
     void forPoisNear(float x, float z, float r, const std::function<void(const Poi&)>& fn) const;
+    void forTreesNear(float x, float z, float r, const std::function<void(const TreePos&)>& fn) const;
+    int forestAt(float x, float z) const;   // 1 dunkle Waldflaeche im Satellitenbild, 0 sonst, -1 Bild noch nicht geladen
+    bool osmReady(float x, float z) const;  // Strassen/Gebaeude der Kachel sind geladen
     std::vector<MapConflict> takeConflicts();              // neu erkannte Unklarheiten abholen
     void resolveConflict(const MapConflict& c, int lanes); // lanes > 0: Spurzahl setzen, 0: so lassen (wird gespeichert)
     void setQuality(int q);                       // 0 niedrig, 1 mittel, 2 hoch: Reichweite des Gelaendes

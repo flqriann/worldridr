@@ -423,6 +423,7 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
     world.drawBuildings(vp, cam, mirrorPass ? 250.0f : cfg.bldDist);
     editor::drawWorld();
     gfxMode(0, FLAG_LIT | FLAG_FOG);
+    forest::draw(mirrorPass);
     propsLit.draw();
     gfxMode(0, FLAG_FOG);
     propsUnlit.draw();
@@ -432,7 +433,7 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
         v.M = fromQuatPos(c.qs, c.pos);
         v.steer = c.steer;
         for (float& r : v.wheelRot) r = c.wheelRot;
-        v.paint = paintOf(c.id); v.tinted = true; v.model = carModelCount() > 0 ? (int)(c.id % carModelCount()) : -1;
+        v.paint = Color{c.paint[0], c.paint[1], c.paint[2], 255}; v.tinted = c.tinted; v.model = c.model; v.kind = c.kind;
         v.blinkL = (c.flags & 1) != 0; v.blinkR = (c.flags & 2) != 0; v.brake = (c.flags & 4) != 0; v.lights = (c.flags & 8) != 0;
         carDraw(v, vp, false, nullptr);
     }
@@ -466,7 +467,7 @@ static void renderMirrors(const Mat4& M) {
         int i = (turn++) % 3;
         Mat4 camM = mul(M, mul(translate(MIRROR_POS[i]), rotY(yaw[i])));
         Mat4 view = rigidInverse(camM);
-        Mat4 proj = mul(scaleM(-1, 1, 1), perspective(fov[i], MIRROR_HW[i] / MIRROR_HH[i], 0.5f, 40000.0f));
+        Mat4 proj = mul(scaleM(-1, 1, 1), perspective(fov[i], MIRROR_HW[i] / MIRROR_HH[i], 0.5f, 16000.0f));
         glBindFramebuffer(GL_FRAMEBUFFER, mirrorRT[i].fbo);
         glViewport(0, 0, mirrorRT[i].w, mirrorRT[i].h);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -565,7 +566,7 @@ static void buildHUD(bool cockpit, bool loading) {
             const float* m = mainVP.m;
             Vec3 p = c.pos + Vec3{0, 1.7f, 0};
             float w = m[3] * p.x + m[7] * p.y + m[11] * p.z + m[15];
-            if (!c.placed || w < 1 || w > 120) continue;
+            if (!c.placed || w < 1 || w > 300) continue;
             float sx = ((m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12]) / w * 0.5f + 0.5f) * W, sy = (1 - ((m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13]) / w * 0.5f + 0.5f)) * H;
             float tw = font.width(c.name, 13) + 14;
             ui.geo.rrect(sx - tw / 2, sy - 18, tw, 22, 8, Color{14, 17, 23, 170});
@@ -1084,6 +1085,7 @@ int main(int argc, char** argv) {
         else if (a == "--max" && i + 1 < argc) serverMax = atoi(argv[++i]);
         else if (a == "--autodrive") { autodrive = true; showMenu = false; }
         else if (a == "--chase") camMode = 1;
+        else if (a == "--cockpit") camMode = 0;
         else if (a == "--editor") { startEditor = true; showMenu = false; }
         else if (a == "--host") startHost = true;
         else if (a == "--nomenu") showMenu = false;
@@ -1162,6 +1164,7 @@ int main(int argc, char** argv) {
     applyVehicle();
     (void)haveSettings;
     editor::init();
+    forest::init();
     script.init(&hud);
     if (cfg.vr) vr.init();
     if (startHost) netplay::host(cfg.port);
@@ -1194,7 +1197,7 @@ int main(int argc, char** argv) {
                     int mode = typing;
                     typing = 0; SDL_StopTextInput(win);
                     if (!typed.empty() && mode == 1) startTeleport(typed);
-                    if (!typed.empty() && mode == 2) { if (netplay::join(typed, cfg.port)) rememberServer(typed); statusLine = netplay::status(); }
+                    if (!typed.empty() && mode == 2) { if (netplay::join(typed, cfg.port)) rememberServer(typed); else statusLine = netplay::status(); }
                     if (!typed.empty() && mode == 3) startTeleport(typed, true);
                     if (!typed.empty() && mode == 4) netplay::chat(typed);
                 }
@@ -1204,6 +1207,7 @@ int main(int argc, char** argv) {
                 SDL_Keycode k = e.key.key;
                 if (k == SDLK_ESCAPE && calStep >= 0) { calStep = -1; statusLine.clear(); continue; }
                 if (k == SDLK_ESCAPE && worldmap::active()) { worldmap::close(); statusLine.clear(); continue; }
+                if (k == SDLK_ESCAPE && edit && !menuOpen && editor::escape()) continue;
                 if (k == SDLK_ESCAPE) { menuOpen = !menuOpen; menuPage = 0; statusLine.clear(); if (!menuOpen) started = true; continue; }
                 if (keys::is(A_CHAT, k) && !menuOpen && !edit && !worldmap::active() && netplay::active()) { beginTyping(4); continue; }
                 if (keys::is(A_MAP, k) && !edit && !menuOpen) { if (worldmap::active()) worldmap::close(); else worldmap::open(); continue; }
@@ -1277,6 +1281,7 @@ int main(int argc, char** argv) {
             if (startEditor) { // Selbsttest: Uebersicht von oben auf den Startpunkt
                 editor::open(car.pos, 0);
                 editor::setCamera({10, car.pos.y + 45, 55}, 0, -0.62f);
+                if (const char* hy = getenv("WR_CAMY")) editor::setCamera({10, car.pos.y + (float)atof(hy), 55}, 0, -0.3f);
                 startEditor = false;
             }
         }
@@ -1476,6 +1481,7 @@ int main(int argc, char** argv) {
             me.name = cfg.playerName;
             world.toLatLon(car.pos.x, car.pos.z, me.lat, me.lon);
             me.y = car.pos.y; me.q = car.q; me.steer = car.w[0].steer; me.speed = car.speed(); me.wheelRot = car.w[0].rot;
+            { CarVisual ov = ownVisual(); me.model = carModelSel; me.kind = car.kind; me.tinted = ov.tinted; me.paint[0] = ov.paint.r; me.paint[1] = ov.paint.g; me.paint[2] = ov.paint.b; }
             me.flags = (uint8_t)((((blinker == -1 || blinker == 2) && blinkLit) ? 1 : 0) | (((blinker == 1 || blinker == 2) && blinkLit) ? 2 : 0) | (car.brake > 0.05f ? 4 : 0) | (lights ? 8 : 0));
             netplay::update(dt, me);
         }
@@ -1484,6 +1490,7 @@ int main(int argc, char** argv) {
         updateOwnOccupant(dt);
         Mat4 M = car.transform();
         buildProps(focus);
+        forest::update(edit ? editor::cameraPos() : (spawned ? playerPos() : Vec3{}));
         bool vrFrame = !edit && vr.beginFrame();
         int wantInterval = vr.running ? 0 : 1;
         if (wantInterval != swapInterval) { SDL_GL_SetSwapInterval(wantInterval); swapInterval = wantInterval; }
@@ -1541,7 +1548,7 @@ int main(int argc, char** argv) {
                 Vec3 back{std::sin(yaw), 0, std::cos(yaw)};
                 camM = mul(translate(car.pos + back * 7.2f + Vec3{0, 2.2f, 0}), mul(rotY(yaw), rotX(-0.20f + lookPitch)));
             }
-            Mat4 view = rigidInverse(camM), proj = perspective(cfg.fov * PI / 180.0f, aspect, 0.08f, 40000.0f);
+            Mat4 view = rigidInverse(camM), proj = perspective(cfg.fov * PI / 180.0f, aspect, 0.2f, 16000.0f);
             mainVP = mul(proj, view);
             if (edit && !menuOpen) editor::update(dt, mainVP, (float)ww, (float)wh);
             drawScene(view, proj, xformPoint(camM, {0, 0, 0}));

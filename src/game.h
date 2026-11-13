@@ -114,6 +114,7 @@ bool surface(float x, float z, float yRef, float& h);
 bool blocked(float x, float z, float y);
 void save();
 bool wantsTestDrive(Vec3& pos, float& yaw);
+bool escape();               // Esc im Studio: Verschieben abbrechen / Bearbeitungsmodus verlassen; true = verbraucht
 }
 
 // ---------- KI-Verkehr ----------
@@ -165,6 +166,12 @@ void debugHit();
 Vec3 playerPos();             // Spieler zu Fuss oder Auto
 Vec3 playerForward();
 
+namespace forest {
+void init();                    // lädt assets/trees/*.glb
+void update(Vec3 cam);          // Waldzellen erzeugen, Instanzlisten aufbauen
+void draw(bool mirror);
+}
+
 namespace ped {
 extern int wanted;                                           // gewuenschte Anzahl (0 = aus)
 void update(float dt);
@@ -210,6 +217,10 @@ struct NetCar {
     float y = 0, steer = 0, speed = 0, wheelRot = 0;
     Quat q;
     uint8_t flags = 0; // 1 Blinker links, 2 rechts, 4 Bremse, 8 Licht
+    int model = -1;    // Auto-Modell des Spielers (Index), damit alle dasselbe Auto sehen
+    int kind = 0;      // 0 Auto, 1 Moped, 2 Motorrad
+    bool tinted = false;
+    uint8_t paint[3] = {190, 30, 40};
     // nur lokal:
     Vec3 pos;
     Quat qs;

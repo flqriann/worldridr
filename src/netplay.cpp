@@ -20,6 +20,7 @@ struct Packet {
     double lat, lon;
     float y, q[4], steer, speed, wheelRot;
     uint8_t flags;
+    int8_t model; uint8_t kind, tinted, paint[3];
 };
 struct ChatPacket {
     Hdr h;
@@ -180,6 +181,8 @@ void receive() {
             it->lat = p.lat; it->lon = p.lon; it->y = p.y;
             it->q = qnorm(Quat{p.q[0], p.q[1], p.q[2], p.q[3]});
             it->steer = p.steer; it->speed = p.speed; it->wheelRot = p.wheelRot; it->flags = p.flags;
+            it->model = p.model; it->kind = p.kind; it->tinted = p.tinted != 0;
+            for (int i = 0; i < 3; i++) it->paint[i] = p.paint[i];
             it->lastSeen = simTime;
         } else if (n == (int)sizeof(ChatPacket) && h.type == 3) {
             ChatPacket c;
@@ -287,9 +290,15 @@ void update(float dt, const NetCar& mine) {
         p.lat = mine.lat; p.lon = mine.lon; p.y = mine.y;
         p.q[0] = mine.q.w; p.q[1] = mine.q.x; p.q[2] = mine.q.y; p.q[3] = mine.q.z;
         p.steer = mine.steer; p.speed = mine.speed; p.wheelRot = mine.wheelRot; p.flags = mine.flags;
+        p.model = (int8_t)mine.model; p.kind = (uint8_t)mine.kind; p.tinted = mine.tinted ? 1 : 0;
+        for (int i = 0; i < 3; i++) p.paint[i] = mine.paint[i];
         if (isHost) sendAll(p, nullptr); else sendTo(p, hostAddr);
     }
     purge();
+    if (isHost) { // Lebenszeichen, damit Beitretende auch ohne weitere Mitspieler "Verbunden" sehen
+        beatTimer -= dt;
+        if (beatTimer <= 0) { beatTimer = 1.0f; Hdr h{MAGIC, 6, myId}; sendAll(h, nullptr); }
+    }
     // weiche Bewegung der Mitspieler
     for (NetCar& c : remote) {
         Vec3 target;

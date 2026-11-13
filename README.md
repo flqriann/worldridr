@@ -155,22 +155,47 @@ Anzahl in `config.lua` (`traffic = 22`, 0 = aus) oder im Menü ein-/ausschalten.
 
 ## Studio (Editor) – F2 oder Menü
 
+Aufbau wie in Roblox Studio / Blender: links **Einfügen** und **Explorer** (Objektliste), rechts **Eigenschaften**,
+oben Speichern, Rückgängig/Wiederholen, Werkzeuge, Raster und der Schalter **Bearbeiten (Tab)**.
+
 | Aktion | Bedienung |
 | --- | --- |
-| Fliegen | rechte Maustaste halten + Maus, W A S D, Q/E runter/hoch, Shift schnell, Mausrad |
-| Einfügen | linke Leiste: Block, Zylinder, Keil (Rampe), Kugel, eigene `.obj`-Modelle aus `assets/models` |
-| Auswählen / verschieben | anklicken, am Objekt ziehen (folgt dem Boden) oder an den farbigen Achsen ziehen |
-| Werkzeuge | 1 Bewegen, 2 Drehen, 3 Skalieren, 4 Straße; Strg beim Ziehen/Drehen rastet ein |
-| Eigenschaften | rechte Leiste: Größe, Farbe, Textur, Kachelgröße, „Fest“ (befahrbar/Hindernis) |
-| Texturen | eigene `.png`/`.jpg` nach `assets/textures` legen – sie erscheinen in der Liste |
-| Straße bauen | Werkzeug 4, Typ wählen, Punkte klicken, Enter oder Rechtsklick beendet. Kurven entstehen automatisch |
-| Kreuzung / Verlängern | Punkt nahe an einen bestehenden Punkt klicken (rastet ein) |
-| Brücke / Rampe | Straßenpunkt auswählen, „+ 0,5 m“ oder Bild auf/ab |
-| Sonstiges | Strg+D duplizieren, Entf löschen, Strg+Z rückgängig, Strg+S speichern, „Testfahrt“ setzt das Auto an die Blickposition |
+| Kamera | rechte Maustaste halten + W A S D, Q/E (Shift schnell); **mittlere Taste** kreist um die Auswahl, Shift+mittlere Taste verschiebt; Mausrad zoomt zum Mauszeiger; **F** springt auf die Auswahl |
+| Einfügen | Block, Zylinder, Keil, Kugel, **Treppe, Dach, Pyramide, Kegel, Platte, L-Winkel** (frei bearbeitbare Meshes) und eigene `.obj`-Modelle aus `assets/models` |
+| Auswählen / verschieben | anklicken (auch in der Explorer-Liste), am Objekt ziehen oder an den farbigen Pfeilen ziehen |
+| Werkzeuge | 1 Bewegen, 2 Drehen, 3 Skalieren, 4 Straße |
+| Raster | Knopf „Raster“ schaltet 0,25 / 0,5 / 1 / 2 m / aus; Strg beim Ziehen kehrt es um. Drehen rastet in 15°-Schritten ein |
+| Eigenschaften | Position X/Höhe/Z, Drehung, Größe mit −/+ (Schrittweite = Raster), „Fest“, Duplizieren, Löschen, Textur durchschalten |
+| Farben | RGB-Regler, 12 Grundfarben, **„+ Merken“** legt eigene Farben an (werden in der Karte gespeichert) |
 
-Gespeichert wird in `maps/welt.json` mit Geokoordinaten; die Karte wird beim Start automatisch geladen.
+### Mesh bearbeiten (Tab)
+
+Mit **Tab** (oder „Bearbeiten“) wird das gewählte Objekt zum Mesh; Block, Zylinder, Keil und Kugel werden dabei umgewandelt.
+Mit **1 / 2 / 3** wählst du Punkte, Kanten oder Flächen.
+
+| Taste | Wirkung |
+| --- | --- |
+| Klick, Shift+Klick, Rahmen ziehen | auswählen / mehrere / Bereich |
+| Pfeil am Auswahlzentrum ziehen | entlang einer Achse verschieben |
+| **G / R / S** | verschieben, drehen, skalieren (Blender-Stil); **X / Y / Z** sperrt die Achse, **N** = Flächennormale, Zahl tippen = exakter Wert, Klick/Enter bestätigt, Esc/Rechtsklick bricht ab |
+| **E** | ausgewählte Flächen extrudieren (danach direkt entlang der Normale ziehen) |
+| **U** | Fläche teilen, **X / Entf** löschen, **F** Fläche aus gewählten Punkten, **V** Flächen umdrehen, **A** alles / nichts |
+| Farbe | gilt für die gewählten Flächen (ohne Auswahl für das ganze Objekt) – jede Fläche hat ihre eigene Farbe |
+
+Straßen: Werkzeug 4, Typ wählen, Punkte klicken, Enter oder Rechtsklick beendet; Punkt nahe an einen vorhandenen Punkt klicken
+rastet ein (Kreuzung/Verlängern); Brücke/Rampe über „+ 0,5 m“ oder Bild auf/ab am Straßenpunkt.
+Sonstiges: Strg+D duplizieren, Entf löschen, Strg+Z / Strg+Y rückgängig / wiederholen, Strg+S speichern,
+„Testfahrt“ setzt das Auto an die Blickposition. Eigene Texturen (`.png`/`.jpg`) nach `assets/textures`.
+
+Gespeichert wird in `maps/welt.json` mit Geokoordinaten (inklusive Mesh-Flächen und Farben); die Karte wird beim Start geladen.
 Gebaute Straßen haben Tempolimit, Spuren und Gehsteige und zählen für die Regelprüfung wie echte Straßen.
-Feste Blöcke und Keile ohne Neigung sind befahrbar (Rampen, Podeste), alles Höhere ist ein Hindernis.
+Feste Objekte sind Hindernis und Untergrund: Rampen, Podeste und **Treppen** (Mesh) kann man befahren bzw. zu Fuß hochgehen.
+
+## Bäume und Wälder
+
+Straßenbäume und Wälder nutzen die Modelle `assets/trees/tree.glb` (Laubbaum) und `assets/trees/pine.glb` (Kiefer); eigene `.glb`
+mit Materialfarben lassen sich einfach austauschen. Wald entsteht dort, wo das Satellitenbild dunkel und grün ist (nicht auf
+Straßen und Gebäuden). Nah wird das volle Modell gezeichnet, weiter weg eine einfache Version (Instanced Rendering).
 
 ## Mehrspieler (Details)
 

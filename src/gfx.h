@@ -58,6 +58,9 @@ typedef ptrdiff_t GLsizeiptr;
     X(void, BufferData, (GLenum, GLsizeiptr, const void*, GLenum)) \
     X(void, DeleteBuffers, (GLsizei, const GLuint*)) \
     X(void, EnableVertexAttribArray, (GLuint)) \
+    X(void, DisableVertexAttribArray, (GLuint)) \
+    X(void, VertexAttribDivisor, (GLuint, GLuint)) \
+    X(void, DrawArraysInstanced, (GLenum, GLint, GLsizei, GLsizei)) \
     X(void, VertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void*)) \
     X(void, BindAttribLocation, (GLuint, GLuint, const GLchar*)) \
     X(void, ActiveTexture, (GLenum)) \
@@ -87,7 +90,10 @@ struct Mesh {
     void create(const Vertex* v, int n);
     void destroy();
     void draw() const;
+    void drawInstanced(GLuint instVbo, int n) const; // pro Instanz vec4 (x, y, z, Skalierung); gfxInstanced(true) vorher
 };
+GLuint gfxInstBuffer(GLuint vbo, const float* v4, int n); // Instanzdaten hochladen, liefert ggf. neu erzeugten Puffer
+void gfxInstanced(bool on);
 
 // Dynamischer Dreiecks-Puffer fuer Auto, Schilder, HUD
 struct Batch {

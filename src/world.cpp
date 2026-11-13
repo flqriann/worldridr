@@ -141,11 +141,11 @@ struct Elev {
     }
 };
 
-struct Tile { int z, x, y; Mesh mesh; GLuint tex = 0; double touched = 0; Vec3 lo, hi; };
+struct Tile { int z, x, y; Mesh mesh; GLuint tex = 0; double touched = 0; Vec3 lo, hi; std::vector<uint8_t> forest; int fw = 0, fh = 0; };
 struct Cell { Mesh m; Vec3 lo, hi; };               // Teilnetz eines Chunks, einzeln sichtbarkeitsgeprueft
 struct CellRes { std::vector<Vertex> v; Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f}; };
 static const int GC = 6;                              // Zellen pro Achse
-struct TileRes { int gen, z, x, y; bool ok = false; std::vector<Vertex> v; std::vector<uint8_t> rgb; int w = 0, h = 0; };
+struct TileRes { int gen, z, x, y; bool ok = false; std::vector<Vertex> v; std::vector<uint8_t> rgb; int w = 0, h = 0; std::vector<uint8_t> forest; };
 struct Chunk {
     Mesh roads;                       // nur fuer selbst gebaute Strassen
     std::vector<Cell> sideCells, roadCells, bldCells;
@@ -154,6 +154,7 @@ struct Chunk {
     std::vector<Control> controls;
     std::vector<Building> buildings;
     std::vector<Poi> pois;
+    std::vector<TreePos> trees;
     float x0 = 0, z0 = 0, x1 = 0, z1 = 0;
     double touched = 0;
     bool ok = false;
@@ -168,6 +169,7 @@ struct ChunkRes {
     std::vector<Control> controls;
     std::vector<Building> buildings;
     std::vector<Poi> pois;
+    std::vector<TreePos> trees;
     float x0, z0, x1, z1;
 };
 
@@ -210,6 +212,14 @@ static void buildTile(World::Impl* d, GeoRef g, int z, int x, int y) {
         if (px) {
             r.rgb.assign(px, px + (size_t)w * h * 3);
             r.w = w; r.h = h;
+            if (z == d->zoom[1]) { // Wald = dunkle, gruene Flaechen (Wasser ist blau, Daecher/Asphalt grau und werden nicht erfasst)
+                r.forest.assign((size_t)w * h, 0);
+                for (size_t i = 0; i < (size_t)w * h; i++) {
+                    int R = px[i * 3], G = px[i * 3 + 1], B = px[i * 3 + 2];
+                    int lum = (R * 3 + G * 6 + B) / 10;
+                    r.forest[i] = (lum < 92 && G > R + 4 && G > B + 8) ? 1 : 0;
+                }
+            }
             stbi_image_free(px);
             int span = 1 << (20 - z);          // Hoehenpixel pro Kachelkante
             int cells = std::min(span * 4, 32);  // nah: 1/4 Hoehenpixel (ca. 6 m) pro Masche, glatt interpoliert
@@ -1200,7 +1210,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                         for (const Building& bb : r.buildings) { if (px2 < bb.minx - 1 || px2 > bb.maxx + 1 || pz2 < bb.minz - 1 || pz2 > bb.maxz + 1) continue; if (pointInPoly(bb.poly, px2, pz2)) { inB = true; break; } }
                         if (inB) continue;
                         if (w.klass <= 3 && hash2((int)(px2), (int)(pz2)) < 0.55f) continue; // grosse Strassen: weniger Baeume
-                        pushTree(r.bldV, px2, H(px2, pz2), pz2, hash2((int)(px2 * 5), (int)(pz2 * 5)));
+                        r.trees.push_back({px2, H(px2, pz2), pz2, hash2((int)(px2 * 5), (int)(pz2 * 5))});
                         treeCount++;
                     }
                     while (rd[k] >= nextLamp) {
@@ -1435,6 +1445,7 @@ void World::update(Vec3 p, double now) {
         t.lo = {1e9f, 1e9f, 1e9f}; t.hi = {-1e9f, -1e9f, -1e9f};
         for (const Vertex& q : r.v) { t.lo = {std::min(t.lo.x, q.p[0]), std::min(t.lo.y, q.p[1]), std::min(t.lo.z, q.p[2])}; t.hi = {std::max(t.hi.x, q.p[0]), std::max(t.hi.y, q.p[1]), std::max(t.hi.z, q.p[2])}; }
         t.tex = gfxTexture(r.rgb.data(), r.w, r.h, 3, true);
+        t.forest = std::move(r.forest); t.fw = r.w; t.fh = r.h;
     }
     for (ChunkRes& r : cr) {
         if (r.gen != g.gen) continue;
@@ -1449,7 +1460,7 @@ void World::update(Vec3 p, double now) {
         uploadCells(r.roadCells, c.roadCells);
         uploadCells(r.bldCells, c.bldCells);
         c.segs = std::move(r.segs); c.names = std::move(r.names);
-        c.controls = std::move(r.controls); c.buildings = std::move(r.buildings); c.pois = std::move(r.pois);
+        c.controls = std::move(r.controls); c.buildings = std::move(r.buildings); c.pois = std::move(r.pois); c.trees = std::move(r.trees);
         if (r.ok) logMsg("OSM-Kachel %d/%d: %d Strassenabschnitte, %d Gebaeude, %d Ampeln/Schilder, %d Tankstellen/Supermärkte", r.cx, r.cy, (int)c.segs.size(), (int)c.buildings.size(), (int)c.controls.size(), (int)c.pois.size());
     }
 
@@ -1691,6 +1702,25 @@ void World::resolveConflict(const MapConflict& c, int lanes) {
     }
 }
 
+void World::forTreesNear(float x, float z, float r, const std::function<void(const TreePos&)>& fn) const {
+    for (auto& kv : d->chunks)
+        for (const TreePos& t : kv.second.trees)
+            if (std::fabs(t.x - x) < r && std::fabs(t.z - z) < r) fn(t);
+}
+int World::forestAt(float x, float z) const {
+    double mx = g.mx0 + x / g.S, my = g.my0 + z / g.S, n = (double)(1 << d->zoom[1]);
+    int tx = (int)std::floor(mx * n), ty = (int)std::floor(my * n);
+    auto it = d->tiles.find(tkey(d->zoom[1], tx, ty));
+    if (it == d->tiles.end() || it->second.forest.empty()) return -1;
+    const Tile& t = it->second;
+    int px = clampv((int)((mx * n - tx) * t.fw), 0, t.fw - 1), py = clampv((int)((my * n - ty) * t.fh), 0, t.fh - 1);
+    return t.forest[(size_t)py * t.fw + px];
+}
+bool World::osmReady(float x, float z) const {
+    double mx = g.mx0 + x / g.S, my = g.my0 + z / g.S;
+    auto it = d->chunks.find(tkey(14, (int)std::floor(mx * 16384.0), (int)std::floor(my * 16384.0)));
+    return it != d->chunks.end() && it->second.ok;
+}
 void World::forPoisNear(float x, float z, float r, const std::function<void(const Poi&)>& fn) const {
     for (auto& kv : d->chunks)
         for (const Poi& p : kv.second.pois)

@@ -11,7 +11,7 @@ float consumeScale = 1.0f;
 }
 
 namespace {
-const float FUEL_ARCADE = 4.0f;   // schnellerer Verbrauch, damit Tankstellen im Spiel eine Rolle spielen
+const float FUEL_ARCADE = 1.5f;   // leicht erhoehter Verbrauch gegenueber der Realitaet (ca. 7-10 l/100 km)
 const float PUMP_RATE = 2.2f;     // Liter pro Sekunde beim Tanken
 bool refueling = false, lowWarned = false, emptyWarned = false;
 float refuelLiters = 0, refuelCost = 0;
@@ -58,7 +58,7 @@ void update(float dt) {
     if (fuel < 0) fuel = fuelCap;
     // Verbrauch
     if (car.engineOn) {
-        float lps = (0.00025f + 8.3e-6f * car.throttle * car.rpm()) * FUEL_ARCADE * consumeScale;
+        float lps = (0.00028f + 1.1e-6f * car.throttle * car.rpm()) * FUEL_ARCADE * consumeScale;
         fuel -= lps * dt;
     }
     if (fuel <= 0) {
@@ -75,12 +75,11 @@ void update(float dt) {
         bool ok = nearKind == 0 && std::fabs(car.speed()) < 0.6f && !car.engineOn;
         float dl = std::min(PUMP_RATE * dt, fuelCap - fuel);
         float price = nearPoi.price;
-        if (ok && dl > 0 && money >= dl * price) {
-            fuel += dl; money -= dl * price; refuelLiters += dl; refuelCost += dl * price;
+        if (ok && dl > 0) { // Tanken kostet nichts, der Preis wird nur angezeigt
+            fuel += dl; refuelLiters += dl; refuelCost += dl * price;
         } else {
             refueling = false;
-            if (refuelLiters > 0.05f) hud.msgs.push_back({"Getankt: " + std::to_string((int)std::round(refuelLiters)) + " l f\xC3\xBCr " + eur(refuelCost) + (fuel >= fuelCap - 0.05f ? " (Tank voll)" : ""), 5.0f});
-            else if (money < price) hud.msgs.push_back({"Nicht genug Geld - Lieferauftr\xC3\xA4ge bei Superm\xC3\xA4rkten bringen Geld", 5.0f});
+            if (refuelLiters > 0.05f) hud.msgs.push_back({"Getankt: " + std::to_string((int)std::round(refuelLiters)) + " l (Wert " + eur(refuelCost) + ", kostenlos)" + (fuel >= fuelCap - 0.05f ? " (Tank voll)" : ""), 5.0f});
         }
     }
     // Lieferung: abgebrochen, wenn die Navigation beendet wurde

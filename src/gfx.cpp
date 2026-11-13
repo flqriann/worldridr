@@ -31,13 +31,20 @@ void logMsg(const char* fmt, ...) {
 }
 
 static const char* VS = R"(#version 330 core
-layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNrm; layout(location=2) in vec2 aUV; layout(location=3) in vec4 aCol;
-uniform mat4 uMVP; uniform mat4 uModel; uniform float uBias;
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNrm; layout(location=2) in vec2 aUV; layout(location=3) in vec4 aCol; layout(location=4) in vec4 aInst;
+uniform mat4 uMVP; uniform mat4 uModel; uniform float uBias; uniform int uInst;
 out vec3 vW; out vec3 vN; out vec2 vUV; out vec4 vC;
 void main(){
-  vec4 w=uModel*vec4(aPos,1.0); mat3 m=mat3(uModel);
-  vW=w.xyz; vN=m*(aNrm/vec3(dot(m[0],m[0]),dot(m[1],m[1]),dot(m[2],m[2]))); vUV=aUV; vC=aCol;
-  gl_Position=uMVP*w; gl_Position.z-=uBias*gl_Position.w;
+  vec3 lp=aPos, ln=aNrm; vec4 col=aCol;
+  if(uInst==1){ // Instanzen (Baeume): zufaellige Drehung und leichte Farbvariation aus der Position
+    float h=fract(sin(dot(aInst.xz,vec2(12.9898,78.233)))*43758.5453); float a=h*6.2832, c=cos(a), s=sin(a);
+    lp=vec3(aPos.x*c+aPos.z*s, aPos.y, -aPos.x*s+aPos.z*c)*aInst.w+aInst.xyz;
+    ln=vec3(aNrm.x*c+aNrm.z*s, aNrm.y, -aNrm.x*s+aNrm.z*c);
+    col.rgb*=0.82+0.3*fract(h*13.7);
+  }
+  vec4 w=uModel*vec4(lp,1.0); mat3 m=mat3(uModel);
+  vW=w.xyz; vN=m*(ln/vec3(dot(m[0],m[0]),dot(m[1],m[1]),dot(m[2],m[2]))); vUV=aUV; vC=col;
+  gl_Position=uMVP*w; if(uBias>0.0){ float sw=uBias*3000.0; sw+=gl_Position.w*0.0004; gl_Position.z-=sw*0.4/max(gl_Position.w,0.1); }
 }
 )";
 
@@ -68,10 +75,11 @@ void main(){
   if(uMode==8){ o=texture(uTex,vUV)*vec4(uTint,1.0); return; }
   vec3 nn=normalize(vN);
   float l=0.45+0.13*nn.y+0.52*max(dot(nn,uSun),0.0);
-  if(uMode==7){ // Editor-Objekte: Textur als Wuerfelprojektion in Weltkoordinaten
+  if(uMode==7 || uMode==9){ // Editor-Objekte: Textur als Wuerfelprojektion in Weltkoordinaten (9: mal Flaechenfarbe)
     vec3 an=abs(nn);
     vec2 uv=(an.y>an.x && an.y>an.z) ? vW.xz : (an.x>an.z ? vW.zy : vW.xy);
-    o=vec4(fog(texture(uTex,uv/uTile).rgb*uTint*l),1.0); return;
+    vec3 fc=(uMode==9) ? vC.rgb : vec3(1.0);
+    o=vec4(fog(texture(uTex,uv/uTile).rgb*uTint*fc*l),1.0); return;
   }
   if(uMode==1){
     // Satellitenbild + feines Detailrauschen in der Naehe (das Luftbild hat nur ~0,4 m pro Pixel)
@@ -168,7 +176,7 @@ void main(){
 
 static struct {
     GLuint prog = 0, dynVao = 0, dynVbo = 0;
-    GLint uMVP, uMode, uFlags, uTex, uCam, uSun, uInvVP, uBias, uTint, uModel, uTile, uQ;
+    GLint uMVP, uMode, uFlags, uTex, uCam, uSun, uInvVP, uBias, uTint, uModel, uTile, uQ, uInst;
     float maxAniso = 1;
 } G;
 
@@ -209,7 +217,7 @@ bool gfxInit() {
     G.uInvVP = glGetUniformLocation(G.prog, "uInvVP"); G.uBias = glGetUniformLocation(G.prog, "uBias");
     G.uTint = glGetUniformLocation(G.prog, "uTint"); G.uQ = glGetUniformLocation(G.prog, "uQ");
     glUniform1i(G.uQ, 1);
-    G.uModel = glGetUniformLocation(G.prog, "uModel"); G.uTile = glGetUniformLocation(G.prog, "uTile");
+    G.uModel = glGetUniformLocation(G.prog, "uModel"); G.uTile = glGetUniformLocation(G.prog, "uTile"); G.uInst = glGetUniformLocation(G.prog, "uInst");
     gfxModel(identity());
     glUniform1f(G.uTile, 2.0f);
     glUniform1i(G.uTex, 0);
@@ -229,6 +237,7 @@ bool gfxInit() {
 void gfxMode(int mode, int flags) { glUniform1i(G.uMode, mode); glUniform1i(G.uFlags, flags); glUniform3f(G.uTint, 1, 1, 1); }
 void gfxModel(const Mat4& m) { glUniformMatrix4fv(G.uModel, 1, GL_FALSE, m.m); }
 void gfxTile(float metres) { glUniform1f(G.uTile, metres); }
+void gfxInstanced(bool on) { glUniform1i(G.uInst, on ? 1 : 0); }
 void gfxQuality(int q) { glUniform1i(G.uQ, q); }
 GLuint gfxTextureFile(const std::string& path) {
     int w, h, c;
@@ -303,6 +312,20 @@ void Mesh::draw() const {
     glBindVertexArray(vao);
     glDrawArrays(GL_TRIANGLES, 0, count);
 }
+void Mesh::drawInstanced(GLuint ivbo, int n) const {
+    if (!count || !ivbo || n <= 0) return;
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, ivbo);
+    glEnableVertexAttribArray(4); glVertexAttribPointer(4, 4, GL_FLOAT, GL_FALSE, 16, (void*)0); glVertexAttribDivisor(4, 1);
+    glDrawArraysInstanced(GL_TRIANGLES, 0, count, n);
+    glVertexAttribDivisor(4, 0); glDisableVertexAttribArray(4);
+}
+GLuint gfxInstBuffer(GLuint vbo, const float* v4, int n) {
+    if (!vbo) glGenBuffers(1, &vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)std::max(n, 1) * 16, v4, GL_STREAM_DRAW);
+    return vbo;
+}
 
 void Batch::vert(Vec3 p, Vec3 n, float u, float w, Color c) { v.push_back({{p.x, p.y, p.z}, {n.x, n.y, n.z}, {u, w}, c}); }
 void Batch::tri(Vec3 a, Vec3 b, Vec3 c, Vec3 n, Color col) { vert(a, n, 0, 0, col); vert(b, n, 1, 0, col); vert(c, n, 1, 1, col); }
@@ -338,7 +361,7 @@ void Batch::cylinderX(const Mat4& m, Vec3 c, float radius, float halfLen, float 
         Vec3 l0 = xformPoint(m, c + o0 + Vec3{-halfLen, 0, 0}), l1 = xformPoint(m, c + o1 + Vec3{-halfLen, 0, 0});
         Vec3 r0 = xformPoint(m, c + o0 + Vec3{halfLen, 0, 0}), r1 = xformPoint(m, c + o1 + Vec3{halfLen, 0, 0});
         quad(l0, r0, r1, l1, normalize(xformDir(m, o0 + o1)), side);
-        Color cc = (i % 4 == 0) ? Color{150, 150, 155, 255} : cap; // Speichen-Andeutung, damit man die Drehung sieht
+        Color cc = (i == 0) ? Color{170, 170, 176, 255} : cap; // eine helle Markierung zeigt die Drehung
         tri(xformPoint(m, c + Vec3{-halfLen, 0, 0}), l0, l1, nL, cc);
         tri(xformPoint(m, c + Vec3{halfLen, 0, 0}), r1, r0, -nL, cc);
     }
