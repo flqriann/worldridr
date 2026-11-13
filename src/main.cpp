@@ -1497,6 +1497,18 @@ int main(int argc, char** argv) {
         if (cfg.mirrors && (cockpit || vrFrame) && spawned && car.kind == 0) renderMirrors(M);
 
         bool drewWindow = false;
+        // Menue, Texteingabe und Weltkarte lassen sich am PC-Fenster bedienen; im Headset steht nur ein Hinweis
+        bool pcUi = vrFrame && (menuOpen || typing || worldmap::active());
+        std::vector<Vertex> savedGeo, savedText;
+        if (pcUi) {
+            savedGeo.swap(ui.geo.v); savedText.swap(ui.text.v);
+            ui.panel(0, 0, uiW, uiH, Color{0, 0, 0, 0}, 0);
+            float cx2 = uiW * 0.5f, cy2 = uiH * 0.5f;
+            ui.geo.rrect(cx2 - 330, cy2 - 90, 660, 180, 20, Color{16, 18, 24, 235});
+            ui.labelC(cx2, cy2 - 20, 40, col::white, "Bitte auf den PC-Monitor schauen");
+            ui.labelC(cx2, cy2 + 28, 22, col::gray, "Das MenÃ¼ wird am Computer mit der Maus bedient");
+            ui.labelC(cx2, cy2 + 62, 18, col::gray, "Esc schlieÃt das MenÃ¼");
+        }
         if (vrFrame) {
             if (vr.shouldRender()) {
                 for (int i = 0; i < 2; i++) {
@@ -1511,7 +1523,7 @@ int main(int argc, char** argv) {
                     const float s = 1.2f / uiW;
                     Mat4 panelM = mul(M, mul(translate({EYE.x, EYE.y + 0.05f, EYE.z - 1.6f}), mul(scaleM(s, -s, s), translate({-uiW * 0.5f, -uiH * 0.5f, 0}))));
                     ui.flush(mul(vp, panelM));
-                    if (i == 0) {
+                    if (i == 0 && !pcUi) {
                         glBindFramebuffer(GL_READ_FRAMEBUFFER, vr.eye[0].fbo);
                         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
                         glBlitFramebuffer(0, 0, vr.eye[0].w, vr.eye[0].h, 0, 0, ww, wh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
@@ -1522,6 +1534,7 @@ int main(int argc, char** argv) {
             }
             vr.endFrame();
         }
+        if (pcUi) { ui.geo.v.swap(savedGeo); ui.text.v.swap(savedText); } // eigentliches Menue fuer das PC-Fenster zurueck
         if (!drewWindow) {
             bool scaled = cfg.renderScale < 0.97f && !edit;
             int rw = scaled ? std::max(320, (int)(ww * cfg.renderScale)) : ww, rh = scaled ? std::max(180, (int)(wh * cfg.renderScale)) : wh;
