@@ -142,7 +142,8 @@ static void saveSettings() {
             cfg.quality, cfg.renderScale, (int)cfg.mirrors, cfg.traffic, (int)cfg.police, (int)cfg.faultPoints, cfg.hudMode, (int)cfg.minimap, (int)cfg.automatic, camMode,
             carModelSel >= 0 ? carModelName(carModelSel).c_str() : "builtin", (int)cfg.msaa, cfg.bldDist, cfg.roadDist, cfg.peds, (int)cfg.mapQuestions);
     if (carColorSet) fprintf(f, "carcolor=%d,%d,%d\n", carColor[0], carColor[1], carColor[2]);
-    fprintf(f, "veh=%d\nfuel=%.2f\nmoney=%.2f\ndiesel=%d\n", vehKind, econ::fuel, econ::money, (int)cfg.diesel);
+    // Der Tankstand wird bewusst nicht gespeichert: jede Fahrt beginnt mit vollem Tank (sonst kommt man mit leerem Tank nicht mehr los).
+    fprintf(f, "veh=%d\nmoney=%.2f\ndiesel=%d\n", vehKind, econ::money, (int)cfg.diesel);
     keys::save(f);
     fclose(f);
 }
@@ -170,7 +171,7 @@ static bool loadSettings() {
         else if (k == "minimap") cfg.minimap = n != 0;
         else if (k == "mapq") cfg.mapQuestions = n != 0;
         else if (k == "veh") vehKind = clampv((int)n, 0, 2);
-        else if (k == "fuel") econ::fuel = (float)n;
+        else if (k == "fuel") continue; // alte Einstellungsdateien: gespeicherter Tankstand wird ignoriert, der Tank startet voll
         else if (k == "money") econ::money = (float)n;
         else if (k == "carcolor") { int r, g, b; carColorSet = sscanf(v.c_str(), "%d,%d,%d", &r, &g, &b) == 3; if (carColorSet) { carColor[0] = (uint8_t)r; carColor[1] = (uint8_t)g; carColor[2] = (uint8_t)b; } }
         else if (k == "automatic") cfg.automatic = n != 0;
@@ -809,7 +810,7 @@ static void buildMenu() {
             next();
         }
         if (nav::active()) {
-            if (item("Navigation beenden")) nav::clear();
+            if (item("Navigation beenden")) { nav::cancel(); closeMenu(); }
             next();
         }
         if (item("Beenden")) running = false;
@@ -1234,8 +1235,7 @@ int main(int argc, char** argv) {
                 else if (keys::is(A_EXIT, k)) { if (foot::on) foot::enterCar(); else foot::exitCar(); }
                 else if (keys::is(A_LOCK, k)) foot::toggleLock();
                 else if (keys::is(A_ACTION, k)) econ::keyJ();
-                else if (keys::is(A_FUELNAV, k)) econ::navToNearest(0);
-                else if (k == SDLK_F5) vr.recenter();
+                else if (keys::is(A_FUELNAV, k)) econ::navToNearest(0);                else if (k == SDLK_F5) vr.recenter();
                 else if (k == SDLK_F1) script.event("key", "f1");
                 else if (k >= SDLK_0 && k <= SDLK_9) { char s[2] = {(char)('0' + (k - SDLK_0)), 0}; script.event("key", s); }
             }

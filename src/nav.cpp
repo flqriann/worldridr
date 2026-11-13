@@ -2,7 +2,9 @@
 #include "game.h"
 #include "net.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <thread>
 
@@ -12,18 +14,20 @@ using json = nlohmann::json;
 typedef std::pair<double, double> LL;
 
 struct Step { double lat = 0, lon = 0; std::string type, mod, name; int exit = 0; float at = 0, len = 0; };
-struct Pending { int id = 0; bool ok = false; std::vector<LL> pts; std::vector<Step> steps; float dist = 0, dur = 0; };
+// air[i] = 1: Segment pts[i] -> pts[i+1] ist Luftlinie (keine Strasse); net = Routendienst war nicht erreichbar (spaeter erneut versuchen)
+struct Pending { int id = 0; bool ok = false, net = false; std::vector<LL> pts; std::vector<char> air; std::vector<Step> steps; float dist = 0, dur = 0; };
 
 std::mutex mx;
 std::vector<Pending> pend;
 std::atomic<int> reqSeq{0};
 int curReq = 0;
 
-bool hasDest = false, routed = false, requesting = false, approx = false;
+bool hasDest = false, routed = false, requesting = false, approx = false, netFail = false; // approx: Route enthaelt Luftlinie
 double dLat = 0, dLon = 0, lastReq = -100;
 std::vector<LL> ll;
+std::vector<char> air;          // je Segment: Luftlinie?
 std::vector<Step> steps;
-std::vector<float> rx, rz, cum;
+std::vector<float> rx, rz, cum, cumAir;   // cumAir: Luftlinien-Laenge bis zum Punkt
 int builtGen = -1, segHint = 0;
 float total = 0, osrmDist = 0, osrmDur = 0, along = 0, offDist = 0, offTimer = 0;
 int zoomIdx = 1;
@@ -44,6 +48,141 @@ std::string fmtDur(float s) {
     return b;
 }
 
+double hav(const LL& a, const LL& b) { // Entfernung in Metern
+    const double R = 6371000.0, d = 3.14159265358979323846 / 180.0;
+    double s1 = std::sin((b.first - a.first) * d / 2), s2 = std::sin((b.second - a.second) * d / 2);
+    double h = s1 * s1 + std::cos(a.first * d) * std::cos(b.first * d) * s2 * s2;
+    return 2 * R * std::asin(std::min(1.0, std::sqrt(h)));
+}
+
+// Ein Routenabschnitt per OSRM. kind: 0 gefunden, 1 keine Route moeglich, 2 Dienst nicht erreichbar.
+// Bei Serverfehlern (Zeitueberschreitung, 429, 5xx) wird mit dem anderen Server erneut versucht.
+struct Piece { int kind = 2; std::vector<LL> pts; std::vector<Step> steps; float dist = 0, dur = 0; };
+
+Piece routePiece(const LL& a, const LL& b, bool limit, int& srv) {
+    static const char* BASE[2] = {"https://router.project-osrm.org/route/v1/driving/", "https://routing.openstreetmap.de/routed-car/route/v1/driving/"};
+    Piece r;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        char url[512];
+        // limit: Start und Ende muessen innerhalb von 2,5 km an einer Strasse liegen, sonst gilt der Abschnitt als nicht routbar
+        snprintf(url, sizeof url, "%s%.6f,%.6f;%.6f,%.6f?overview=full&geometries=geojson&steps=true%s", BASE[srv], a.second, a.first, b.second, b.first,
+                 limit ? "&radiuses=2500;2500" : "");
+        std::vector<uint8_t> out;
+        int st = 0;
+        std::string code;
+        try {
+            if (httpRequest(url, out, st)) {
+                json j = json::parse(out.begin(), out.end(), nullptr, false);
+                if (j.is_object()) {
+                    code = j.value("code", "");
+                    if (code == "Ok" && j.contains("routes") && !j["routes"].empty()) {
+                        const json& rt = j["routes"][0];
+                        r.dist = (float)rt.value("distance", 0.0);
+                        r.dur = (float)rt.value("duration", 0.0);
+                        for (const json& c : rt["geometry"]["coordinates"]) r.pts.push_back({c[1].get<double>(), c[0].get<double>()});
+                        for (const json& leg : rt["legs"])
+                            for (const json& s : leg["steps"]) {
+                                Step q;
+                                const json& m = s["maneuver"];
+                                q.type = m.value("type", "");
+                                q.mod = m.value("modifier", "");
+                                q.exit = m.value("exit", 0);
+                                q.lon = m["location"][0].get<double>();
+                                q.lat = m["location"][1].get<double>();
+                                q.name = s.value("name", "");
+                                q.len = (float)s.value("distance", 0.0);
+                                r.steps.push_back(q);
+                            }
+                        r.kind = r.pts.size() >= 2 ? 0 : 1;
+                        return r;
+                    }
+                }
+            }
+        } catch (...) { code.clear(); r.pts.clear(); r.steps.clear(); }
+        if (!code.empty() && code != "Ok" && st != 429 && st < 500) { r.kind = 1; return r; } // NoRoute / NoSegment: der Server hat geantwortet
+        srv ^= 1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(250 * (attempt + 1)));
+    }
+    r.kind = 2;
+    return r;
+}
+
+// Berechnet die Route. Geht keine durchgehende Route, wird abschnittsweise geroutet: wo es Strassen gibt, echte Route,
+// dazwischen Luftlinie, am Ende wieder echte Route. Feinere Stuetzpunkte nahe Start und Ziel halten die Luftlinie dort kurz.
+Pending computeRoute(int id, double lat, double lon, double tl, double tn) {
+    Pending p;
+    p.id = id;
+    LL start{lat, lon}, dest{tl, tn};
+    int srv = 0;
+    // Test: WR_NAV_SEGMENTED=1 ueberspringt die Gesamtroute und erzwingt die abschnittsweise Berechnung
+    Piece full;
+    if (std::getenv("WR_NAV_SEGMENTED")) full.kind = 1; else full = routePiece(start, dest, false, srv);
+    if (full.kind == 0) {
+        p.ok = true; p.pts = std::move(full.pts); p.steps = std::move(full.steps); p.dist = full.dist; p.dur = full.dur;
+        p.air.assign(p.pts.size() - 1, 0);
+        return p;
+    }
+    if (full.kind == 2) { p.net = true; return p; } // Dienst nicht erreichbar: reine Luftlinie, spaeter erneut versuchen
+    double D = hav(start, dest);
+    if (D < 150) return p;
+    std::vector<double> head, tail, mid;
+    for (double d : {300.0, 1000.0, 3000.0})
+        if (d < D * 0.25) { head.push_back(d); tail.insert(tail.begin(), D - d); }
+    double lo = head.empty() ? 0.0 : head.back(), hi = tail.empty() ? D : tail.front(), span = hi - lo;
+    if (span > 6000) {
+        int cnt = (int)std::ceil(span / std::max(3000.0, span / 10.0));
+        for (int k = 1; k < cnt; k++) mid.push_back(lo + span * k / cnt);
+    }
+    std::vector<double> ds{0.0};
+    ds.insert(ds.end(), head.begin(), head.end());
+    ds.insert(ds.end(), mid.begin(), mid.end());
+    ds.insert(ds.end(), tail.begin(), tail.end());
+    ds.push_back(D);
+    std::vector<LL> W;
+    for (size_t i = 0; i < ds.size(); i++) {
+        double f = ds[i] / D;
+        W.push_back(i == 0 ? start : (i + 1 == ds.size() ? dest : LL{lat + (tl - lat) * f, lon + (tn - lon) * f}));
+    }
+
+    std::vector<LL> pts;
+    std::vector<char> air; // air[i] = Segment pts[i] -> pts[i+1] ist Luftlinie
+    std::vector<Step> steps;
+    bool any = false, lastOk = false;
+    auto push = [&](const LL& q, char a) { if (!pts.empty()) air.push_back(a); pts.push_back(q); };
+    auto airStep = [&](const char* type, const LL& at) { Step s; s.type = type; s.lat = at.first; s.lon = at.second; steps.push_back(s); };
+    for (size_t i = 0; i + 1 < W.size(); i++) {
+        if (i) std::this_thread::sleep_for(std::chrono::milliseconds(250)); // oeffentlicher Dienst: nicht haemmern
+        Piece r = routePiece(W[i], W[i + 1], true, srv);
+        srv ^= 1;
+        lastOk = r.kind == 0;
+        if (r.kind == 2) p.net = true;
+        if (!lastOk) continue;
+        bool firstOk = !any;
+        any = true;
+        p.dist += r.dist; p.dur += r.dur;
+        const LL& first = r.pts.front();
+        if (pts.empty()) {
+            if (hav(start, first) > 40) { airStep("air", start); push(start, 0); push(first, 1); airStep("resume", first); }
+            else push(first, 0);
+        } else {
+            double gap = hav(pts.back(), first);
+            if (gap > 40) { airStep("air", pts.back()); push(first, 1); airStep("resume", first); }
+            else if (gap >= 0.5) push(first, 0);
+        }
+        for (size_t j = 1; j < r.pts.size(); j++) push(r.pts[j], 0);
+        for (const Step& s : r.steps) { // Zwischenziele der Abschnitte sind keine Abbiegehinweise
+            if (s.type == "depart" && !firstOk) continue;
+            if (s.type == "arrive" && i + 2 != W.size()) continue;
+            steps.push_back(s);
+        }
+    }
+    if (!any) return p; // nirgends eine Strasse in der Naehe: reine Luftlinie
+    if (hav(pts.back(), dest) > 40) { airStep("air", pts.back()); push(dest, 1); }
+    p.ok = true; p.pts = std::move(pts); p.air = std::move(air); p.steps = std::move(steps);
+    (void)lastOk;
+    return p;
+}
+
 void requestRoute() {
     double lat, lon;
     gamePosition(lat, lon);
@@ -54,37 +193,10 @@ void requestRoute() {
     double tl = dLat, tn = dLon;
     std::thread([id, lat, lon, tl, tn] {
         Pending p;
-        p.id = id;
-        char url[400];
-        snprintf(url, sizeof url, "https://router.project-osrm.org/route/v1/driving/%.6f,%.6f;%.6f,%.6f?overview=full&geometries=geojson&steps=true", lon, lat, tn, tl);
-        std::vector<uint8_t> out;
-        int st = 0;
-        try {
-            if (httpRequest(url, out, st) && st == 200) {
-                json j = json::parse(out.begin(), out.end(), nullptr, false);
-                if (!j.is_discarded() && j.value("code", "") == "Ok" && j.contains("routes") && !j["routes"].empty()) {
-                    const json& r = j["routes"][0];
-                    p.dist = (float)r.value("distance", 0.0);
-                    p.dur = (float)r.value("duration", 0.0);
-                    for (const json& c : r["geometry"]["coordinates"]) p.pts.push_back({c[1].get<double>(), c[0].get<double>()});
-                    for (const json& leg : r["legs"])
-                        for (const json& s : leg["steps"]) {
-                            Step q;
-                            const json& m = s["maneuver"];
-                            q.type = m.value("type", "");
-                            q.mod = m.value("modifier", "");
-                            q.exit = m.value("exit", 0);
-                            q.lon = m["location"][0].get<double>();
-                            q.lat = m["location"][1].get<double>();
-                            q.name = s.value("name", "");
-                            q.len = (float)s.value("distance", 0.0);
-                            p.steps.push_back(q);
-                        }
-                    p.ok = p.pts.size() >= 2;
-                }
-            }
-        } catch (...) { p.ok = false; }
-        if (!p.ok) logMsg("Routenberechnung fehlgeschlagen (HTTP %d)", st);
+        auto t0 = std::chrono::steady_clock::now();
+        try { p = computeRoute(id, lat, lon, tl, tn); } catch (...) { p = Pending{}; p.id = id; p.net = true; }
+        logMsg("Routenberechnung: %.1f s", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        if (!p.ok) logMsg("Routenberechnung fehlgeschlagen (%s)", p.net ? "Dienst nicht erreichbar" : "keine Route");
         std::lock_guard<std::mutex> lk(mx);
         pend.push_back(std::move(p));
     }).detach();
@@ -93,10 +205,15 @@ void requestRoute() {
 // Route in lokale Koordinaten umrechnen (nach Ortswechsel neu) und Abbiegepunkte auf der Route verorten
 void rebuildLocal() {
     int n = (int)ll.size();
-    rx.resize(n); rz.resize(n); cum.assign(n, 0);
+    rx.resize(n); rz.resize(n); cum.assign(n, 0); cumAir.assign(n, 0);
+    air.resize(n > 0 ? n - 1 : 0, 0);
     for (int i = 0; i < n; i++) {
         world.toLocal(ll[i].first, ll[i].second, rx[i], rz[i]);
-        if (i) cum[i] = cum[i - 1] + std::hypot(rx[i] - rx[i - 1], rz[i] - rz[i - 1]);
+        if (i) {
+            float sl = (float)hav(ll[i - 1], ll[i]); // echte Meter (die lokale Karte ist weit weg vom Ursprung verzerrt)
+            cum[i] = cum[i - 1] + sl;
+            cumAir[i] = cumAir[i - 1] + (air[i - 1] ? sl : 0.0f);
+        }
     }
     total = n ? cum[n - 1] : 0;
     int prev = 0;
@@ -150,6 +267,8 @@ std::string instruction(const Step& s) {
         if (m == "right") return std::string("Rechts ") + verb;
         return "Geradeaus weiter";
     };
+    if (s.type == "air") return "Luftlinie folgen (keine Stra\xC3\x9F" "e)";
+    if (s.type == "resume") return "Wieder der Stra\xC3\x9F" "e folgen";
     if (s.type == "arrive") return m == "left" ? "Ziel liegt links" : (m == "right" ? "Ziel liegt rechts" : "Ziel erreicht");
     if (s.type == "depart") return "Losfahren" + on;
     if (s.type == "roundabout" || s.type == "rotary" || s.type == "roundabout turn" || s.type == "exit roundabout" || s.type == "exit rotary")
@@ -294,12 +413,31 @@ void buildMinimap(float W, float H) {
             }
     // Route
     if (routed && rx.size() >= 2) {
+        const Color airC{255, 150, 40, 255};
+        // Luftlinie: gestrichelt, nur der Teil im Kartenausschnitt (die Segmente koennen hunderte km lang sein)
+        auto airLine = [&](float ax, float az, float bx, float bz, int pass) {
+            float px = playerPos().x, pz = playerPos().z, dx = bx - ax, dz = bz - az;
+            float a2 = dx * dx + dz * dz, b2 = 2 * ((ax - px) * dx + (az - pz) * dz), c2 = (ax - px) * (ax - px) + (az - pz) * (az - pz) - reach * reach;
+            float disc = b2 * b2 - 4 * a2 * c2;
+            if (a2 < 1e-6f || disc < 0) return;
+            float sq = std::sqrt(disc), t0 = std::max(0.0f, (-b2 - sq) / (2 * a2)), t1 = std::min(1.0f, (-b2 + sq) / (2 * a2));
+            if (t0 >= t1) return;
+            float len = std::sqrt(a2) * (t1 - t0), dash = 26.0f / std::sqrt(a2);
+            int cnt = std::min(160, (int)(len / 26.0f));
+            for (int k = 0; k <= cnt; k += 2) {
+                float s0 = t0 + dash * k, s1 = std::min(t1, s0 + dash);
+                if (s0 >= t1) break;
+                if (pass == 0) line(ax + dx * s0, az + dz * s0, ax + dx * s1, az + dz * s1, 8.5f, Color{255, 255, 255, 255});
+                else line(ax + dx * s0, az + dz * s0, ax + dx * s1, az + dz * s1, 5.5f, airC);
+            }
+        };
         for (int pass = 0; pass < 2; pass++)
             for (size_t i = 0; i + 1 < rx.size(); i++) {
                 if (cum[i + 1] < along - 40) continue;
+                if (i < air.size() && air[i]) { airLine(rx[i], rz[i], rx[i + 1], rz[i + 1], pass); continue; }
                 if (std::fabs(rx[i] - playerPos().x) > reach * 1.5f && std::fabs(rx[i + 1] - playerPos().x) > reach * 1.5f) continue;
                 if (pass == 0) line(rx[i], rz[i], rx[i + 1], rz[i + 1], 8.5f, Color{255, 255, 255, 255});
-                else line(rx[i], rz[i], rx[i + 1], rz[i + 1], 5.5f, approx ? Color{255, 170, 60, 255} : Color{38, 132, 255, 255});
+                else line(rx[i], rz[i], rx[i + 1], rz[i + 1], 5.5f, Color{38, 132, 255, 255});
             }
     }
     // Ziel
@@ -363,7 +501,12 @@ void buildBanner(float W) {
         return;
     }
     float remain = std::max(0.0f, total - along);
-    float eta = approx ? remain / 13.0f : (osrmDur > 0 && osrmDist > 0 ? osrmDur * remain / std::max(1.0f, osrmDist) : remain / 13.0f);
+    // Restzeit: Strassenanteil nach der berechneten Fahrzeit, Luftlinie mit 13 m/s (47 km/h)
+    int ci = clampv(segHint, 0, std::max(0, (int)cumAir.size() - 1));
+    float airRemain = cumAir.empty() ? 0.0f : std::max(0.0f, cumAir.back() - cumAir[ci]);
+    float roadRemain = std::max(0.0f, remain - airRemain);
+    float eta = airRemain / 13.0f + (osrmDur > 0 && osrmDist > 0 ? osrmDur * roadRemain / std::max(1.0f, osrmDist) : roadRemain / 13.0f);
+    bool inAir = segHint >= 0 && segHint < (int)air.size() && air[segHint];
     const Step* next = nullptr;
     for (const Step& s : steps)
         if (s.at > along + 4 && s.type != "depart") { next = &s; break; }
@@ -379,8 +522,8 @@ void buildBanner(float W) {
         while (txt.size() > 4 && font.width(txt, 16) > bw - 110) txt.pop_back();
         ui.label(cx - bw / 2 + 96, y + 62, 16, col::white, txt);
     } else {
-        ui.label(cx - bw / 2 + 24, y + 38, 26, col::white, approx ? "Luftlinie zum Ziel" : "Geradeaus weiter");
-        ui.label(cx - bw / 2 + 24, y + 62, 16, col::gray, "Folge der Route");
+        ui.label(cx - bw / 2 + 24, y + 38, 26, col::white, inAir ? "Luftlinie zum Ziel" : "Geradeaus weiter");
+        ui.label(cx - bw / 2 + 24, y + 62, 16, col::gray, inAir ? "Keine Stra\xC3\x9F" "e: der gestrichelten Linie folgen" : "Folge der Route");
     }
     ui.geo.rrect(cx - 150, y + bh + 6, 300, 28, 10, col::dark);
     ui.labelC(cx, y + bh + 25, 15, col::gray, fmtDist(remain) + "  \xC2\xB7  " + fmtDur(eta) + "  \xC2\xB7  Ziel");
@@ -389,18 +532,25 @@ void buildBanner(float W) {
 
 void setDestination(double lat, double lon) {
     hasDest = true; dLat = lat; dLon = lon;
-    routed = false; approx = false; ll.clear(); steps.clear(); rx.clear(); rz.clear(); cum.clear();
+    routed = false; approx = false; netFail = false; ll.clear(); air.clear(); steps.clear(); rx.clear(); rz.clear(); cum.clear(); cumAir.clear();
     segHint = 0; along = 0; offTimer = 0;
     requestRoute();
     hud.msgs.push_back({"Navigation gestartet", 3.0f});
 }
 void clear() {
-    hasDest = false; routed = false; requesting = false; approx = false; curReq = ++reqSeq;
-    ll.clear(); steps.clear(); rx.clear(); rz.clear(); cum.clear();
+    hasDest = false; routed = false; requesting = false; approx = false; netFail = false; curReq = ++reqSeq;
+    ll.clear(); air.clear(); steps.clear(); rx.clear(); rz.clear(); cum.clear(); cumAir.clear();
+}
+void cancel() {
+    if (!hasDest) return;
+    clear();
+    logMsg("Navigation beendet");
+    hud.msgs.push_back({"Navigation beendet", 3.0f});
 }
 bool active() { return hasDest; }
 bool destination(double& lat, double& lon) { lat = dLat; lon = dLon; return hasDest; }
 const std::vector<LL>& routeLatLon() { return ll; }
+const std::vector<char>& routeAir() { return air; }
 void zoomCycle() { zoomIdx = (zoomIdx + 1) % 4; }
 
 void update(float dt) {
@@ -409,20 +559,33 @@ void update(float dt) {
     for (Pending& p : got) {
         if (p.id != curReq || !hasDest) continue;
         requesting = false;
+        netFail = p.net;
         if (p.ok) {
-            ll = std::move(p.pts); steps = std::move(p.steps);
+            ll = std::move(p.pts); air = std::move(p.air); steps = std::move(p.steps);
+            air.resize(ll.size() - 1, 0);
             osrmDist = p.dist; osrmDur = p.dur;
-            routed = true; approx = false;
+            routed = true;
             builtGen = -1;
-            logMsg("Route: %.1f km, %d Hinweise", p.dist / 1000.0f, (int)steps.size());
+            double airM = 0;
+            for (size_t i = 0; i + 1 < ll.size(); i++)
+                if (air[i]) {
+                    airM += hav(ll[i], ll[i + 1]);
+                    logMsg("  Luftlinie %.5f,%.5f -> %.5f,%.5f (%.1f km)", ll[i].first, ll[i].second, ll[i + 1].first, ll[i + 1].second, hav(ll[i], ll[i + 1]) / 1000.0);
+                }
+            bool wasApprox = approx;
+            approx = airM > 0;
+            logMsg("Route: %.1f km Strasse, %.1f km Luftlinie, %d Hinweise", p.dist / 1000.0f, airM / 1000.0, (int)steps.size());
+            if (approx && !wasApprox) hud.msgs.push_back({"Teils ohne Stra\xC3\x9F" "e: " + fmtDist((float)airM) + " Luftlinie (gestrichelt)", 5.0f});
         } else {
             double lat, lon;
             gamePosition(lat, lon);
             ll = {{lat, lon}, {dLat, dLon}};
+            air = {1};
             steps.clear();
+            Step s; s.type = "air"; s.lat = lat; s.lon = lon; steps.push_back(s);
             routed = true; approx = true; osrmDist = osrmDur = 0;
             builtGen = -1;
-            hud.msgs.push_back({"Keine Route gefunden - Luftlinie", 4.0f});
+            hud.msgs.push_back({p.net ? "Routendienst nicht erreichbar - Luftlinie" : "Keine Route gefunden - Luftlinie", 4.0f});
         }
     }
     if (!hasDest || !routed) return;
@@ -436,8 +599,9 @@ void update(float dt) {
         return;
     }
     if (offDist > 40) offTimer += dt; else offTimer = 0;
-    if (!requesting && ((offTimer > 3 && simTime - lastReq > 8) || (approx && simTime - lastReq > 20))) {
-        if (!approx) hud.msgs.push_back({"Route wird neu berechnet", 3.0f});
+    // Neu berechnen: nach Verlassen der Route, oder wenn der Routendienst nicht erreichbar war (Luftlinie ist dann nur ein Notbehelf)
+    if (!requesting && ((offTimer > 3 && simTime - lastReq > 8) || (netFail && simTime - lastReq > 20))) {
+        if (!netFail) hud.msgs.push_back({"Route wird neu berechnet", 3.0f});
         offTimer = 0;
         requestRoute();
     }
@@ -459,6 +623,7 @@ void drawWorld() {
         auto height = [&](float x, float z) { float h; return world.height(x, z, h) ? h : playerPos().y - 0.5f; };
         // Punkte alle ~4 m von knapp hinter dem Auto bis 450 m voraus
         std::vector<Vec3> pts;
+        std::vector<char> pa;   // Punkt liegt auf einem Luftlinien-Segment
         float d = std::max(0.0f, along - 6), end = std::min(total, along + 450);
         int i = std::max(0, segHint - 2);
         while (d <= end && i < n - 1) {
@@ -466,6 +631,7 @@ void drawWorld() {
             float l = cum[i + 1] - cum[i], t = l > 1e-4f ? clampv((d - cum[i]) / l, 0.0f, 1.0f) : 0.0f;
             float x = rx[i] + (rx[i + 1] - rx[i]) * t, z = rz[i] + (rz[i + 1] - rz[i]) * t;
             pts.push_back({x, height(x, z) + 0.14f, z});
+            pa.push_back(i < (int)air.size() && air[i]);
             d += 4.0f;
         }
         for (size_t q = 0; q + 1 < pts.size(); q++) {
@@ -474,6 +640,12 @@ void drawWorld() {
             auto strip = [&](float hw, Color c) {
                 ribbon.quad(a - side * hw, a + side * hw, b + side * hw, b - side * hw, {0, 1, 0}, c);
             };
+            if (pa[q] || pa[q + 1]) { // Luftlinie: orange und gestrichelt
+                if (q % 2) continue;
+                strip(1.25f, Color{255, 140, 30, 130});
+                strip(0.32f, Color{255, 225, 170, 200});
+                continue;
+            }
             strip(1.25f, Color{20, 110, 255, 120});
             strip(0.32f, Color{190, 225, 255, 190});
         }

@@ -186,9 +186,11 @@ void debugSpawnAhead();
 namespace nav {
 void setDestination(double lat, double lon);   // Route vom Auto zum Ziel berechnen (OSRM) und anzeigen
 void clear();
+void cancel();                                 // Navigation abbrechen (mit Meldung): Taste C, Menue, Weltkarte
 bool active();                                 // Ziel gesetzt
 bool destination(double& lat, double& lon);
 const std::vector<std::pair<double, double>>& routeLatLon();  // Routenverlauf (Breite, Laenge)
+const std::vector<char>& routeAir();           // je Segment 1 = Luftlinie (keine Strasse), sonst echte Route
 void update(float dt);
 void buildHUD();                               // Minimap und Abbiegehinweis (in die Oberflaeche)
 void drawWorld();                              // Routenband und Zielmarkierung in der 3D-Welt

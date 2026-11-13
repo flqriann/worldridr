@@ -124,6 +124,7 @@ void open() {
     gamePosition(lat, lon);
     cx = lonToMx(lon); cy = latToMy(lat);
     if (zf < 4) zf = 13;
+    if (const char* z = std::getenv("WR_MAPZOOM")) zf = clampv((float)atof(z), 1.5f, 18.0f); // nur fuer Tests
     hasMark = false;
 }
 
@@ -158,6 +159,7 @@ void buildUI() {
     x += 158;
     if (ui.button(x, 9, 44, 32, "+")) zf = std::min(18.0f, zf + 1);
     if (ui.button(x + 50, 9, 44, 32, "-")) zf = std::max(1.5f, zf - 1);
+    if (nav::active() && ui.button(x + 102, 9, 176, 32, "Navigation beenden", false, 15)) nav::cancel();
     if (ui.button(W - 124, 9, 110, 32, "Schlie\xC3\x9F" "en")) { close(); return; }
     double m_x, m_y;
     fromScreen(ui.mx, ui.my, m_x, m_y);
@@ -191,6 +193,7 @@ void buildUI() {
     if (sy > TOP + 8) marker(sx, sy, Color{60, 140, 255, 255}, "Du");
     if (nav::active()) { // Route und Ziel der Navigation
         const auto& rt = nav::routeLatLon();
+        const auto& ra = nav::routeAir();
         for (int pass = 0; pass < 2; pass++)
             for (size_t i = 0; i + 1 < rt.size(); i++) {
                 float ax, ay, bx, by;
@@ -199,9 +202,32 @@ void buildUI() {
                 if ((ax < -50 && bx < -50) || (ax > ui.W + 50 && bx > ui.W + 50) || (ay < TOP - 50 && by < TOP - 50) || (ay > ui.H + 50 && by > ui.H + 50)) continue;
                 float dx = bx - ax, dy = by - ay, l = std::hypot(dx, dy);
                 if (l < 0.01f) continue;
+                bool air = i < ra.size() && ra[i];
                 float w = (pass == 0 ? 7.0f : 4.0f) * 0.5f, nx = -dy / l * w, ny = dx / l * w;
-                Color c = pass == 0 ? Color{255, 255, 255, 235} : Color{38, 132, 255, 255};
-                ui.geo.quad({ax - nx, ay - ny, 0}, {ax + nx, ay + ny, 0}, {bx + nx, by + ny, 0}, {bx - nx, by - ny, 0}, {0, 0, 1}, c);
+                Color c = pass == 0 ? Color{255, 255, 255, 235} : (air ? Color{255, 150, 40, 255} : Color{38, 132, 255, 255});
+                if (!air) { ui.geo.quad({ax - nx, ay - ny, 0}, {ax + nx, ay + ny, 0}, {bx + nx, by + ny, 0}, {bx - nx, by - ny, 0}, {0, 0, 1}, c); continue; }
+                // Luftlinie: gestrichelt (nur der sichtbare Bildschirmbereich wird gezeichnet, Segmente koennen sehr lang sein)
+                float ux = dx / l, uy = dy / l, s0 = 0, s1 = l;
+                if (l > 4000) { // grob auf den Bildschirm kuerzen
+                    float tmin = 0, tmax = 1;
+                    auto clipAxis = [&](float p0, float d, float lo, float hi) {
+                        if (std::fabs(d) < 1e-4f) { if (p0 < lo || p0 > hi) tmax = -1; return; }
+                        float ta = (lo - p0) / d, tb = (hi - p0) / d;
+                        if (ta > tb) std::swap(ta, tb);
+                        tmin = std::max(tmin, ta); tmax = std::min(tmax, tb);
+                    };
+                    clipAxis(ax, dx, -20, ui.W + 20); clipAxis(ay, dy, TOP, ui.H + 20);
+                    if (tmin >= tmax) continue;
+                    s0 = tmin * l; s1 = tmax * l;
+                }
+                int cnt = 0;
+                for (float s = s0; s < s1 && cnt < 500; s += 14.0f, cnt++) {
+                    if (cnt % 2) continue;
+                    float e = std::min(s1, s + 8.0f);
+                    float x0 = ax + ux * s, y0 = ay + uy * s, x1 = ax + ux * e, y1 = ay + uy * e;
+                    if (y0 < TOP + 2 || y1 < TOP + 2) continue; // nicht in die Werkzeugleiste zeichnen
+                    ui.geo.quad({x0 - nx, y0 - ny, 0}, {x0 + nx, y0 + ny, 0}, {x1 + nx, y1 + ny, 0}, {x1 - nx, y1 - ny, 0}, {0, 0, 1}, c);
+                }
             }
         double dl, dn;
         nav::destination(dl, dn);

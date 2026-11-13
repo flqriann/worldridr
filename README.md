@@ -50,7 +50,15 @@ Unten rechts zeigt eine **Minimap** (Fahrtrichtung oben, Straßen nach Klasse ei
 Zoom um (150 m, 300 m, 700 m, aus). In der Weltkarte (**M**) einen Ort anklicken und **Navigation** wählen (oder nach einem Ort
 suchen): die Route wird über OSRM (OpenStreetMap-Routing) berechnet und als blaues Band auf der Straße, in der Minimap und in
 der Weltkarte angezeigt. Oben erscheinen Abbiegehinweis mit Entfernung, Restweg und Ankunftszeit; verlässt du die Route, wird
-automatisch neu berechnet. Beenden: Esc-Menü → „Navigation beenden“. Ohne Internet gibt es nur eine Luftlinie zum Ziel.
+automatisch neu berechnet. **Beenden jederzeit, ohne das Ziel zu erreichen:** Knopf „Navigation beenden“ in der Weltkarte (**M**)
+oder Esc-Menü → „Navigation beenden“.
+
+**Wenn keine durchgehende Route möglich ist** (Meer, abgeschnittenes Straßennetz, Ziel ohne Straße in der Nähe), wird abschnittsweise
+geroutet: wo es Straßen gibt, echte Route (blau), dazwischen **Luftlinie (orange, gestrichelt** in Minimap, Weltkarte und im 3D-Band),
+am Ende wieder echte Route. Nahe Start und Ziel wird feiner geprüft, damit die Luftlinie dort kurz bleibt. Streckenlänge und Ankunftszeit
+rechnen Straße (nach Routenzeit) und Luftlinie (47 km/h) getrennt. Bei Serverproblemen wird automatisch ein zweiter Routing-Server
+(routing.openstreetmap.de) probiert; ist gar kein Dienst erreichbar, gibt es nur eine Luftlinie und alle 20 s einen neuen Versuch.
+Zum Testen erzwingt die Umgebungsvariable `WR_NAV_SEGMENTED=1` die abschnittsweise Berechnung.
 Zum Testen: `run.bat --dest 48.2085 16.3721`.
 
 ## Autos als .obj
@@ -124,7 +132,7 @@ auf Bremse, Blinker, Licht und Rückwärtsgang. Das Fußgängermodell liegt in `
 ## Tank, Tankstellen, Supermärkte, Moped und Motorrad
 
 - **Tank und Geld:** Der Tank leert sich mit der Fahrt (Anzeige: Balken im Display bzw. unter dem Tempo, rot bei wenig Sprit); bei leerem Tank
-  geht der Motor aus. **K** navigiert zur nächsten Tankstelle. Tankstand und Geld werden gespeichert.
+  geht der Motor aus. **K** navigiert zur nächsten Tankstelle. Jede Fahrt beginnt mit **vollem Tank**; nur das Geld wird gespeichert.
 - **Tankstellen** (aus OpenStreetMap, mit Dach, Zapfsäulen und Markenfarbe): anhalten, Motor aus (I), **J** zum Tanken, bezahlt wird pro Liter.
 - **Supermärkte** (Werbesäule in Markenfarbe): anhalten und **J** nimmt einen **Lieferauftrag** an. Das Ziel liegt 1,2–2,8 km entfernt, die
   Navigation startet automatisch. Bezahlt wird nach Strecke, Pünktlichkeit und Fahrstil (Unfälle ziehen ab); davon bezahlst du den Sprit.
