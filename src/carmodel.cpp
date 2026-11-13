@@ -1,7 +1,10 @@
 // Automodell: geloftete Karosserie, Raeder mit Felgen, Innenraum und analoges 3D-Armaturenbrett
 #include "game.h"
+#include "stb_image.h"
+#include <cstring>
+#include <filesystem>
 
-const Vec3 EYE{-0.36f, 0.60f, 0.22f};
+Vec3 EYE{-0.36f, 0.60f, 0.22f};
 const Vec3 MIRROR_POS[3] = {{-1.0f, 0.36f, -0.78f}, {0.0f, 0.745f, -0.20f}, {1.0f, 0.36f, -0.78f}};
 const float MIRROR_HW[3] = {0.105f, 0.12f, 0.105f}, MIRROR_HH[3] = {0.065f, 0.034f, 0.065f};
 
@@ -204,10 +207,619 @@ static void buildInterior() {
     mDashText.create(t.v.data(), (int)t.v.size());
 }
 
+// ---------- .obj-Autos (assets/cars) ----------
+namespace {
+struct LampTri { Vec3 p[3]; Vec3 n; int kind; float x, z; };
+struct ObjCar {
+    std::string name;
+    bool tried = false, ok = false, hasWheels = false, hasPaint = false, hasLamps = false;
+    int tris = 0;
+    std::vector<LampTri> lamps;   // Leuchtflaechen (Brems-, Blink-, Rueckfahr-, Scheinwerferlicht)
+    Mesh paint, body, wheel[4];   // Karosserie-Lack (einfaerbbar), Rest, Raeder (VL, VR, HL, HR)
+    Vec3 wc[4];                   // Radmittelpunkte
+    Vec3 lo, hi;                  // Abmessungen im Autokoordinatensystem (Vorwaerts = -z, Boden = -0.525)
+    Color ref{176, 28, 34, 255};  // Originalfarbe des Lacks
+};
+std::vector<ObjCar> objCars;
+
+void rgbToHsv(Color c, float& h, float& s, float& v) {
+    float r = c.r / 255.0f, g = c.g / 255.0f, b = c.b / 255.0f, mx = std::max(r, std::max(g, b)), mn = std::min(r, std::min(g, b)), d = mx - mn;
+    v = mx; s = mx > 1e-4f ? d / mx : 0; h = 0;
+    if (d < 1e-4f) return;
+    if (mx == r) h = std::fmod((g - b) / d + 6.0f, 6.0f); else if (mx == g) h = (b - r) / d + 2; else h = (r - g) / d + 4;
+    h *= 60.0f;
+}
+
+float targetLength(const std::string& n) {
+    if (n.find("delivery") != std::string::npos) return 5.6f;
+    if (n.find("suv-luxury") != std::string::npos) return 4.9f;
+    if (n.find("suv") != std::string::npos) return 4.6f;
+    if (n.find("hatchback") != std::string::npos) return 4.0f;
+    return 4.5f;
+}
+
+struct FaceV { int v = 0, t = 0, n = 0; };
+struct Face { int g, mat; FaceV a[3]; };
+struct MatInfo { std::string name; bool hasKd = false, useTex = false; Color kd{200, 200, 200, 255}; };
+
+std::string lower(std::string s) { for (char& c : s) c = (char)tolower((unsigned char)c); return s; }
+bool has(const std::string& s, const char* w) { return s.find(w) != std::string::npos; }
+
+// Farbe eines Materials ohne .mtl-Datei: aus dem Namen abgeleitet (crimson_paint, dark_grey, tire_black ...)
+Color colorFromName(const std::string& nameIn) {
+    std::string n = lower(nameIn);
+    if (has(n, "paint") || has(n, "body")) {
+        if (has(n, "blue") || has(n, "navy")) return {40, 90, 190, 255};
+        if (has(n, "green")) return {40, 140, 80, 255};
+        if (has(n, "yellow")) return {235, 190, 30, 255};
+        if (has(n, "orange")) return {230, 110, 30, 255};
+        if (has(n, "white")) return {235, 235, 238, 255};
+        if (has(n, "black")) return {28, 30, 34, 255};
+        if (has(n, "silver") || has(n, "grey") || has(n, "gray")) return {160, 164, 172, 255};
+        return {190, 30, 40, 255}; // crimson, red, ...
+    }
+    if (has(n, "emissive") || has(n, "lamp") || has(n, "light")) {
+        if (has(n, "ruby") || has(n, "red")) return {200, 24, 22, 255};
+        if (has(n, "amber") || has(n, "orange") || has(n, "indicator")) return {255, 170, 30, 255};
+        return {240, 242, 246, 255};
+    }
+    if (has(n, "lens") || has(n, "headlight")) return {235, 240, 246, 255};
+    if (has(n, "glass") || has(n, "window")) return {52, 72, 92, 255};
+    if (has(n, "tire") || has(n, "tyre") || has(n, "rubber")) return {22, 22, 24, 255};
+    if (has(n, "rim") || has(n, "alloy") || has(n, "chrome") || has(n, "hub") || has(n, "spoke") || has(n, "metal")) return {176, 180, 188, 255};
+    if (has(n, "caliper") || has(n, "gold") || has(n, "brass")) return {212, 170, 56, 255};
+    if (has(n, "plate") || has(n, "white")) return {236, 236, 238, 255};
+    if (has(n, "dark") || has(n, "black") || has(n, "trim") || has(n, "plastic")) return {38, 39, 42, 255};
+    if (has(n, "grey") || has(n, "gray")) return {110, 112, 118, 255};
+    return {190, 190, 190, 255};
+}
+// 1 Rueck-/Bremslicht, 2 Blinker, 3 weisses Licht (Rueckfahr-/Tagfahrlicht), 4 Scheinwerfer
+int lampKind(const std::string& nameIn) {
+    std::string n = lower(nameIn);
+    if (has(n, "emissive") || has(n, "lamp")) {
+        if (has(n, "ruby") || has(n, "red") || has(n, "brake") || has(n, "tail")) return 1;
+        if (has(n, "amber") || has(n, "orange") || has(n, "indicator") || has(n, "blink")) return 2;
+        return 3;
+    }
+    if (has(n, "headlight") && has(n, "lens")) return 4;
+    return 0;
+}
+// Zu welchem Rad gehoert eine Gruppe? 0 VL, 1 VR, 2 HL, 3 HR, -1 keins. Teile wie tire_FL, rim_FL, spoke0_FL oder wheel-front-left.
+int wheelCorner(const std::string& nameIn) {
+    std::string n = lower(nameIn);
+    if (!(has(n, "tire") || has(n, "tyre") || has(n, "rim") || has(n, "hub") || has(n, "spoke") || has(n, "caliper") || has(n, "wheel") || has(n, "brake_disc"))) return -1;
+    bool fr = false, bk = false, lf = false, rt = false;
+    if (has(n, "front")) fr = true;
+    if (has(n, "back") || has(n, "rear")) bk = true;
+    if (has(n, "left")) lf = true;
+    if (has(n, "right")) rt = true;
+    size_t us = n.find_last_of("_-");
+    std::string suf = us == std::string::npos ? "" : n.substr(us + 1);
+    if (suf.size() == 2 && (suf[0] == 'f' || suf[0] == 'r' || suf[0] == 'b') && (suf[1] == 'l' || suf[1] == 'r')) {
+        fr = suf[0] == 'f'; bk = !fr; lf = suf[1] == 'l'; rt = !lf;
+    }
+    if ((fr == bk) || (lf == rt)) return -1;
+    return (fr ? 0 : 2) + (lf ? 0 : 1);
+}
+
+bool loadObjCar(ObjCar& m) {
+    std::string path = "assets/cars/" + m.name + ".obj";
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::string text;
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) text.append(buf, n);
+    fclose(f);
+
+    std::vector<Vec3> P, N, VC;
+    std::vector<float> U, V;
+    std::vector<std::string> groups;
+    std::vector<MatInfo> mats;
+    std::vector<Face> faces;
+    std::string mtl;
+    int cur = -1, curMat = -1;
+    auto matIndex = [&](const std::string& nm) {
+        for (size_t i = 0; i < mats.size(); i++) if (mats[i].name == nm) return (int)i;
+        MatInfo mi;
+        mi.name = nm;
+        mats.push_back(mi);
+        return (int)mats.size() - 1;
+    };
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t e = text.find('\n', pos);
+        if (e == std::string::npos) e = text.size();
+        std::string line = text.substr(pos, e - pos);
+        pos = e + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.size() < 2) continue;
+        const char* s = line.c_str();
+        if (!strncmp(s, "v ", 2)) {
+            float x, y, z, r = 1, g = 1, b = 1;
+            int k = sscanf(s + 2, "%f %f %f %f %f %f", &x, &y, &z, &r, &g, &b);
+            if (k >= 3) { P.push_back({x, y, z}); VC.push_back(k >= 6 ? Vec3{r, g, b} : Vec3{1, 1, 1}); }
+        } else if (!strncmp(s, "vn ", 3)) { float x, y, z; if (sscanf(s + 3, "%f %f %f", &x, &y, &z) == 3) N.push_back({x, y, z}); }
+        else if (!strncmp(s, "vt ", 3)) { float u, v; if (sscanf(s + 3, "%f %f", &u, &v) == 2) { U.push_back(u); V.push_back(v); } }
+        else if (!strncmp(s, "mtllib ", 7)) mtl = s + 7;
+        else if (!strncmp(s, "usemtl ", 7)) curMat = matIndex(s + 7);
+        else if (!strncmp(s, "g ", 2) || !strncmp(s, "o ", 2)) { groups.push_back(s + 2); cur = (int)groups.size() - 1; }
+        else if (!strncmp(s, "f ", 2)) {
+            std::vector<FaceV> fv;
+            const char* p = s + 2;
+            while (*p) {
+                while (*p == ' ') p++;
+                if (!*p) break;
+                FaceV q;
+                char* end;
+                q.v = (int)strtol(p, &end, 10); p = end;
+                if (*p == '/') { p++; if (*p != '/') { q.t = (int)strtol(p, &end, 10); p = end; } if (*p == '/') { p++; q.n = (int)strtol(p, &end, 10); p = end; } }
+                if (q.v < 0) q.v = (int)P.size() + q.v + 1;
+                if (q.t < 0) q.t = (int)U.size() + q.t + 1;
+                if (q.n < 0) q.n = (int)N.size() + q.n + 1;
+                if (q.v >= 1 && q.v <= (int)P.size()) fv.push_back(q);
+                while (*p && *p != ' ') p++;
+            }
+            if (cur < 0) { groups.push_back("body"); cur = 0; }
+            for (size_t k = 1; k + 1 < fv.size(); k++) faces.push_back({cur, curMat, {fv[0], fv[k], fv[k + 1]}});
+        }
+    }
+    if (faces.empty()) return false;
+
+    // .mtl (falls vorhanden): Kd-Farben und eine Farbtextur
+    std::vector<uint8_t> tex;
+    int tw = 0, th = 0;
+    if (!mtl.empty()) {
+        FILE* mf = fopen(("assets/cars/" + mtl).c_str(), "rb");
+        if (mf) {
+            std::string mt;
+            while ((n = fread(buf, 1, sizeof buf, mf)) > 0) mt.append(buf, n);
+            fclose(mf);
+            size_t mp = 0;
+            int mc = -1;
+            while (mp < mt.size()) {
+                size_t e = mt.find('\n', mp);
+                if (e == std::string::npos) e = mt.size();
+                std::string l = mt.substr(mp, e - mp);
+                mp = e + 1;
+                while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back();
+                if (!strncmp(l.c_str(), "newmtl ", 7)) mc = matIndex(l.substr(7));
+                else if (mc >= 0 && !strncmp(l.c_str(), "Kd ", 3)) {
+                    float r, g, b;
+                    if (sscanf(l.c_str() + 3, "%f %f %f", &r, &g, &b) == 3) { mats[mc].hasKd = true; mats[mc].kd = Color{(uint8_t)clampv(r * 255, 0.0f, 255.0f), (uint8_t)clampv(g * 255, 0.0f, 255.0f), (uint8_t)clampv(b * 255, 0.0f, 255.0f), 255}; }
+                } else if (mc >= 0 && !strncmp(l.c_str(), "map_Kd ", 7) && tex.empty()) {
+                    int c;
+                    uint8_t* px = stbi_load(("assets/cars/" + l.substr(7)).c_str(), &tw, &th, &c, 3);
+                    if (px) { tex.assign(px, px + (size_t)tw * th * 3); stbi_image_free(px); mats[mc].useTex = true; }
+                } else if (mc >= 0 && !strncmp(l.c_str(), "map_Kd ", 7)) mats[mc].useTex = !tex.empty();
+            }
+        }
+    }
+
+    // Raeder: Gruppen, die zu einer Radecke gehoeren (mehrere Teile pro Rad moeglich)
+    std::vector<int> corner(groups.size(), -1);
+    std::vector<Vec3> gsum(groups.size());
+    std::vector<int> gcnt(groups.size());
+    for (size_t g = 0; g < groups.size(); g++) corner[g] = wheelCorner(groups[g]);
+    for (const Face& fc : faces)
+        for (const FaceV& q : fc.a) { gsum[fc.g] += P[q.v - 1]; gcnt[fc.g]++; }
+    Vec3 F{0, 0, -1};
+    {
+        Vec3 fr{}, bk{};
+        int nf = 0, nb = 0;
+        for (size_t g = 0; g < groups.size(); g++) {
+            if (corner[g] < 0 || !gcnt[g]) continue;
+            Vec3 c = gsum[g] * (1.0f / gcnt[g]);
+            if (corner[g] < 2) { fr += c; nf++; } else { bk += c; nb++; }
+        }
+        if (nf && nb) {
+            Vec3 d = fr * (1.0f / nf) - bk * (1.0f / nb);
+            d.y = 0;
+            if (length(d) > 1e-4f) F = normalize(d);
+        }
+    }
+    Vec3 R = cross(F, Vec3{0, 1, 0});
+    auto toCar = [&](Vec3 p) { return Vec3{dot(p, R), p.y, -dot(p, F)}; };
+    auto toCarN = [&](Vec3 p) { return normalize(Vec3{dot(p, R), p.y, -dot(p, F)}); };
+
+    Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f};
+    for (const Vec3& p : P) {
+        Vec3 c = toCar(p);
+        lo = {std::min(lo.x, c.x), std::min(lo.y, c.y), std::min(lo.z, c.z)};
+        hi = {std::max(hi.x, c.x), std::max(hi.y, c.y), std::max(hi.z, c.z)};
+    }
+    float s = targetLength(m.name) / std::max(0.01f, hi.z - lo.z);
+    // Spielzeugproportionen (breit/hoch im Verhaeltnis zur Laenge) werden gestaucht, realistische Modelle bleiben unveraendert
+    float aspect = (hi.x - lo.x) / std::max(0.01f, hi.z - lo.z), hasp = (hi.y - lo.y) / std::max(0.01f, hi.z - lo.z);
+    const float sx = s * clampv(0.42f / std::max(0.01f, aspect), 0.65f, 1.0f), sy = s * clampv(0.34f / std::max(0.01f, hasp), 0.65f, 1.0f);
+    float zc = (lo.z + hi.z) * 0.5f, xc = (lo.x + hi.x) * 0.5f;
+    auto place = [&](Vec3 c) { return Vec3{(c.x - xc) * sx, (c.y - lo.y) * sy - 0.525f, (c.z - zc) * s + 0.14f}; };
+
+    // Radmittelpunkte: Mitte des Begrenzungsquaders aller Teile eines Rades (im Autokoordinatensystem)
+    Vec3 wlo[4], whi[4];
+    bool wany[4] = {false, false, false, false};
+    for (int i = 0; i < 4; i++) { wlo[i] = {1e9f, 1e9f, 1e9f}; whi[i] = {-1e9f, -1e9f, -1e9f}; }
+    for (const Face& fc : faces) {
+        int k = corner[fc.g];
+        if (k < 0) continue;
+        wany[k] = true;
+        for (const FaceV& q : fc.a) {
+            Vec3 c = toCar(P[q.v - 1]);
+            wlo[k] = {std::min(wlo[k].x, c.x), std::min(wlo[k].y, c.y), std::min(wlo[k].z, c.z)};
+            whi[k] = {std::max(whi[k].x, c.x), std::max(whi[k].y, c.y), std::max(whi[k].z, c.z)};
+        }
+    }
+    bool wheelsOk = wany[0] && wany[1] && wany[2] && wany[3];
+    Vec3 wctr[4];
+    for (int i = 0; i < 4; i++) { wctr[i] = (wlo[i] + whi[i]) * 0.5f; if (wheelsOk) m.wc[i] = place(wctr[i]); }
+
+    // Farben je Dreieck: Textur, Kd oder Materialname
+    auto sampleColor = [&](const Face& fc) {
+        const MatInfo* mi = fc.mat >= 0 ? &mats[fc.mat] : nullptr;
+        if (mi && mi->useTex && !tex.empty()) {
+            float u = 0, v = 0; int k = 0;
+            for (const FaceV& q : fc.a) if (q.t >= 1 && q.t <= (int)U.size()) { u += U[q.t - 1]; v += V[q.t - 1]; k++; }
+            if (k) {
+                u /= k; v /= k;
+                int px = clampv((int)std::floor((u - std::floor(u)) * tw), 0, tw - 1), py = clampv((int)std::floor((1.0f - (v - std::floor(v))) * th), 0, th - 1);
+                const uint8_t* t = &tex[((size_t)py * tw + px) * 3];
+                return Color{t[0], t[1], t[2], 255};
+            }
+        }
+        if (mi && mi->hasKd) return mi->kd;
+        Vec3 vc{};
+        for (const FaceV& q : fc.a) vc += VC[q.v - 1];
+        vc = vc * (1.0f / 3);
+        if (mi && vc.x > 0.97f && vc.y > 0.97f && vc.z > 0.97f) return colorFromName(mi->name); // keine Farbinformation: nach dem Namen
+        if (!mi) return Color{200, 200, 200, 255};
+        return Color{(uint8_t)(vc.x * 255), (uint8_t)(vc.y * 255), (uint8_t)(vc.z * 255), 255};
+    };
+    std::vector<Color> fcol(faces.size());
+    std::vector<char> isPaint(faces.size(), 0);
+    bool namedPaint = false;
+    for (size_t i = 0; i < faces.size(); i++) {
+        fcol[i] = sampleColor(faces[i]);
+        if (faces[i].mat >= 0 && has(lower(mats[faces[i].mat].name), "paint")) { isPaint[i] = 1; namedPaint = true; }
+    }
+    if (namedPaint) { // Material heisst "...paint": das ist der einfaerbbare Lack
+        float sr = 0, sg = 0, sb = 0, sw = 0;
+        for (size_t i = 0; i < faces.size(); i++) {
+            if (!isPaint[i]) continue;
+            Vec3 a = P[faces[i].a[0].v - 1], b = P[faces[i].a[1].v - 1], c = P[faces[i].a[2].v - 1];
+            float area = length(cross(b - a, c - a)) * 0.5f + 1e-6f;
+            sr += fcol[i].r * area; sg += fcol[i].g * area; sb += fcol[i].b * area; sw += area;
+        }
+        if (sw > 0) { m.ref = Color{(uint8_t)(sr / sw), (uint8_t)(sg / sw), (uint8_t)(sb / sw), 255}; m.hasPaint = true; }
+    } else { // sonst: haeufigster gesaettigter Farbton der Karosserie
+        float hueW[24] = {}, total = 0;
+        for (size_t i = 0; i < faces.size(); i++) {
+            const Face& fc = faces[i];
+            if (corner[fc.g] >= 0) continue;
+            Vec3 a = P[fc.a[0].v - 1], b = P[fc.a[1].v - 1], c = P[fc.a[2].v - 1];
+            float area = length(cross(b - a, c - a)) * 0.5f, h, sa, va;
+            rgbToHsv(fcol[i], h, sa, va);
+            total += area;
+            if (sa > 0.35f && va > 0.25f) hueW[(int)(h / 15.0f) % 24] += area;
+        }
+        int best = 0;
+        for (int i = 1; i < 24; i++) if (hueW[i] > hueW[best]) best = i;
+        float bestH = best * 15.0f + 7.5f;
+        if (total > 0 && hueW[best] > total * 0.08f) {
+            float sr = 0, sg = 0, sb = 0, sw = 0;
+            for (size_t i = 0; i < faces.size(); i++) {
+                const Face& fc = faces[i];
+                if (corner[fc.g] >= 0) continue;
+                float h, sa, va;
+                rgbToHsv(fcol[i], h, sa, va);
+                float dh = std::fabs(h - bestH);
+                if (dh > 180) dh = 360 - dh;
+                if (sa > 0.3f && va > 0.25f && dh < 22) {
+                    isPaint[i] = 1;
+                    Vec3 a = P[fc.a[0].v - 1], b = P[fc.a[1].v - 1], c = P[fc.a[2].v - 1];
+                    float area = length(cross(b - a, c - a)) * 0.5f;
+                    sr += fcol[i].r * area; sg += fcol[i].g * area; sb += fcol[i].b * area; sw += area;
+                }
+            }
+            if (sw > 0) { m.ref = Color{(uint8_t)(sr / sw), (uint8_t)(sg / sw), (uint8_t)(sb / sw), 255}; m.hasPaint = true; }
+        }
+    }
+
+    Batch paint, body, wheel[4];
+    m.lamps.clear();
+    for (size_t i = 0; i < faces.size(); i++) {
+        const Face& fc = faces[i];
+        int k = corner[fc.g];
+        Batch* dst = &body;
+        bool inWheel = k >= 0 && wheelsOk;
+        if (inWheel) dst = &wheel[k];
+        else if (isPaint[i] && m.hasPaint) dst = &paint;
+        Color c = fcol[i];
+        if (dst == &paint) {
+            c = Color{(uint8_t)std::min(255.0f, c.r / (m.ref.r * 1.4f + 1.0f) * 255.0f), (uint8_t)std::min(255.0f, c.g / (m.ref.g * 1.4f + 1.0f) * 255.0f),
+                      (uint8_t)std::min(255.0f, c.b / (m.ref.b * 1.4f + 1.0f) * 255.0f), 255};
+        }
+        Vec3 pp[3];
+        for (int q = 0; q < 3; q++) {
+            Vec3 cc = toCar(P[fc.a[q].v - 1]);
+            if (inWheel) { // Rad: um den eigenen Mittelpunkt skalieren, damit es sich sauber dreht
+                Vec3 d = cc - wctr[k];
+                pp[q] = place(wctr[k]) + Vec3{d.x * sx, d.y * sy, d.z * sy};
+            } else pp[q] = place(cc);
+        }
+        Vec3 flat = normalize(cross(pp[1] - pp[0], pp[2] - pp[0]));
+        int lk = fc.mat >= 0 && !inWheel ? lampKind(mats[fc.mat].name) : 0;
+        if (lk > 0) { // Leuchten werden zur Laufzeit je nach Zustand eingefaerbt
+            LampTri lt;
+            for (int q = 0; q < 3; q++) lt.p[q] = pp[q];
+            lt.n = flat; lt.kind = lk;
+            lt.x = (pp[0].x + pp[1].x + pp[2].x) / 3; lt.z = (pp[0].z + pp[1].z + pp[2].z) / 3;
+            m.lamps.push_back(lt);
+            continue;
+        }
+        for (int q = 0; q < 3; q++) {
+            Vec3 nn = fc.a[q].n >= 1 && fc.a[q].n <= (int)N.size() ? toCarN(N[fc.a[q].n - 1]) : flat;
+            dst->vert(pp[q], nn, 0, 0, c);
+        }
+    }
+    m.paint.create(paint.v.data(), (int)paint.v.size());
+    m.body.create(body.v.data(), (int)body.v.size());
+    for (int i = 0; i < 4; i++) m.wheel[i].create(wheel[i].v.data(), (int)wheel[i].v.size());
+    m.hasWheels = wheelsOk;
+    m.hasLamps = !m.lamps.empty();
+    m.tris = (int)faces.size();
+    m.lo = place(lo); m.hi = place(hi);
+    float x0 = (lo.x - xc) * sx, x1 = (hi.x - xc) * sx;
+    m.lo.x = x0; m.hi.x = x1;
+    logMsg("Auto-Modell %s: %d Dreiecke, %.2f x %.2f x %.2f m, Raeder: %s, Lack: %s, Leuchten: %d", m.name.c_str(), (int)faces.size(), x1 - x0, m.hi.y - m.lo.y, m.hi.z - m.lo.z,
+           m.hasWheels ? "ja" : "nein", m.hasPaint ? "ja" : "nein", (int)m.lamps.size());
+    return true;
+}
+
+ObjCar* objCarAt(int i) {
+    if (i < 0 || i >= (int)objCars.size()) return nullptr;
+    ObjCar& m = objCars[i];
+    if (!m.tried) { m.tried = true; m.ok = loadObjCar(m); if (!m.ok) logMsg("Auto-Modell %s konnte nicht geladen werden", m.name.c_str()); }
+    return m.ok ? &m : nullptr;
+}
+
+void scanCars() {
+    objCars.clear();
+    std::error_code ec;
+    std::vector<std::string> names;
+    for (auto& e : std::filesystem::directory_iterator("assets/cars", ec))
+        if (e.path().extension() == ".obj") names.push_back(e.path().stem().string());
+    std::sort(names.begin(), names.end());
+    for (auto& n : names) { ObjCar c; c.name = n; objCars.push_back(std::move(c)); }
+    carModelSel = -1;
+    if (cfg.carModel == "builtin") return;
+    for (int i = 0; i < (int)objCars.size(); i++) if (objCars[i].name == cfg.carModel) carModelSel = i;
+    if (carModelSel < 0 && !objCars.empty()) carModelSel = 0;
+}
+} // namespace
+
+int carModelSel = -1;
+int carModelCount() { return (int)objCars.size(); }
+const std::string& carModelName(int i) { static const std::string builtin = "Eigenbau"; return i >= 0 && i < (int)objCars.size() ? objCars[i].name : builtin; }
+int carModelFind(const std::string& name) { for (int i = 0; i < (int)objCars.size(); i++) if (objCars[i].name == name) return i; return -1; }
+void carModelCycle() { carModelSel++; if (carModelSel >= (int)objCars.size()) carModelSel = -1; }
+
+static void drawObjCar(const CarVisual& v, const Mat4& vp, ObjCar& m) {
+    gfxMVP(vp);
+    gfxBias(0);
+    float hw = std::max(std::fabs(m.lo.x), std::fabs(m.hi.x));
+    shadow.clear();
+    { float sw = hw * 0.92f; shadow.quad({-sw, -0.525f, m.lo.z + 0.1f}, {sw, -0.525f, m.lo.z + 0.1f}, {sw, -0.525f, m.hi.z - 0.1f}, {-sw, -0.525f, m.hi.z - 0.1f}, {0, 1, 0}, Color{0, 0, 0, 70}); }
+    gfxModel(v.M);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    gfxMode(0, 0);
+    shadow.draw();
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+
+    if (m.hasPaint) {
+        gfxMode(0, FLAG_LIT | FLAG_FOG | FLAG_GLOSS);
+        Color p = v.tinted ? v.paint : m.ref;
+        gfxTint(p.r / 255.0f * 1.4f, p.g / 255.0f * 1.4f, p.b / 255.0f * 1.4f);
+        m.paint.draw();
+    }
+    gfxMode(0, FLAG_LIT | FLAG_FOG);
+    m.body.draw();
+    if (m.hasWheels)
+        for (int i = 0; i < 4; i++) {
+            bool front = i < 2;
+            Vec3 c = m.wc[i];
+            c.y += v.comp[i] - 0.127f;
+            Mat4 W = mul(v.M, mul(translate(c), mul(rY(front ? -v.steer : 0.0f), mul(rX(-v.wheelRot[i]), translate(Vec3{-m.wc[i].x, -m.wc[i].y, -m.wc[i].z})))));
+            gfxModel(W);
+            m.wheel[i].draw();
+        }
+    // Leuchten
+    dynGlow.clear();
+    float H = m.hi.y - m.lo.y, lw = hw * 0.62f;
+    float yHead = m.lo.y + H * 0.36f, yTail = m.lo.y + H * 0.40f, yBlink = m.lo.y + H * 0.30f;
+    if (m.hasLamps) { // eigene Leuchtflaechen des Modells je nach Zustand einfaerben
+        float zmid = (m.lo.z + m.hi.z) * 0.5f;
+        for (const LampTri& lt : m.lamps) {
+            bool rear = lt.z > zmid;
+            Color c;
+            switch (lt.kind) {
+            case 1: c = v.brake ? Color{255, 36, 24, 255} : (v.lights ? Color{176, 16, 14, 255} : Color{112, 14, 14, 255}); break;
+            case 2: c = (lt.x < 0 ? v.blinkL : v.blinkR) ? Color{255, 176, 24, 255} : Color{150, 100, 24, 255}; break;
+            case 3: c = rear ? (v.reverse ? Color{255, 255, 255, 255} : Color{176, 176, 180, 255}) : (v.lights ? Color{255, 252, 235, 255} : Color{205, 208, 214, 255}); break;
+            default: c = v.lights ? Color{255, 250, 225, 255} : Color{208, 216, 224, 255}; break;
+            }
+            for (int q = 0; q < 3; q++) dynGlow.vert(lt.p[q], lt.n, 0, 0, c);
+        }
+    }
+    for (float s : (m.hasLamps ? std::initializer_list<float>{} : std::initializer_list<float>{-1.0f, 1.0f})) {
+        bool blink = s < 0 ? v.blinkL : v.blinkR;
+        dynGlow.box(I4, {s * lw, yHead, m.lo.z + 0.01f}, {hw * 0.17f, H * 0.045f, 0.03f}, v.lights ? Color{255, 250, 228, 255} : Color{214, 220, 226, 255});
+        dynGlow.box(I4, {s * (lw + hw * 0.22f), yBlink, m.lo.z + 0.01f}, {hw * 0.07f, H * 0.03f, 0.03f}, blink ? Color{255, 170, 20, 255} : Color{150, 100, 24, 255});
+        dynGlow.box(I4, {s * lw, yTail, m.hi.z - 0.01f}, {hw * 0.17f, H * 0.05f, 0.03f}, v.brake ? Color{255, 34, 22, 255} : (v.lights ? Color{170, 14, 12, 255} : Color{110, 12, 12, 255}));
+        dynGlow.box(I4, {s * (lw + hw * 0.22f), yTail - H * 0.07f, m.hi.z - 0.01f}, {hw * 0.07f, H * 0.03f, 0.03f}, blink ? Color{255, 170, 20, 255} : Color{150, 100, 24, 255});
+        if (v.reverse) dynGlow.box(I4, {s * lw * 0.5f, yTail - H * 0.07f, m.hi.z - 0.01f}, {hw * 0.06f, H * 0.03f, 0.03f}, Color{245, 245, 245, 255});
+    }
+    if (v.siren) { // Blaulicht-Balken auf dem Dach, wechselt im Takt
+        bool a = std::fmod(simTime, 0.36) < 0.18;
+        float zc = (m.lo.z + m.hi.z) * 0.5f + 0.1f;
+        for (float s : {-1.0f, 1.0f}) {
+            bool blue = s < 0;
+            bool on = blue == a;
+            Color c = blue ? (on ? Color{60, 110, 255, 255} : Color{20, 30, 70, 255}) : (on ? Color{255, 50, 40, 255} : Color{70, 14, 12, 255});
+            dynGlow.box(I4, {s * hw * 0.3f, m.hi.y + 0.05f, zc}, {hw * 0.26f, 0.07f, 0.14f}, c);
+        }
+    }
+    gfxModel(v.M);
+    gfxMode(0, FLAG_FOG);
+    dynGlow.draw();
+    gfxModel(I4);
+}
+
+
+// ---------- Moped / Motorrad (Derbi Senda 50 und ein 125er): selbst erzeugtes Modell, neigt sich in Kurven ----------
+static Mesh mBikePaint, mBikeDark, mBikeFork, mBikeForkPaint, mBikeWheelM, mBikeRider;
+
+static void buildBike() {
+    Batch paint, dark, fork, forkPaint, rider;
+    Color black{26, 27, 30, 255}, metal{158, 162, 170, 255}, rubber{18, 18, 20, 255};
+    Color pw{255, 255, 255, 255};   // Lack: weiss, wird beim Zeichnen eingefaerbt
+    // --- Lack: Tank, Seitenverkleidung, Heck ---
+    paint.box(I4, {0, 0.16f, -0.20f}, {0.105f, 0.085f, 0.23f}, pw);
+    paint.box(I4, {0, 0.215f, -0.20f}, {0.085f, 0.03f, 0.20f}, pw);
+    for (float s : {-1.0f, 1.0f}) paint.box(I4, {s * 0.115f, 0.0f, 0.28f}, {0.012f, 0.10f, 0.22f}, pw);
+    paint.box(I4, {0, 0.17f, 0.60f}, {0.075f, 0.055f, 0.17f}, pw);
+    paint.box(I4, {0, 0.115f, 0.80f}, {0.06f, 0.012f, 0.14f}, pw);     // Schutzblech hinten
+    // --- Motor, Rahmen, Sitz, Auspuff ---
+    dark.box(I4, {0, -0.22f, 0.03f}, {0.115f, 0.14f, 0.20f}, Color{58, 60, 66, 255});
+    dark.box(I4, {0, -0.12f, -0.15f}, {0.08f, 0.10f, 0.10f}, Color{44, 46, 50, 255});
+    dark.box(I4, {0, 0.075f, 0.28f}, {0.095f, 0.04f, 0.32f}, black);                 // Sitz
+    dark.beam(I4, {0, 0.30f, -0.50f}, {0, -0.02f, -0.08f}, 0.028f, black);           // Rahmenrohre
+    dark.beam(I4, {0, -0.02f, -0.08f}, {0, 0.05f, 0.62f}, 0.026f, black);
+    dark.beam(I4, {0.09f, -0.26f, 0.08f}, {0.115f, -0.20f, 0.70f}, 0.032f, metal);   // Auspuff
+    dark.box(I4, {0.115f, -0.20f, 0.72f}, {0.04f, 0.04f, 0.16f}, metal);
+    dark.beam(I4, {0, -0.34f, 0.60f}, {0, -0.24f, 0.62f}, 0.02f, black);            // Schwinge
+    for (float s : {-1.0f, 1.0f}) {
+        dark.beam(I4, {s * 0.07f, -0.28f, 0.10f}, {s * 0.07f, -0.225f, 0.62f}, 0.016f, metal); // Hinterradschwinge
+        dark.box(I4, {s * 0.13f, -0.30f, 0.10f}, {0.02f, 0.012f, 0.07f}, metal);                // Fussraste
+    }
+    dark.box(I4, {0, 0.19f, 0.80f}, {0.06f, 0.035f, 0.01f}, Color{235, 235, 235, 255}); // Kennzeichen
+    // --- Gabel, Lenker, Scheinwerfer, hohes Frontschutzblech (steht mit der Lenkung) ---
+    for (float s : {-1.0f, 1.0f}) {
+        fork.beam(I4, {s * 0.065f, 0.40f, -0.52f}, {s * 0.065f, -0.223f, -0.64f}, 0.022f, metal);
+        fork.beam(I4, {s * 0.065f, 0.20f, -0.57f}, {s * 0.065f, -0.20f, -0.63f}, 0.03f, black);
+        fork.box(I4, {s * 0.37f, 0.46f, -0.50f}, {0.05f, 0.022f, 0.022f}, rubber);         // Griffe
+        fork.box(I4, {s * 0.33f, 0.52f, -0.52f}, {0.015f, 0.04f, 0.012f}, black);          // Spiegelarm
+        fork.box(I4, {s * 0.36f, 0.58f, -0.52f}, {0.05f, 0.03f, 0.008f}, black);           // Spiegel
+    }
+    fork.beam(I4, {-0.33f, 0.46f, -0.50f}, {0.33f, 0.46f, -0.50f}, 0.014f, black);         // Lenker
+    fork.box(I4, {0, 0.44f, -0.52f}, {0.04f, 0.04f, 0.04f}, black);
+    fork.box(I4, {0, 0.34f, -0.68f}, {0.075f, 0.075f, 0.045f}, Color{232, 236, 240, 255}); // Scheinwerfer
+    fork.box(I4, {0, 0.46f, -0.60f}, {0.06f, 0.04f, 0.03f}, black);                         // Tacho
+    forkPaint.box(I4, {0, 0.115f, -0.66f}, {0.055f, 0.012f, 0.19f}, pw);                  // hohes Schutzblech
+    forkPaint.box(I4, {0, 0.07f, -0.82f}, {0.055f, 0.045f, 0.012f}, pw);
+    // --- Fahrer (nur in der Aussenansicht) ---
+    Color jacket{48, 78, 150, 255}, pants{36, 42, 62, 255}, helmet{236, 236, 240, 255}, glove{30, 30, 34, 255};
+    rider.box(I4, {0, 0.52f, 0.14f}, {0.16f, 0.25f, 0.10f}, jacket);
+    rider.box(I4, {0, 0.88f, 0.05f}, {0.115f, 0.125f, 0.13f}, helmet);
+    rider.box(I4, {0, 0.88f, -0.06f}, {0.10f, 0.04f, 0.04f}, Color{30, 34, 44, 255});     // Visier
+    for (float s : {-1.0f, 1.0f}) {
+        rider.beam(I4, {s * 0.19f, 0.68f, 0.10f}, {s * 0.30f, 0.52f, -0.20f}, 0.04f, jacket);
+        rider.beam(I4, {s * 0.30f, 0.52f, -0.20f}, {s * 0.36f, 0.47f, -0.50f}, 0.035f, jacket);
+        rider.box(I4, {s * 0.36f, 0.46f, -0.50f}, {0.04f, 0.035f, 0.04f}, glove);
+        rider.beam(I4, {s * 0.10f, 0.20f, 0.24f}, {s * 0.20f, 0.12f, -0.14f}, 0.06f, pants);   // Oberschenkel
+        rider.beam(I4, {s * 0.20f, 0.12f, -0.14f}, {s * 0.15f, -0.22f, -0.02f}, 0.05f, pants); // Unterschenkel
+        rider.box(I4, {s * 0.15f, -0.30f, 0.0f}, {0.045f, 0.03f, 0.10f}, black);                // Schuh
+    }
+    mBikePaint.create(paint.v.data(), (int)paint.v.size());
+    mBikeDark.create(dark.v.data(), (int)dark.v.size());
+    mBikeFork.create(fork.v.data(), (int)fork.v.size());
+    mBikeForkPaint.create(forkPaint.v.data(), (int)forkPaint.v.size());
+    mBikeRider.create(rider.v.data(), (int)rider.v.size());
+    // Rad: schmaler Reifen, helle Felge mit Speichen
+    Batch wh;
+    const int N = 24;
+    const float Rw = 0.30f, hw = 0.045f;
+    for (int i = 0; i < N; i++) {
+        float a0 = i * 2 * PI / N, a1 = (i + 1) * 2 * PI / N, am = (a0 + a1) * 0.5f;
+        auto P = [&](float x, float a, float r) { return Vec3{x, std::cos(a) * r, std::sin(a) * r}; };
+        Vec3 n{0, std::cos(am), std::sin(am)};
+        wh.quad(P(-hw, a0, Rw), P(hw, a0, Rw), P(hw, a1, Rw), P(-hw, a1, Rw), n, rubber);
+        for (float s : {-1.0f, 1.0f}) {
+            wh.quad(P(s * hw, a0, Rw), P(s * hw, a1, Rw), P(s * hw * 0.8f, a1, Rw - 0.05f), P(s * hw * 0.8f, a0, Rw - 0.05f), {s, 0, 0}, rubber);
+            wh.quad(P(s * hw * 0.8f, a0, Rw - 0.05f), P(s * hw * 0.8f, a1, Rw - 0.05f), P(s * hw * 0.8f, a1, Rw - 0.075f), P(s * hw * 0.8f, a0, Rw - 0.075f), {s, 0, 0}, metal);
+        }
+    }
+    for (int i = 0; i < 5; i++) { // Speichen
+        float a = i * 2 * PI / 5;
+        wh.box(rX(a), {0, 0.14f, 0}, {0.008f, 0.11f, 0.012f}, metal);
+    }
+    wh.box(I4, {0, 0, 0}, {0.05f, 0.03f, 0.03f}, black); // Nabe
+    mBikeWheelM.create(wh.v.data(), (int)wh.v.size());
+}
+
+static void bikeDraw(const CarVisual& v, const Mat4& vp, bool cockpit) {
+    gfxMVP(vp);
+    gfxBias(0);
+    Color paint = v.tinted ? v.paint : (v.kind == 1 ? Color{206, 34, 42, 255} : Color{38, 88, 180, 255});
+    float sc = v.kind == 2 ? 1.12f : 1.0f;
+    Mat4 lean = mul(translate({0, -0.525f, 0}), mul(rZ(v.lean), translate({0, 0.525f, 0})));
+    Mat4 S = v.kind == 2 ? mul(translate({0, -0.525f, 0}), mul(scaleM(sc, sc, sc * 1.08f), translate({0, 0.525f, 0}))) : I4;
+    Mat4 B = mul(v.M, mul(lean, S));
+    // Schatten (schmal, nicht geneigt)
+    shadow.clear();
+    shadow.quad({-0.30f, -0.525f, -0.95f}, {0.30f, -0.525f, -0.95f}, {0.30f, -0.525f, 1.05f}, {-0.30f, -0.525f, 1.05f}, {0, 1, 0}, Color{0, 0, 0, 70});
+    gfxModel(v.M);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    gfxMode(0, 0);
+    shadow.draw();
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+
+    float dyF = (v.comp[0] + v.comp[1]) * 0.5f - 0.127f, dyR = (v.comp[2] + v.comp[3]) * 0.5f - 0.127f;
+    gfxModel(B);
+    gfxMode(0, FLAG_LIT | FLAG_FOG | FLAG_GLOSS);
+    gfxTint(paint.r / 255.0f, paint.g / 255.0f, paint.b / 255.0f);
+    mBikePaint.draw();
+    gfxMode(0, FLAG_LIT | FLAG_FOG);
+    mBikeDark.draw();
+    if (!cockpit) mBikeRider.draw();
+    // Vorderbau: dreht mit der Lenkung
+    Mat4 F = mul(B, mul(translate({0, dyF, -0.52f}), mul(rY(-v.steer), translate({0, 0, 0.52f}))));
+    gfxModel(F);
+    gfxMode(0, FLAG_LIT | FLAG_FOG | FLAG_GLOSS);
+    gfxTint(paint.r / 255.0f, paint.g / 255.0f, paint.b / 255.0f);
+    mBikeForkPaint.draw();
+    gfxMode(0, FLAG_LIT | FLAG_FOG);
+    mBikeFork.draw();
+    gfxModel(mul(F, mul(translate({0, -0.223f, -0.64f}), rX(-v.wheelRot[0]))));
+    mBikeWheelM.draw();
+    gfxModel(mul(B, mul(translate({0, -0.223f + dyR, 0.64f}), rX(-v.wheelRot[2]))));
+    mBikeWheelM.draw();
+    // Leuchten
+    dynGlow.clear();
+    dynGlow.box(I4, {0, 0.34f, -0.715f}, {0.06f, 0.06f, 0.01f}, v.lights ? Color{255, 252, 230, 255} : Color{214, 220, 226, 255});
+    dynGlow.box(I4, {0, 0.18f, 0.775f}, {0.04f, 0.022f, 0.01f}, v.brake ? Color{255, 36, 24, 255} : (v.lights ? Color{176, 16, 14, 255} : Color{112, 14, 14, 255}));
+    for (float s : {-1.0f, 1.0f}) {
+        bool blink = s < 0 ? v.blinkL : v.blinkR;
+        Color c = blink ? Color{255, 176, 24, 255} : Color{150, 100, 24, 255};
+        dynGlow.box(I4, {s * 0.30f, 0.40f, -0.52f}, {0.022f, 0.016f, 0.016f}, c);
+        dynGlow.box(I4, {s * 0.09f, 0.14f, 0.82f}, {0.022f, 0.016f, 0.016f}, c);
+    }
+    gfxModel(B);
+    gfxMode(0, FLAG_FOG);
+    dynGlow.draw();
+    gfxModel(I4);
+}
 void carModelInit() {
     buildBody();
     buildWheel();
     buildInterior();
+    buildBike();
+    scanCars();
 }
 
 static void textC(Batch& b, float cx, float y, float px, Color c, const std::string& s) { font.draw(b, cx - font.width(s, px) * 0.5f, y, px, c, s); }
@@ -246,8 +858,9 @@ static void buildDash(const CarVisual& v, const DashState& d) {
     char buf[64];
     if (d.limit > 0) {
         dynGeo.disc(-82, -8, 34, Color{215, 30, 35, 255});
+        for (size_t i = dynGeo.v.size() - 84; i < dynGeo.v.size(); i++) dynGeo.v[i].p[2] = 0.15f;
         dynGeo.disc(-82, -8, 26, white);
-        for (size_t i = dynGeo.v.size() - 84; i < dynGeo.v.size(); i++) dynGeo.v[i].p[2] = 0.3f;
+        for (size_t i = dynGeo.v.size() - 84; i < dynGeo.v.size(); i++) dynGeo.v[i].p[2] = 0.35f;
         snprintf(buf, sizeof buf, "%d", d.limit);
         textC(dynText, -82, 1, 26, Color{10, 10, 10, 255}, buf);
     }
@@ -262,6 +875,12 @@ static void buildDash(const CarVisual& v, const DashState& d) {
     }
     snprintf(buf, sizeof buf, "%.1f km", d.odoKm);
     font.draw(dynText, 126 - font.width(buf, 9), -52, 9, dim, buf);
+    { // Tankanzeige: Balken links unten im Mitteldisplay, rot bei wenig Sprit
+        float ff = clampv(d.fuel, 0.0f, 1.0f);
+        dynGeo.quad({-130, -50, 0.45f}, {-62, -50, 0.45f}, {-62, -45, 0.45f}, {-130, -45, 0.45f}, {0, 0, 1}, Color{36, 40, 48, 255});
+        dynGeo.quad({-130, -50, 0.5f}, {-130 + 68 * ff, -50, 0.5f}, {-130 + 68 * ff, -45, 0.5f}, {-130, -45, 0.5f}, {0, 0, 1}, ff < 0.15f ? red : Color{110, 190, 255, 255});
+        font.draw(dynText, -130, -52, 7, ff < 0.15f ? red : dim, "TANK");
+    }
     dynGeo.xform(g0, mul(screenM, translate({0, 0, 0.3f})));
     dynText.xform(t0, mul(screenM, translate({0, 0, 1.4f})));
     // --- Schalthebel und Handbremse bewegen sich mit ---
@@ -273,7 +892,13 @@ static void buildDash(const CarVisual& v, const DashState& d) {
     dynLit.beam(I4, {0.085f, 0.03f, 0.30f}, {0.085f, d.handbrake ? 0.15f : 0.05f, 0.10f}, 0.014f, Color{26, 26, 29, 255});
 }
 
-void carDraw(const CarVisual& v, const Mat4& vp, bool cockpit, const DashState* dash) {
+void carDraw(const CarVisual& vIn, const Mat4& vp, bool cockpit, const DashState* dash) {
+    if (vIn.kind > 0) { bikeDraw(vIn, vp, cockpit); return; }
+    int mi = vIn.model == MODEL_SELECTED ? carModelSel : vIn.model;
+    ObjCar* oc = mi >= 0 ? objCarAt(mi) : nullptr;
+    if (oc && !cockpit) { drawObjCar(vIn, vp, *oc); return; }
+    CarVisual v = vIn;
+    if (oc && oc->hasPaint && !v.tinted) v.paint = oc->ref; // Cockpit: Eigenbau-Haube in der Farbe des gewaehlten Autos
     gfxMVP(vp);
     gfxBias(0);
     // Schatten unter dem Auto
@@ -342,3 +967,60 @@ void carDraw(const CarVisual& v, const Mat4& vp, bool cockpit, const DashState* 
     }
     gfxModel(I4);
 }
+
+// ---------- Katalog: Infos, Spielerfarbe, 3D-Vorschau ----------
+bool carColorSet = false;
+uint8_t carColor[3] = {190, 30, 40};
+
+void carOwnPaint(CarVisual& v) {
+    if (carColorSet) { v.paint = Color{carColor[0], carColor[1], carColor[2], 255}; v.tinted = true; }
+}
+
+bool carModelInfo(int i, std::string& out) {
+    ObjCar* m = objCarAt(i);
+    if (!m) return false;
+    char b[128];
+    snprintf(b, sizeof b, "%.1f m lang  \xC2\xB7  %.1f m breit  \xC2\xB7  %d Dreiecke", m->hi.z - m->lo.z, m->hi.x - m->lo.x, m->tris);
+    out = b;
+    return true;
+}
+
+void carPreviewDraw(int x, int y, int w, int h, float yaw) {
+    if (w < 8 || h < 8) return;
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(x, y, w, h);
+    glViewport(x, y, w, h);
+    glClearColor(0.075f, 0.09f, 0.12f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glClearColor(0, 0, 0, 1);
+    Vec3 cam{0, vehKind > 0 ? 1.1f : 1.9f, vehKind > 0 ? 6.2f : 11.0f};
+    Mat4 proj = perspective(0.50f, (float)w / h, 0.1f, 200.0f);
+    Mat4 view = rigidInverse(mul(translate(cam), rX(-0.17f)));
+    Mat4 vp = mul(proj, view);
+    gfxCamera(cam, invert(vp));
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    // Podest: dunkle Scheibe mit hellem Rand
+    static Batch ground;
+    ground.clear();
+    for (int i = 0; i < 48; i++) {
+        float a0 = i * 2 * PI / 48, a1 = (i + 1) * 2 * PI / 48;
+        ground.tri({0, -0.53f, 0}, {std::cos(a0) * 3.6f, -0.53f, std::sin(a0) * 3.6f}, {std::cos(a1) * 3.6f, -0.53f, std::sin(a1) * 3.6f}, {0, 1, 0}, Color{34, 38, 48, 255});
+        ground.tri({0, -0.529f, 0}, {std::cos(a0) * 3.3f, -0.529f, std::sin(a0) * 3.3f}, {std::cos(a1) * 3.3f, -0.529f, std::sin(a1) * 3.3f}, {0, 1, 0}, Color{22, 25, 32, 255});
+    }
+    gfxMVP(vp);
+    gfxModel(I4);
+    gfxBias(0);
+    gfxMode(0, FLAG_LIT);
+    ground.draw();
+    CarVisual v;
+    v.M = fromQuatPos(qaxis({0, 1, 0}, yaw), {0, 0, 0});
+    v.kind = vehKind;
+    v.lights = true;
+    for (float& r : v.wheelRot) r = 0;
+    carOwnPaint(v);
+    carDraw(v, vp, false, nullptr);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+int vehKind = 0;

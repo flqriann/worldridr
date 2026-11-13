@@ -27,14 +27,33 @@ struct CarVisual {
     float comp[4] = {0.127f, 0.127f, 0.127f, 0.127f};
     Color paint{176, 28, 34, 255};
     bool brake = false, blinkL = false, blinkR = false, lights = false, reverse = false;
+    int model = -2;             // MODEL_SELECTED (-2), MODEL_BUILTIN (-1) oder Index in die Liste der .obj-Autos
+    bool tinted = false;        // true: paint ueberschreibt die Originalfarbe des .obj-Modells
+    bool siren = false;         // Blaulicht (Polizei im Einsatz)
+    int kind = 0;               // 0 Auto, 1 Moped, 2 Motorrad
+    float lean = 0;             // Schraeglage (rad), nur Zweiraeder
 };
+constexpr int MODEL_SELECTED = -2, MODEL_BUILTIN = -1;
+// .obj-Autos aus assets/cars (Wavefront OBJ + MTL + Farbtextur, Raeder als eigene Gruppen "wheel-front-left" ...)
+int carModelCount();
+const std::string& carModelName(int i);
+extern int carModelSel;           // gewaehltes Auto des Spielers (-1 = Eigenbau)
+void carModelCycle();
+int carModelFind(const std::string& name);   // Index oder -1
+bool carModelInfo(int i, std::string& out);   // Abmessungen und Dreiecke (laedt das Modell)
+extern int vehKind;                              // Fahrzeug des Spielers: 0 Auto, 1 Moped, 2 Motorrad
+extern bool carColorSet;                       // Spielerfarbe gesetzt (sonst Originalfarbe)
+extern uint8_t carColor[3];
+void carOwnPaint(CarVisual& v);               // Spielerfarbe auf ein CarVisual anwenden
+void carPreviewDraw(int x, int y, int w, int h, float yaw);   // 3D-Vorschau des gewaehlten Autos (Pixelrechteck)
 struct DashState {
     float kmh = 0, rpm = 0, steerInput = 0, odoKm = 0;
     int gear = 0, selector = 0, limit = 0;
     bool automatic = false, blinkL = false, blinkR = false, handbrake = false, belt = false, engineOn = false, lights = false;
+    float fuel = 1;                 // Tankinhalt 0..1
     std::string road;
 };
-extern const Vec3 EYE;            // Fahrerkopf relativ zum Schwerpunkt
+extern Vec3 EYE;                  // Fahrerkopf relativ zum Schwerpunkt (je nach Fahrzeug)
 extern const Vec3 MIRROR_POS[3];
 extern const float MIRROR_HW[3], MIRROR_HH[3];
 void carModelInit();
@@ -88,6 +107,48 @@ extern int wanted;            // gewuenschte Anzahl Fahrzeuge (0 = aus)
 void update(float dt);
 void draw(const Mat4& vp, Vec3 cam, float maxDist);
 int count();
+std::string policeStatus();   // Hinweis fuer die Anzeige ("Polizei: Bitte anhalten"), sonst leer
+bool policeActive();
+void offence(int kind);       // Verstoss melden: 0 rote Ampel, 1 Stoppschild, 2 Unfall
+float sirenLevel();           // Lautstaerke der naechsten Sirene 0..1
+void policeMarks(std::vector<std::pair<Vec3, bool>>& out);  // Polizeiautos (Position, im Einsatz) fuer die Minimap
+}
+
+// ---------- Tank, Geld, Tankstellen, Supermaerkte ----------
+namespace econ {
+extern float fuel, fuelCap, money;                       // Liter, Liter, Euro
+void setTank(float capacityLiters, float consumption);   // je nach Fahrzeug
+float fuelFrac();
+bool deliveryActive();
+void update(float dt);
+void keyJ();                                             // Tanken / Lieferauftrag annehmen
+void navToNearest(int kind);                             // 0 Tankstelle, 1 Supermarkt
+void onCrash();
+void onArrived();                                        // Navigationsziel erreicht (Lieferung abliefern)
+void buildHUD();
+}
+
+// ---------- Fussgaenger ----------
+namespace ped {
+extern int wanted;                                           // gewuenschte Anzahl (0 = aus)
+void update(float dt);
+void draw(const Mat4& vp, Vec3 cam, float maxDist);
+void crossing(std::vector<std::pair<Vec3, Vec3>>& out);    // Fussgaenger auf der Fahrbahn (Position, Richtung)
+int count();
+void debugSpawnAhead();
+}
+
+// ---------- Navigation und Minimap ----------
+namespace nav {
+void setDestination(double lat, double lon);   // Route vom Auto zum Ziel berechnen (OSRM) und anzeigen
+void clear();
+bool active();                                 // Ziel gesetzt
+bool destination(double& lat, double& lon);
+const std::vector<std::pair<double, double>>& routeLatLon();  // Routenverlauf (Breite, Laenge)
+void update(float dt);
+void buildHUD();                               // Minimap und Abbiegehinweis (in die Oberflaeche)
+void drawWorld();                              // Routenband und Zielmarkierung in der 3D-Welt
+void zoomCycle();                              // Minimap: Zoomstufen, zuletzt aus
 }
 
 // ---------- Weltkarte ----------
@@ -118,7 +179,17 @@ struct NetCar {
     bool placed = false;
     double lastSeen = 0;
 };
+struct LanServer { std::string name, address; int players = 0; double seen = 0; };
 namespace netplay {
+struct ChatLine { std::string name, text; double t; };
+bool server(int port, const std::string& name, int maxPlayers);   // eigenstaendiger Server ohne Fenster
+void serverUpdate(float dt);
+void discover();                                                    // LAN-Server per Broadcast suchen
+void pollDiscovery();
+std::vector<LanServer> lanServers();
+void chat(const std::string& text);
+std::vector<ChatLine>& chatLog();
+int playerCount();
 bool host(int port);
 bool join(const std::string& address, int port);
 void stop();

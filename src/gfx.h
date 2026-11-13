@@ -70,6 +70,8 @@ typedef ptrdiff_t GLsizeiptr;
     X(void, RenderbufferStorage, (GLenum, GLenum, GLsizei, GLsizei)) \
     X(void, FramebufferRenderbuffer, (GLenum, GLenum, GLenum, GLuint)) \
     X(GLenum, CheckFramebufferStatus, (GLenum)) \
+    X(void, DeleteFramebuffers, (GLsizei, const GLuint*)) \
+    X(void, DeleteRenderbuffers, (GLsizei, const GLuint*)) \
     X(void, BlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum))
 
 #define X(r, n, a) extern r(APIENTRY* gl##n) a;
@@ -115,6 +117,7 @@ struct Target { // Render-Ziel fuer Spiegel
     GLuint fbo = 0, tex = 0, depth = 0;
     int w = 0, h = 0;
     void create(int w, int h);
+    void destroy();
 };
 
 // Modi: 0 Farbe, 1 Gelaende (Satellitenbild), 2 Strasse, 3 Gebaeude, 4 Textur, 5 Text, 6 Himmel
@@ -129,5 +132,6 @@ void gfxMVP(const Mat4& mvp);
 void gfxCamera(Vec3 cam, const Mat4& invViewProj);
 void gfxBias(float b);
 void gfxTint(float r, float g, float b);
+void gfxQuality(int q);   // 0 = einfache Shader (kein Detailrauschen), 1+ = volle Details
 GLuint gfxTexture(const uint8_t* px, int w, int h, int comp, bool mips);
 void gfxBindTexture(GLuint t);

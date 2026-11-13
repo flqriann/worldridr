@@ -9,6 +9,7 @@ struct HudState {
     std::vector<Msg> msgs;
     std::vector<std::string> faults;
     int points = 0;
+    bool faultsOn = false, lessonActive = false; // Fehlerpunkte nur im Pruefungsmodus oder in Fahrstunden
 };
 
 // Lua-Anbindung: Fahrstunden und Regelpruefung liegen in scripts/*.lua

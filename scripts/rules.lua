@@ -14,6 +14,7 @@ function R.reset()
 end
 
 local function fault(key, text, points, wait)
+  if not sim.faults_on() then return end
   local now = sim.time()
   if cooldown[key] and now < cooldown[key] then return end
   cooldown[key] = now + (wait or 10)
@@ -34,6 +35,8 @@ function R.event(name)
   elseif name == "stop_sign" then fault("stop", "Stoppschild: nicht angehalten", 4, 3)
   elseif name == "priority" then fault("priority", "Vorrang missachtet", 4, 5)
   elseif name == "crash" then fault("crash", "Unfall", 5, 3)
+  elseif name == "pedestrian" then fault("ped", "Fußgänger angefahren", 10, 5)
+  elseif name == "police_ignored" then fault("police", "Polizeianweisung missachtet", 5, 30)
   end
 end
 

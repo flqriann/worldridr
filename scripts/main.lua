@@ -1,4 +1,5 @@
 -- Einstieg: laedt Regelpruefung und Fahrstunden. Neue Fahrstunden einfach in scripts/lessons ablegen und unten eintragen.
+-- Beim Start bleibt die Oberflaeche leer; Fahrstunden werden im Menue (oder mit F1) gewaehlt.
 local rules = dofile("scripts/rules.lua")
 
 local lessons = {
@@ -31,11 +32,13 @@ local function start(i)
   rules.reset()
   if i == 0 then
     current = nil
-    sim.title("Freies Fahren")
-    sim.instruction("F1 = Fahrstunden   T = Ort wechseln   R = zurück auf die Straße   V = Kamera   F3 = Lenkrad-Diagnose")
+    sim.lesson(false)
+    sim.title("")
+    sim.instruction("")
     return
   end
   current, step = lessons[i], 1
+  sim.lesson(true)
   sim.title(current.title)
   enter_step()
 end
@@ -52,6 +55,12 @@ function on_event(name, arg)
     if arg == "f1" then show_menu() return end
     local n = tonumber(arg)
     if menu and n and (n == 0 or lessons[n]) then start(n) end
+    return
+  end
+  if name == "lesson" then
+    -- aus dem Hauptmenue: Fahrstunde direkt starten (0 = Menue zeigen)
+    local n = tonumber(arg)
+    if n and n > 0 and lessons[n] then start(n) else show_menu() end
     return
   end
   if name == "spawn" then
@@ -75,13 +84,12 @@ function on_update(dt)
       local p = sim.points()
       sim.message(string.format("%s abgeschlossen - %d Fehlerpunkte", current.title, p), 8)
       current = nil
-      sim.title("Freies Fahren")
-      sim.instruction("Gut gemacht! F1 = nächste Fahrstunde wählen")
+      sim.lesson(false)
+      sim.title("")
+      sim.instruction("")
     else
       sim.message("Richtig!", 1.5)
       enter_step()
     end
   end
 end
-
-show_menu()

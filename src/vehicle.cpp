@@ -2,24 +2,28 @@
 #include "world.h"
 
 namespace {
-const float MASS = 1300.0f;
-const Vec3 INERTIA{1900.0f, 2100.0f, 550.0f}; // Nicken (x), Gieren (y), Wanken (z)
-const float R = 0.316f;                       // Radradius
-const float SUS_REST = 0.30f, SUS_MAX = 0.26f;
-const float I_WHEEL = 1.1f, I_ENGINE = 0.23f; // Kurbeltrieb + Zweimassenschwungrad + Kupplung
-const float FINAL = 3.65f;
-const float GEARS[8] = {-3.60f, 0.0f, 3.78f, 2.12f, 1.36f, 1.03f, 0.84f, 0.70f}; // R, N, 1..6
-const float CLUTCH_K = 40.0f, CLUTCH_CAP = 330.0f;
-const float MAX_STEER = 0.56f;
+float MASS = 1300.0f;
+Vec3 INERTIA{1900.0f, 2100.0f, 550.0f}; // Nicken (x), Gieren (y), Wanken (z)
+float R = 0.316f;                       // Radradius
+float SUS_REST = 0.30f, SUS_MAX = 0.26f;
+float I_WHEEL = 1.1f, I_ENGINE = 0.23f; // Kurbeltrieb + Zweimassenschwungrad + Kupplung
+float FINAL = 3.65f;
+float GEARS[8] = {-3.60f, 0.0f, 3.78f, 2.12f, 1.36f, 1.03f, 0.84f, 0.70f}; // R, N, 1..6
+float CLUTCH_K = 40.0f, CLUTCH_CAP = 330.0f;
+float MAX_STEER = 0.56f;
+// weitere Fahrzeugparameter (Auto / Moped / Motorrad), siehe Vehicle::setKind
+float TQ = 1.0f, RPMK = 1.0f, IDLE = 850.0f, RLIMIT = 6500.0f, STALL = 350.0f, START = 480.0f, BRAKE_F = 1900.0f, BRAKE_R = 1000.0f, BRAKE_H = 1600.0f;
+float STAB_F = 12000.0f, STAB_R = 6000.0f, MUN = 3500.0f, CDA = 0.66f, TWIDTH = 0.77f, ZF = 1.10f, ZR = 1.52f, KF = 29000.0f, CF = 2400.0f, KR = 21000.0f, CR = 1750.0f;
 const float STEER_RATIO = 14.5f;
 const float SR_PEAK = 0.10f, SA_PEAK = 0.14f;
 
-float torqueCurve(float rpm) {
+float torqueCurve(float rpmIn) {
+    float rpm = rpmIn * RPMK;
     static const float pts[][2] = {{0, 60}, {800, 115}, {1500, 200}, {3500, 200}, {5000, 176}, {6000, 142}, {6600, 100}, {7500, 0}};
     for (int i = 0; i < 7; i++)
         if (rpm <= pts[i + 1][0]) {
             float t = (rpm - pts[i][0]) / (pts[i + 1][0] - pts[i][0]);
-            return pts[i][1] + (pts[i + 1][1] - pts[i][1]) * clampv(t, 0.0f, 1.0f);
+            return (pts[i][1] + (pts[i + 1][1] - pts[i][1]) * clampv(t, 0.0f, 1.0f)) * TQ;
         }
     return 0;
 }
@@ -31,14 +35,44 @@ float clutchEngage(float pedal) {
 
 float Vehicle::wheelRadius() { return R; }
 
-Vehicle::Vehicle() {
-    const float a = 1.10f, b = 1.52f, tw = 0.77f, my = -0.05f;
-    w[0].mount = {-tw, my, -a}; w[1].mount = {tw, my, -a};
-    w[2].mount = {-tw, my, b}; w[3].mount = {tw, my, b};
+Vehicle::Vehicle() { setKind(0); }
+
+// Fahrzeugart: 0 Auto (Kompaktwagen), 1 Moped (Derbi Senda 50, 6 Gaenge, ca. 50 km/h), 2 Motorrad (125 ccm, ca. 100 km/h).
+// Gleiche Physik, andere Kennwerte; die Spurweite der virtuellen Stuetzpunkte bleibt breit genug, damit nichts umkippt.
+void Vehicle::setKind(int k) {
+    kind = k;
+    static const float carGears[8] = {-3.60f, 0.0f, 3.78f, 2.12f, 1.36f, 1.03f, 0.84f, 0.70f};
+    for (int i = 0; i < 8; i++) GEARS[i] = carGears[i];
+    if (k == 0) {
+        MASS = 1300; INERTIA = {1900, 2100, 550}; R = 0.316f; SUS_REST = 0.30f; SUS_MAX = 0.26f; I_WHEEL = 1.1f; I_ENGINE = 0.23f; FINAL = 3.65f;
+        CLUTCH_K = 40; CLUTCH_CAP = 330; MAX_STEER = 0.56f; TQ = 1; RPMK = 1; IDLE = 850; RLIMIT = 6500; STALL = 350; START = 480;
+        BRAKE_F = 1900; BRAKE_R = 1000; BRAKE_H = 1600; STAB_F = 12000; STAB_R = 6000; MUN = 3500; CDA = 0.66f; TWIDTH = 0.77f; ZF = 1.10f; ZR = 1.52f;
+        KF = 29000; CF = 2400; KR = 21000; CR = 1750;
+    } else {
+        bool moped = k == 1;
+        float m = moped ? 185.0f : 255.0f, rel = m / 1300.0f;
+        MASS = m; INERTIA = {m * 0.16f, m * 0.18f, m * 0.07f}; R = 0.30f; SUS_REST = 0.30f; SUS_MAX = 0.26f;
+        I_WHEEL = moped ? 0.25f : 0.35f;
+        TQ = moped ? 0.016f : 0.065f; I_ENGINE = 0.23f * TQ * 1.5f;
+        RPMK = moped ? 0.5f : 0.42f; IDLE = moped ? 1700.0f : 1300.0f; RLIMIT = moped ? 7500.0f : 9500.0f; STALL = IDLE * 0.45f; START = IDLE * 0.6f;
+        FINAL = moped ? 24.3f : 13.6f;
+        CLUTCH_K = 40 * TQ; CLUTCH_CAP = 330 * TQ * 1.6f;
+        MAX_STEER = 0.42f;
+        BRAKE_F = 1900 * rel * 1.7f; BRAKE_R = 1000 * rel * 1.7f; BRAKE_H = 1600 * rel;
+        STAB_F = 12000 * rel; STAB_R = 6000 * rel; MUN = 3500 * rel; CDA = 0.42f;
+        TWIDTH = 0.62f; ZF = 0.64f; ZR = 0.64f;
+        KF = 29000 * rel * 1.2f; CF = 2400 * rel * 1.4f; KR = 21000 * rel * 1.2f; CR = 1750 * rel * 1.4f;
+        static const float bikeGears[8] = {-3.0f, 0.0f, 3.4f, 2.4f, 1.8f, 1.3f, 1.0f, 0.78f};
+        for (int i = 0; i < 8; i++) GEARS[i] = bikeGears[i];
+        if (moped) FINAL = 24.3f * 0.70f / 0.78f; // 6. Gang: ca. 50 km/h bei 7500 U/min
+    }
+    const float my = -0.05f;
+    w[0].mount = {-TWIDTH, my, -ZF}; w[1].mount = {TWIDTH, my, -ZF};
+    w[2].mount = {-TWIDTH, my, ZR}; w[3].mount = {TWIDTH, my, ZR};
     for (int i = 0; i < 4; i++) {
         w[i].front = i < 2; w[i].driven = i < 2;
-        w[i].k = i < 2 ? 29000.0f : 21000.0f;
-        w[i].c = i < 2 ? 2400.0f : 1750.0f;
+        w[i].k = i < 2 ? KF : KR;
+        w[i].c = i < 2 ? CF : CR;
     }
 }
 
@@ -137,7 +171,7 @@ void Vehicle::substep(float dt) {
     Vec3 right = qrot(q, {1, 0, 0}), up = qrot(q, {0, 1, 0}), fwd = qrot(q, {0, 0, -1});
     Vec3 F{0, -MASS * 9.81f, 0}, T{};
     float sp = length(vel);
-    F += vel * (-0.5f * 1.2f * 0.66f * sp); // Luftwiderstand
+    F += vel * (-0.5f * 1.2f * CDA * sp); // Luftwiderstand
 
     // --- Federung ---
     float fs[4];
@@ -164,7 +198,7 @@ void Vehicle::substep(float dt) {
         wh.comp = wh.contact ? std::min(c, SUS_MAX + 0.08f) : 0.0f;
     }
     for (int a = 0; a < 4; a += 2) { // Stabilisatoren
-        float dlt = (w[a].comp - w[a + 1].comp) * (a == 0 ? 12000.0f : 6000.0f);
+        float dlt = (w[a].comp - w[a + 1].comp) * (a == 0 ? STAB_F : STAB_R);
         if (w[a].contact) fs[a] = std::max(0.0f, fs[a] + dlt);
         if (w[a + 1].contact) fs[a + 1] = std::max(0.0f, fs[a + 1] - dlt);
     }
@@ -187,24 +221,24 @@ void Vehicle::substep(float dt) {
     //  - Reib- und Pumpverluste entsprechen ca. 1 .. 2 bar Reibmitteldruck (15 Nm bei 2000, 29 Nm bei 6000 U/min).
     float r = rpm();
     float n = std::max(r, 300.0f) / 1000.0f;
-    float fric = 8.0f + 0.0035f * r;
+    float fric = (8.0f + 0.0035f * r) * TQ;
     float Te;
     if (engineOn) {
         float area = 1.2f * throttle + 25.0f * throttle * throttle * throttle;
         float req = 1.0f - std::exp(-area / n);
-        req = std::max(req, clampv((850.0f - r) * 0.0022f, 0.0f, 0.24f)); // Leerlaufregler mit kleiner Momentenreserve
-        if (r > 6500) req = 0;                                              // Drehzahlbegrenzer
+        req = std::max(req, clampv((IDLE - r) * 0.0022f * 850.0f / IDLE, 0.0f, 0.24f)); // Leerlaufregler mit kleiner Momentenreserve
+        if (r > RLIMIT) req = 0;                                              // Drehzahlbegrenzer
         manifold += (req - manifold) * std::min(1.0f, dt / 0.09f);
         float boostTarget = std::max(0.0f, manifold - 0.6f) / 0.4f;
         float tau = boostTarget < boost ? 0.15f : clampv(1.5f - 0.33f * n, 0.22f, 1.1f);
         boost += (boostTarget - boost) * std::min(1.0f, dt / tau);
         float fill = std::min(manifold, 0.6f) + 0.4f * boost;
-        float pump = (1.0f - fill) * (4.0f + 0.0012f * r);                  // Drosselverluste = Motorbremse
+        float pump = (1.0f - fill) * (4.0f + 0.0012f * r) * TQ;                  // Drosselverluste = Motorbremse
         Te = fill * (torqueCurve(r) + fric) - fric - pump;
     } else {
         manifold = boost = 0;
-        Te = -(fric + 4.0f + 0.0012f * r) * clampv(engW / 2.0f, 0.0f, 1.0f);
-        if (starter) Te += 75.0f;
+        Te = -(fric + (4.0f + 0.0012f * r) * TQ) * clampv(engW / 2.0f, 0.0f, 1.0f);
+        if (starter) Te += 75.0f * TQ;
     }
 
     // --- Reifen ---
@@ -213,8 +247,8 @@ void Vehicle::substep(float dt) {
         float Tdrive = wh.driven ? Tc * ratio * 0.5f * 0.93f : 0.0f; // 7 % Verluste in Getriebe und Differential
         float Dc = wh.driven ? Keff * ratio * ratio : 0.0f;
         float Fx = 0, Dt = 0;
-        float Tb = brake * (wh.front ? 1900.0f : 1000.0f);
-        if (!wh.front && (handbrake || (automatic && selector == 0))) Tb += 1600.0f;
+        float Tb = brake * (wh.front ? BRAKE_F : BRAKE_R);
+        if (!wh.front && (handbrake || (automatic && selector == 0))) Tb += BRAKE_H;
         wh.slip = 0;
         if (wh.contact) {
             Vec3 nrm = wh.gn;
@@ -229,7 +263,7 @@ void Vehicle::substep(float dt) {
             float sa = vy / (std::fabs(vx) + 0.5f);
             float sx = sr / SR_PEAK, sy = sa / SA_PEAK;
             float rho = std::sqrt(sx * sx + sy * sy);
-            float mu = wh.mu * clampv(1.12f - 0.1f * fs[i] / 3500.0f, 0.75f, 1.12f);
+            float mu = wh.mu * clampv(1.12f - 0.1f * fs[i] / MUN, 0.75f, 1.12f);
             const float B = 1.732f, C = 1.5f;
             float at = std::atan(B * rho);
             float cur = std::sin(C * at), dcur = C * B / (1 + B * B * rho * rho) * std::cos(C * at);
@@ -259,8 +293,8 @@ void Vehicle::substep(float dt) {
     // --- Motor ---
     engW += dt * (Te - Tc) / (I_ENGINE + dt * 2.0f * Keff);
     if (engW < 0) engW = 0;
-    if (engineOn && engW * 9.5493f < 350.0f) { engineOn = false; evStall = true; }
-    if (!engineOn && starter && engW * 9.5493f > 480.0f) engineOn = true;
+    if (engineOn && engW * 9.5493f < STALL) { engineOn = false; evStall = true; }
+    if (!engineOn && starter && engW * 9.5493f > START) engineOn = true;
 
     // --- Starrkoerper integrieren ---
     vel += F * (dt / MASS);

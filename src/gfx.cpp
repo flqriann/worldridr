@@ -43,7 +43,7 @@ void main(){
 
 static const char* FS = R"(#version 330 core
 in vec3 vW; in vec3 vN; in vec2 vUV; in vec4 vC;
-uniform int uMode; uniform int uFlags; uniform sampler2D uTex; uniform vec3 uCam; uniform vec3 uSun; uniform mat4 uInvVP; uniform vec3 uTint; uniform float uTile;
+uniform int uQ; uniform int uMode; uniform int uFlags; uniform sampler2D uTex; uniform vec3 uCam; uniform vec3 uSun; uniform mat4 uInvVP; uniform vec3 uTint; uniform float uTile;
 out vec4 o;
 float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
 float vnoise(vec2 p){
@@ -57,7 +57,7 @@ vec3 sky(vec3 d){
   return c+vec3(1.0,0.9,0.7)*(pow(s,350.0)*1.5+pow(s,8.0)*0.12);
 }
 vec3 fog(vec3 c){
-  vec3 v=vW-uCam; float d=length(v); float f=1.0-exp(-d*0.00012);
+  vec3 v=vW-uCam; float d=length(v); float f=1.0-exp(-d*0.00026); f=max(f, smoothstep(4000.0,12000.0,d));
   vec3 dir=v/max(d,0.001);
   return mix(c, sky(normalize(vec3(dir.x,0.02,dir.z))), f);
 }
@@ -77,37 +77,77 @@ void main(){
     // Satellitenbild + feines Detailrauschen in der Naehe (das Luftbild hat nur ~0,4 m pro Pixel)
     vec3 c=texture(uTex,vUV).rgb;
     float d=length(vW-uCam);
-    float n=vnoise(vW.xz*2.3)*0.5+vnoise(vW.xz*9.0)*0.35+vnoise(vW.xz*31.0)*0.15;
-    c*=mix(1.0, 0.80+0.40*n, clamp(1.0-d/90.0,0.0,1.0));
+    if(uQ>0){ float n=vnoise(vW.xz*2.3)*0.5+vnoise(vW.xz*9.0)*0.35+vnoise(vW.xz*31.0)*0.15;
+    c*=mix(1.0, 0.80+0.40*n, clamp(1.0-d/90.0,0.0,1.0)); }
     o=vec4(fog(c),1.0); return;
   }
   if(uMode==2){
     float lat=vUV.x, along=vUV.y; float hw=vC.a*25.5;
     int lanes=int(vC.r*255.0+0.5); int fl=int(vC.g*255.0+0.5); int klass=int(vC.b*255.0+0.5);
-    float a=smoothstep(hw, hw-0.3, abs(lat));
-    float nz=vnoise(vW.xz*14.0)*0.6+vnoise(vW.xz*1.7)*0.4;
-    vec3 c=vec3(0.20+0.05*nz);
-    if(klass>=7) c=vec3(0.42,0.38,0.30)+0.04*nz;
-    float line=0.0;
-    if((fl&1)!=0 && lanes>=2){
-      float lw=2.0*hw/float(lanes); float x=(lat+hw)/lw; float k=floor(x+0.5);
-      if(k>=1.0 && k<=float(lanes)-0.5 && abs(x-k)*lw<0.07){
-        bool center=((fl&4)==0) && (abs(k*2.0-float(lanes))<0.1);
-        if((center && klass<=2) || mod(along,9.0)<3.0) line=1.0;
-      }
+    if(klass==8){ // Mittelinsel eines Kreisverkehrs: Rasen mit Bordstein
+      float inside=-lat;
+      float aa=smoothstep(-0.02,0.12,inside);
+      vec3 grass=vec3(0.26,0.40,0.20)+0.06*vnoise(vW.xz*0.9)+0.03*vnoise(vW.xz*6.0);
+      float cb=smoothstep(0.42,0.34,inside);
+      o=vec4(fog(mix(grass,vec3(0.72,0.71,0.68),cb)),aa); return;
     }
-    if((fl&2)!=0 && abs(abs(lat)-(hw-0.3))<0.06) line=1.0;
-    line*=clamp(1.6-length(vW-uCam)/220.0,0.0,1.0);
-    c=mix(c,vec3(0.86),line*0.9);
+    bool sw=(fl&8)!=0, swOnly=(fl&16)!=0;
+    float al=abs(lat);
+    float dist=length(vW-uCam);
+    float nearF=uQ>0 ? clamp(1.0-dist/70.0,0.0,1.0) : 0.0;
+    // Ausdehnung des Bandes: Gehsteigband bis hw+1.9, Asphaltband bis hw (+0.15 Randstein)
+    float outer=swOnly ? hw+1.9 : (sw ? hw+0.15 : hw);
+    float a=smoothstep(outer, outer-0.22, al);
+    if(swOnly) a*=smoothstep(hw-0.03, hw+0.03, al);
+    float nz=uQ>0 ? vnoise(vW.xz*14.0)*0.6+vnoise(vW.xz*1.7)*0.4 : 0.5;
+    vec3 c;
+    if(al>hw){
+      // Gehsteig: helle Platten mit Fugen, Randstein-Kante
+      float slab=uQ>0 ? vnoise(floor(vec2(along,al)*1.25)*0.7)*0.06 : 0.0;
+      c=vec3(0.60,0.58,0.55)+slab+0.03*nz;
+      float j=max(step(0.965,fract(along*1.25)), step(0.965,fract(al*1.25)));
+      c=mix(c, c*0.78, j*nearF*0.8);
+      float kerb=smoothstep(hw+0.15, hw+0.05, al);
+      c=mix(c, vec3(0.74,0.73,0.71), kerb*step(hw,al));
+    } else {
+      float fine=(vnoise(vW.xz*38.0)-0.5)*0.05*nearF;
+      c=vec3(0.19+0.05*nz+fine);
+      if(klass>=7) c=vec3(0.42,0.38,0.30)+0.05*nz+fine;
+      // Spurrillen und Fahrbahnflecken
+      float lw0=2.0*hw/float(max(lanes,1)); float xl=(lat+hw)/lw0; float dc=(fract(xl)-0.5)*lw0;
+      float track=smoothstep(0.38,0.0,abs(abs(dc)-0.85))*step(2.0,lw0)*(klass<=5?1.0:0.0);
+      c*=1.0-0.12*track*nearF;
+      if(uQ>0) c*=0.92+0.10*vnoise(vW.xz*0.35);
+      // Markierungen (weich, abgenutzt)
+      float line=0.0;
+      if((fl&1)!=0 && lanes>=2){
+        float lw=lw0; float x=(lat+hw)/lw; float k=floor(x+0.5);
+        float d=abs(x-k)*lw;
+        if(k>=1.0 && k<=float(lanes)-0.5){
+          bool center=((fl&4)==0) && (abs(k*2.0-float(lanes))<0.1);
+          float dash=(center && klass<=2) ? 1.0 : smoothstep(0.0,0.15,3.0-mod(along,9.0))*smoothstep(0.0,0.15,mod(along,9.0));
+          line=max(line, smoothstep(0.085,0.05,d)*dash);
+        }
+      }
+      if((fl&2)!=0) line=max(line, smoothstep(0.085,0.05,abs(al-(hw-0.3))));
+      float wear=uQ>0 ? 0.78+0.22*vnoise(vW.xz*6.0) : 0.9;
+      line*=wear*clamp(1.6-dist/220.0,0.0,1.0);
+      c=mix(c,vec3(0.88,0.88,0.84),line*0.92);
+    }
     o=vec4(fog(c),a); return;
   }
   if(uMode==3){
     vec3 c=vC.rgb;
     if(vC.a>0.5){
+      bool gl=vC.a<0.85;
       vec2 g=vec2(fract(vUV.x/2.8), fract(vUV.y/3.1));
-      float win=step(0.22,g.x)*step(g.x,0.78)*step(0.28,g.y)*step(g.y,0.80);
+      float win=gl ? step(0.04,g.x)*step(g.x,0.96)*step(0.10,g.y)*step(g.y,0.90)
+                   : step(0.22,g.x)*step(g.x,0.78)*step(0.28,g.y)*step(g.y,0.80);
       float id=hash(floor(vec2(vUV.x/2.8, vUV.y/3.1))+floor(vW.xz*0.05));
-      c=mix(c, mix(vec3(0.10,0.13,0.18), vec3(0.35,0.42,0.52), id*0.6), win);
+      vec3 vv=normalize(vW-uCam);
+      float fr=0.25+0.5*pow(1.0-abs(dot(vv,normalize(vN))),2.0);
+      vec3 glassC=gl ? mix(vec3(0.20,0.30,0.38), sky(normalize(vec3(vv.x,abs(vv.y)+0.15,vv.z))), fr) : mix(vec3(0.10,0.13,0.18), vec3(0.35,0.42,0.52), id*0.6);
+      c=mix(c, glassC, win);
     }
     o=vec4(fog(c*l),1.0); return;
   }
@@ -126,7 +166,7 @@ void main(){
 
 static struct {
     GLuint prog = 0, dynVao = 0, dynVbo = 0;
-    GLint uMVP, uMode, uFlags, uTex, uCam, uSun, uInvVP, uBias, uTint, uModel, uTile;
+    GLint uMVP, uMode, uFlags, uTex, uCam, uSun, uInvVP, uBias, uTint, uModel, uTile, uQ;
     float maxAniso = 1;
 } G;
 
@@ -165,7 +205,8 @@ bool gfxInit() {
     G.uFlags = glGetUniformLocation(G.prog, "uFlags"); G.uTex = glGetUniformLocation(G.prog, "uTex");
     G.uCam = glGetUniformLocation(G.prog, "uCam"); G.uSun = glGetUniformLocation(G.prog, "uSun");
     G.uInvVP = glGetUniformLocation(G.prog, "uInvVP"); G.uBias = glGetUniformLocation(G.prog, "uBias");
-    G.uTint = glGetUniformLocation(G.prog, "uTint");
+    G.uTint = glGetUniformLocation(G.prog, "uTint"); G.uQ = glGetUniformLocation(G.prog, "uQ");
+    glUniform1i(G.uQ, 1);
     G.uModel = glGetUniformLocation(G.prog, "uModel"); G.uTile = glGetUniformLocation(G.prog, "uTile");
     gfxModel(identity());
     glUniform1f(G.uTile, 2.0f);
@@ -186,6 +227,7 @@ bool gfxInit() {
 void gfxMode(int mode, int flags) { glUniform1i(G.uMode, mode); glUniform1i(G.uFlags, flags); glUniform3f(G.uTint, 1, 1, 1); }
 void gfxModel(const Mat4& m) { glUniformMatrix4fv(G.uModel, 1, GL_FALSE, m.m); }
 void gfxTile(float metres) { glUniform1f(G.uTile, metres); }
+void gfxQuality(int q) { glUniform1i(G.uQ, q); }
 GLuint gfxTextureFile(const std::string& path) {
     int w, h, c;
     uint8_t* px = stbi_load(path.c_str(), &w, &h, &c, 3);
@@ -368,7 +410,14 @@ void Font::draw(Batch& b, float x, float y, float px, Color c, const std::string
     }
 }
 
+void Target::destroy() {
+    if (fbo) glDeleteFramebuffers(1, &fbo);
+    if (depth) glDeleteRenderbuffers(1, &depth);
+    if (tex) glDeleteTextures(1, &tex);
+    fbo = depth = tex = 0; w = h = 0;
+}
 void Target::create(int w_, int h_) {
+    destroy();
     w = w_; h = h_;
     glGenFramebuffers(1, &fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);

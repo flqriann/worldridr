@@ -23,10 +23,33 @@ struct AI {
     float s = 0, yaw = 0, v = 0, wheelRot = 0, steerVis = 0, waited = 0, stopTimer = 0, stuck = 0, crashWait = 0;
     Vec3 pos;
     Color paint;
+    int model = 0;
     bool braking = false, ctl = false, stopDone = false, yielding = false;
+    int police = 0;       // 0 normal, 1 Streife, 2 im Einsatz (Anhalten/Verfolgung)
+    int kind = 0;         // 0 Auto, 1 Moped, 2 Motorrad
+    int uid = 0;
     int turn = 0;
 };
 std::vector<AI> cars;
+
+// ---------- Polizei ----------
+// Ablauf: Verstoesse erhoehen "heat". Ab einem Schwellwert kommt eine Streife (oder wird neu losgeschickt), blinkt und ordnet
+// das Anhalten an (ORDER). Haelt der Spieler an, gibt es eine Verkehrskontrolle (STOPPED). Ignoriert er die Anweisung,
+// beginnt die Verfolgung (CHASE), bis er die Polizei abhaengt oder stehen bleibt.
+enum { P_NONE, P_ORDER, P_CHASE, P_STOPPED };
+struct PoliceCase {
+    int state = P_NONE, uid = -1;
+    double t0 = 0, cooldown = 0, farSince = -1;
+    float heat = 0, speeding = 0, stopHold = 0, still = 0;
+} pc;
+int nextUid = 1;
+int policeModel = -2;
+
+bool isPoliceCar(const AI& c) { return c.police > 0; }
+AI* policeCar() {
+    for (AI& c : cars) if (c.uid == pc.uid && c.police > 0) return &c;
+    return nullptr;
+}
 
 // Alle Verkehrsteilnehmer in einheitlicher Form (KI, Spieler, Mitspieler)
 struct Obs { Vec3 pos, fwd; float v; int toNode; float dNode; int klass; bool ctl, player; int ai, edge; bool yielding; };
@@ -55,6 +78,22 @@ float laneOffset(const RoadSeg& s) {
 void chooseNext(AI& c) {
     int n = toNode(c.e, c.rev);
     Vec3 d = dirOf(c.e, c.rev);
+    if (c.police == 2) { // im Einsatz: den Abzweig waehlen, der am besten zum Spieler fuehrt (auch Wenden)
+        Vec3 toP = car.pos - nodeP[n];
+        toP.y = 0;
+        toP = normalize(toP);
+        int bestE = -1;
+        bool bestRev = false;
+        float bestS = -2;
+        for (int e2 : adj[n]) {
+            bool rev2 = E[e2].n1 == n;
+            if (e2 == c.e) rev2 = !c.rev;
+            if (!allowed(e2, rev2)) continue;
+            float s = dot(dirOf(e2, rev2), toP) - (e2 == c.e ? 0.35f : 0.0f);
+            if (s > bestS) { bestS = s; bestE = e2; bestRev = rev2; }
+        }
+        if (bestE >= 0) { c.ne = bestE; c.nrev = bestRev; return; }
+    }
     std::vector<std::pair<int, bool>> cand;
     std::vector<float> w;
     for (int e2 : adj[n]) {
@@ -120,7 +159,7 @@ void rebuild() {
     }
 }
 
-void spawn() {
+void spawn(bool pursuer = false) {
     if (E.empty()) return;
     std::uniform_int_distribution<int> pick(0, (int)E.size() - 1);
     static const Color pal[10] = {{40, 90, 190, 255}, {228, 228, 232, 255}, {28, 30, 34, 255}, {150, 154, 162, 255}, {230, 170, 30, 255},
@@ -131,10 +170,12 @@ void spawn() {
         if (ed.len < 8) continue;
         Vec3 mid{(ed.s.ax + ed.s.bx) * 0.5f, 0, (ed.s.az + ed.s.bz) * 0.5f};
         float dp = std::hypot(mid.x - car.pos.x, mid.z - car.pos.z);
-        if (dp < 80 || dp > 330) continue;
+        if (pursuer ? (dp < 70 || dp > 200) : (dp < 80 || dp > 330)) continue;
+        if (pursuer) { Vec3 f = car.forward(); f.y = 0; f = normalize(f); if (dot(mid - car.pos, f) > -25) continue; }
         AI c;
         c.e = e;
         c.rev = (rng() & 1) != 0;
+        if (pursuer) { Vec3 toP = car.pos - Vec3{(ed.s.ax + ed.s.bx) * 0.5f, 0, (ed.s.az + ed.s.bz) * 0.5f}; c.rev = (ed.dx * toP.x + ed.dz * toP.z) < 0; }
         if (!allowed(e, c.rev)) c.rev = !c.rev;
         c.s = ed.len * 0.5f;
         chooseNext(c);
@@ -148,12 +189,88 @@ void spawn() {
         c.yaw = std::atan2(-d.x, -d.z);
         c.v = std::min(ed.s.maxspeed, 50.0f) / 3.6f * 0.6f;
         c.paint = pal[rng() % 10];
+        c.model = carModelCount() > 0 ? (int)(rng() % carModelCount()) : -1;
+        c.uid = nextUid++;
+        { int r100 = (int)(rng() % 100); c.kind = r100 < 9 ? 1 : (r100 < 15 ? 2 : 0); }
+        if (policeModel == -2) policeModel = carModelFind("police");
+        int patrols = 0;
+        for (const AI& o : cars) if (o.police == 1) patrols++;
+        if (pursuer || (cfg.police && policeModel >= 0 && patrols < std::max(1, traffic::wanted / 8) && rng() % 4 == 0)) {
+            c.police = pursuer ? 2 : 1;
+            c.model = policeModel; c.kind = 0;
+            if (pursuer) { c.v = std::min(ed.s.maxspeed, 90.0f) / 3.6f * 0.8f; chooseNext(c); }
+        } else if (carModelCount() > 1 && c.model == policeModel) c.model = (c.model + 1) % carModelCount();
         cars.push_back(c);
         return;
     }
 }
 
 float stopLaw(float dist) { return std::sqrt(2.0f * 2.6f * std::max(0.0f, dist)); }
+void endCase(AI* p, float coolDown, const char* msg) {
+    if (msg) hud.msgs.push_back({msg, 5.0f});
+    pc.state = P_NONE; pc.heat = 0; pc.speeding = 0; pc.still = 0; pc.cooldown = simTime + coolDown;
+    if (p) { p->police = 1; p->ne = -1; chooseNext(*p); }
+}
+
+void policeLogic(float dt, const RoadHit& ph) {
+    float spd = std::fabs(car.speed()) * 3.6f;
+    if (ph.found && ph.dist < ph.seg->hw + 1.5f && spd > ph.seg->maxspeed + 25 && spd > 45) pc.speeding += dt;
+    else pc.speeding = std::max(0.0f, pc.speeding - dt);
+    if (pc.speeding > 2.5f) pc.heat += dt * 0.9f;
+    else if (pc.state == P_NONE) pc.heat = std::max(0.0f, pc.heat - dt * 0.2f);
+
+    AI* p = policeCar();
+    { static int lastState = -1; if (pc.state != lastState) { lastState = pc.state; logMsg("Polizei-Zustand: %d (heat %.1f)", pc.state, pc.heat); } }
+    if (pc.state == P_NONE) {
+        if (simTime < pc.cooldown) { pc.heat = 0; return; }
+        if (pc.heat < 2.0f) return;
+        AI* best = nullptr;
+        float bd = 150;
+        for (AI& c : cars) {
+            if (c.police != 1) continue;
+            float d = std::hypot(c.pos.x - car.pos.x, c.pos.z - car.pos.z);
+            if (d < bd) { bd = d; best = &c; }
+        }
+        if (!best && pc.heat >= 3.5f && policeModel >= 0) { // keine Streife in der Naehe: eine wird losgeschickt
+            size_t before = cars.size();
+            spawn(true);
+            if (cars.size() > before) best = &cars.back();
+        }
+        if (!best) return;
+        best->police = 2;
+        best->ne = -1;
+        chooseNext(*best);
+        logMsg("Polizei: Anhalten angeordnet"); pc.uid = best->uid; pc.state = P_ORDER; pc.t0 = simTime; pc.still = 0; pc.farSince = -1;
+        hud.msgs.push_back({"Polizei: Bitte anhalten!", 6.0f});
+        return;
+    }
+    if (!p) { endCase(nullptr, 30, nullptr); return; }
+    float d = std::hypot(p->pos.x - car.pos.x, p->pos.z - car.pos.z);
+    bool stopped = std::fabs(car.speed()) < 1.2f;
+    if (pc.state == P_ORDER) {
+        pc.still = (stopped && d < 80) ? pc.still + dt : 0;
+        if (pc.still > 1.0f) { pc.state = P_STOPPED; pc.stopHold = 0; hud.msgs.push_back({"Verkehrskontrolle", 4.0f}); }
+        else if (simTime - pc.t0 > 22) {
+            pc.state = P_CHASE; pc.t0 = simTime; pc.farSince = -1; pc.still = 0;
+            hud.msgs.push_back({"Die Polizei verfolgt dich!", 5.0f});
+            script.event("police_ignored");
+        }
+    } else if (pc.state == P_STOPPED) {
+        pc.stopHold += dt;
+        if (!stopped && car.speed() > 3.0f && pc.stopHold < 4.0f) { // zu frueh losgefahren
+            pc.state = P_CHASE; pc.t0 = simTime; pc.farSince = -1; pc.still = 0;
+            hud.msgs.push_back({"Du bist abgehauen - Verfolgung!", 5.0f});
+            script.event("police_ignored");
+        } else if (pc.stopHold > 6.0f) endCase(p, 120, "Kontrolle beendet. Gute Fahrt!");
+    } else if (pc.state == P_CHASE) {
+        pc.still = (stopped && d < 30) ? pc.still + dt : 0;
+        if (pc.still > 3.0f) { pc.state = P_STOPPED; pc.stopHold = 0; hud.msgs.push_back({"Gestoppt - Verkehrskontrolle", 4.0f}); }
+        if (d > 220) {
+            if (pc.farSince < 0) pc.farSince = simTime;
+            else if (simTime - pc.farSince > 15) endCase(p, 60, "Polizei abgeh\xC3\xA4ngt");
+        } else pc.farSince = -1;
+    }
+}
 } // namespace
 
 namespace traffic {
@@ -161,10 +278,17 @@ namespace traffic {
 int count() { return (int)cars.size(); }
 
 void update(float dt) {
-    if (builtGen != world.geo().gen) { builtGen = world.geo().gen; cars.clear(); builtVersion = -1; }
-    if (wanted <= 0) { cars.clear(); return; }
+    if (builtGen != world.geo().gen) { builtGen = world.geo().gen; cars.clear(); builtVersion = -1; pc = PoliceCase{}; }
+    if (wanted <= 0) { cars.clear(); pc = PoliceCase{}; return; }
     if (builtVersion != world.roadVersion()) { builtVersion = world.roadVersion(); rebuild(); }
     if ((int)cars.size() < wanted) spawn();
+
+    Vec3 pf = car.forward();
+    pf.y = 0;
+    pf = normalize(pf);
+    RoadHit ph = world.nearestRoad(car.pos.x, car.pos.z, 12);
+    if (!cfg.police) { for (size_t i = 0; i < cars.size();) { if (cars[i].police) cars.erase(cars.begin() + i); else i++; } pc = PoliceCase{}; }
+    else policeLogic(dt, ph); // kann Fahrzeuge anlegen: deshalb vor dem Sammeln der Teilnehmer
 
     // --- alle Verkehrsteilnehmer sammeln ---
     std::vector<Obs> obs;
@@ -172,11 +296,7 @@ void update(float dt) {
         const AI& c = cars[i];
         obs.push_back({c.pos, {-std::sin(c.yaw), 0, -std::cos(c.yaw)}, c.v, toNode(c.e, c.rev), E[c.e].len - c.s, E[c.e].s.klass, c.ctl, false, (int)i, c.e, c.waited > 3});
     }
-    Vec3 pf = car.forward();
-    pf.y = 0;
-    pf = normalize(pf);
     Obs player{car.pos, pf, std::fabs(car.speed()), -1, 1e9f, 5, false, true, -1, -1, false};
-    RoadHit ph = world.nearestRoad(car.pos.x, car.pos.z, 12);
     if (ph.found) {
         bool fwdDir = pf.x * ph.dx + pf.z * ph.dz >= 0;
         float ex = fwdDir ? ph.seg->bx : ph.seg->ax, ez = fwdDir ? ph.seg->bz : ph.seg->az;
@@ -185,6 +305,11 @@ void update(float dt) {
         player.klass = ph.seg->klass;
     }
     obs.push_back(player);
+    { // Fussgaenger auf der Fahrbahn: Autos muessen warten
+        std::vector<std::pair<Vec3, Vec3>> pcs;
+        ped::crossing(pcs);
+        for (auto& pp : pcs) obs.push_back({pp.first, pp.second, 1.4f, -1, 1e9f, 5, false, false, -1, -1, false});
+    }
     for (const NetCar& n : netplay::cars())
         if (n.placed) obs.push_back({n.pos, qrot(n.qs, {0, 0, -1}), std::fabs(n.speed), -1, 1e9f, 5, false, false, -1, -1, false});
 
@@ -195,6 +320,13 @@ void update(float dt) {
         int N = toNode(c.e, c.rev);
         float dA = ed.len - c.s;
         float vT = std::min(ed.s.maxspeed, 130.0f) / 3.6f * 0.92f;
+        bool emergency = c.police == 2;
+        if (c.kind == 1) vT = std::min(vT, 12.5f); // Moped: maximal ca. 45 km/h
+        if (emergency) { // Einsatz: schneller als erlaubt, bei der Kontrolle dicht hinter dem Spieler anhalten
+            float pv = std::fabs(car.speed());
+            vT = std::min(std::max(std::max(vT * 1.6f, 13.0f), pv + 3.0f), pc.state == P_CHASE ? 38.0f : 30.0f);
+            if (pc.state == P_STOPPED && c.uid == pc.uid) vT = std::hypot(c.pos.x - car.pos.x, c.pos.z - car.pos.z) < 18 ? 0.0f : 6.0f;
+        }
         c.turn = 0;
         if (c.ne >= 0) { // vor Kurven und beim Abbiegen langsamer, Blinker setzen
             Vec3 nd = dirOf(c.ne, c.nrev);
@@ -216,7 +348,7 @@ void update(float dt) {
         // --- Ampeln und Schilder ---
         bool signalAhead = false;
         c.ctl = false;
-        world.forControls(c.pos, 45, [&](const Control& k) {
+        if (!emergency) world.forControls(c.pos, 45, [&](const Control& k) {
             if (fwd.x * k.dx + fwd.z * k.dz < 0.8f) return;
             float dd = (k.pos.x - c.pos.x) * k.dx + (k.pos.z - c.pos.z) * k.dz - 2.2f;
             float lat = (k.pos.x - c.pos.x) * (-k.dz) + (k.pos.z - c.pos.z) * k.dx;
@@ -235,7 +367,7 @@ void update(float dt) {
         });
         // --- Vorrang an Kreuzungen ohne Ampel ---
         bool mustStop = false;
-        if (adj[N].size() >= 3 && dA < 32 && !signalAhead) {
+        if (adj[N].size() >= 3 && dA < 32 && !signalAhead && !emergency) {
             for (const Obs& o : obs) {
                 if (o.ai == (int)i) continue;
                 bool inJunction = std::hypot(o.pos.x - nodeP[N].x, o.pos.z - nodeP[N].z) < 7.5f && o.edge != c.e && o.v > 0.5f;
@@ -278,7 +410,7 @@ void update(float dt) {
         c.s = dot(c.pos - nodeP[fromNode(c.e, c.rev)], dir);
         c.stuck = c.v < 0.2f ? c.stuck + dt : 0;
 
-        bool remove = std::hypot(c.pos.x - car.pos.x, c.pos.z - car.pos.z) > 440 || c.stuck > 45;
+        bool remove = std::hypot(c.pos.x - car.pos.x, c.pos.z - car.pos.z) > (c.police == 2 ? 900.0f : 440.0f) || c.stuck > 45;
         if (!remove && c.s >= ed.len - 0.4f) { // naechster Abschnitt
             if (c.ne < 0) remove = true;
             else {
@@ -321,7 +453,9 @@ void draw(const Mat4& vp, Vec3 cam, float maxDist) {
         v.M = fromQuatPos(qaxis({0, 1, 0}, c.yaw), c.pos + Vec3{0, 0.54f, 0});
         v.steer = c.steerVis;
         for (float& r : v.wheelRot) r = c.wheelRot;
-        v.paint = c.paint;
+        v.paint = c.paint; v.tinted = c.police == 0; v.model = c.model; v.siren = c.police == 2;
+        v.kind = c.police ? 0 : c.kind;
+        v.lean = clampv(-c.steerVis * c.v * 0.16f, -0.55f, 0.55f);
         v.brake = c.braking;
         v.blinkL = c.turn < 0 && blink;
         v.blinkR = c.turn > 0 && blink;
@@ -329,4 +463,46 @@ void draw(const Mat4& vp, Vec3 cam, float maxDist) {
     }
 }
 
+
+// Verstoss des Spielers melden (0 rote Ampel, 1 Stoppschild, 2 Unfall)
+void offence(int kind) {
+    if (!cfg.police) return;
+    static const float w[3] = {2.2f, 1.2f, 1.8f};
+    pc.heat += w[clampv(kind, 0, 2)];
+}
+std::string policeStatus() {
+    const AI* p = nullptr;
+    for (const AI& c : cars) if (c.uid == pc.uid && c.police > 0) p = &c;
+    std::string where;
+    if (p) {
+        Vec3 f = car.forward();
+        f.y = 0;
+        f = normalize(f);
+        float d = std::hypot(p->pos.x - car.pos.x, p->pos.z - car.pos.z);
+        bool behind = dot(p->pos - car.pos, f) < 0;
+        char b[64];
+        snprintf(b, sizeof b, "  \xC2\xB7  %d m %s", (int)(std::round(d / 10.0f) * 10), behind ? "hinter dir" : "vor dir");
+        where = b;
+    }
+    switch (pc.state) {
+    case P_ORDER: return "Polizei: Bitte anhalten" + where;
+    case P_CHASE: return "Polizei verfolgt dich" + where;
+    case P_STOPPED: return "Verkehrskontrolle";
+    default: return "";
+    }
+}
+// Position und Alarmzustand aller Polizeiautos (fuer die Minimap)
+void policeMarks(std::vector<std::pair<Vec3, bool>>& out) {
+    for (const AI& c : cars) if (c.police > 0) out.push_back({c.pos, c.police == 2});
+}
+bool policeActive() { return pc.state != P_NONE; }
+float sirenLevel() { // Lautstaerke der naechsten Sirene (0..1)
+    float best = 0;
+    for (const AI& c : cars) {
+        if (c.police != 2) continue;
+        float d = std::hypot(c.pos.x - car.pos.x, c.pos.z - car.pos.z);
+        best = std::max(best, clampv(1.0f - d / 320.0f, 0.0f, 1.0f));
+    }
+    return best * best;
+}
 } // namespace traffic

@@ -2,3 +2,5 @@ build/
 cache/
 screenshots/
 *.log
+settings.cfg
+servers.txt

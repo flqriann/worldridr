@@ -147,7 +147,15 @@ struct Config {
     int nearZoom = 18;
     float fov = 62, volume = 0.6f;
     std::string playerName = "Fahrer";
+    bool startAuto = true; // Startort aus der IP-Adresse (config.lua: start = "auto")
+    std::string carModel = "sedan"; // Datei in assets/cars (ohne .obj), "builtin" = Eigenbau
     int port = 27015;
     int traffic = 22; // Anzahl KI-Fahrzeuge in der Umgebung (0 = aus)
+    int peds = 10;    // Anzahl Fussgaenger in der Umgebung (0 = aus)
+    int quality = 1;  // 0 niedrig, 1 mittel, 2 hoch
+    float renderScale = 0.85f, bldDist = 800, roadDist = 1000;
+    bool msaa = false, police = true, faultPoints = false, minimap = true, mapQuestions = true;
+    int hudMode = 0;  // 0 ruhig, 1 normal
+    bool server = false;
     WheelCfg wheel;
 };

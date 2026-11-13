@@ -152,6 +152,8 @@ void buildUI() {
     x += 104;
     if (ui.button(x, 9, 210, 32, "Hierhin teleportieren", hasMark)) { if (hasMark) { gameTeleport(myToLat(markY), mxToLon(markX)); close(); return; } }
     x += 218;
+    if (ui.button(x, 9, 130, 32, nav::active() ? "Neues Ziel" : "Navigation", hasMark)) { if (hasMark) { nav::setDestination(myToLat(markY), mxToLon(markX - std::floor(markX))); close(); return; } }
+    x += 138;
     if (ui.button(x, 9, 150, 32, "Meine Position")) { double lat, lon; gamePosition(lat, lon); cx = lonToMx(lon); cy = latToMy(lat); zf = std::max(zf, 14.0f); }
     x += 158;
     if (ui.button(x, 9, 44, 32, "+")) zf = std::min(18.0f, zf + 1);
@@ -187,13 +189,32 @@ void buildUI() {
     gamePosition(lat, lon);
     toScreen(lonToMx(lon), latToMy(lat), sx, sy);
     if (sy > TOP + 8) marker(sx, sy, Color{60, 140, 255, 255}, "Du");
+    if (nav::active()) { // Route und Ziel der Navigation
+        const auto& rt = nav::routeLatLon();
+        for (int pass = 0; pass < 2; pass++)
+            for (size_t i = 0; i + 1 < rt.size(); i++) {
+                float ax, ay, bx, by;
+                toScreen(lonToMx(rt[i].second), latToMy(rt[i].first), ax, ay);
+                toScreen(lonToMx(rt[i + 1].second), latToMy(rt[i + 1].first), bx, by);
+                if ((ax < -50 && bx < -50) || (ax > ui.W + 50 && bx > ui.W + 50) || (ay < TOP - 50 && by < TOP - 50) || (ay > ui.H + 50 && by > ui.H + 50)) continue;
+                float dx = bx - ax, dy = by - ay, l = std::hypot(dx, dy);
+                if (l < 0.01f) continue;
+                float w = (pass == 0 ? 7.0f : 4.0f) * 0.5f, nx = -dy / l * w, ny = dx / l * w;
+                Color c = pass == 0 ? Color{255, 255, 255, 235} : Color{38, 132, 255, 255};
+                ui.geo.quad({ax - nx, ay - ny, 0}, {ax + nx, ay + ny, 0}, {bx + nx, by + ny, 0}, {bx - nx, by - ny, 0}, {0, 0, 1}, c);
+            }
+        double dl, dn;
+        nav::destination(dl, dn);
+        toScreen(lonToMx(dn), latToMy(dl), sx, sy);
+        if (sy > TOP + 8) marker(sx, sy, Color{238, 70, 60, 255}, "Navigationsziel");
+    }
     for (const NetCar& c : netplay::cars()) {
         toScreen(lonToMx(c.lon), latToMy(c.lat), sx, sy);
         if (sy > TOP + 8) marker(sx, sy, Color{80, 210, 110, 255}, c.name);
     }
     if (hasMark) {
         toScreen(markX, markY, sx, sy);
-        snprintf(buf, sizeof buf, "Ziel  %.4f, %.4f  (Enter oder Doppelklick)", myToLat(markY), mxToLon(markX - std::floor(markX)));
+        snprintf(buf, sizeof buf, "Ziel  %.4f, %.4f  (Doppelklick = teleportieren)", myToLat(markY), mxToLon(markX - std::floor(markX)));
         if (sy > TOP + 8) marker(sx, sy, Color{240, 70, 60, 255}, buf);
     }
     ui.geo.rrect(10, H - 34, 520, 24, 7, Color{16, 18, 24, 200});

@@ -23,6 +23,8 @@ static int l_points(lua_State* L) { lua_pushinteger(L, self(L)->hud->points); re
 static int l_clearFaults(lua_State* L) { self(L)->hud->faults.clear(); self(L)->hud->points = 0; return 0; }
 static int l_resetCar(lua_State* L) { self(L)->wantReset = true; return 0; }
 static int l_time(lua_State* L) { lua_pushnumber(L, self(L)->time); return 1; }
+static int l_faultsOn(lua_State* L) { lua_pushboolean(L, self(L)->hud->faultsOn); return 1; }
+static int l_lesson(lua_State* L) { self(L)->hud->lessonActive = lua_toboolean(L, 1) != 0; return 0; }
 static int l_log(lua_State* L) { logMsg("[lua] %s", luaL_checkstring(L, 1)); return 0; }
 
 bool Script::init(HudState* h) {
@@ -31,7 +33,7 @@ bool Script::init(HudState* h) {
     luaL_openlibs(L);
     static const luaL_Reg fns[] = {{"instruction", l_instruction}, {"title", l_title}, {"message", l_message}, {"fault", l_fault},
                                    {"points", l_points}, {"clear_faults", l_clearFaults}, {"reset_car", l_resetCar}, {"time", l_time},
-                                   {"log", l_log}, {nullptr, nullptr}};
+                                   {"log", l_log}, {"faults_on", l_faultsOn}, {"lesson", l_lesson}, {nullptr, nullptr}};
     lua_newtable(L);
     lua_pushlightuserdata(L, this);
     luaL_setfuncs(L, fns, 1);

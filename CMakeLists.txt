@@ -44,11 +44,15 @@ target_include_directories(lua PUBLIC ${lua_SOURCE_DIR}/src)
 add_executable(worldridr
   src/main.cpp src/gfx.cpp src/net.cpp src/world.cpp src/vehicle.cpp
   src/input.cpp src/audio.cpp src/script.cpp src/vr.cpp
-  src/carmodel.cpp src/ui.cpp src/editor.cpp src/netplay.cpp src/traffic.cpp src/worldmap.cpp)
+  src/carmodel.cpp src/ui.cpp src/editor.cpp src/netplay.cpp src/traffic.cpp src/worldmap.cpp src/nav.cpp src/pedestrians.cpp src/econ.cpp)
 target_include_directories(worldridr PRIVATE ${stb_SOURCE_DIR})
 target_compile_definitions(worldridr PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(worldridr PRIVATE SDL3::SDL3-static OpenXR::openxr_loader lua
   nlohmann_json::nlohmann_json opengl32 winhttp ws2_32)
 if(MSVC)
   target_compile_options(worldridr PRIVATE /utf-8 /W3 /wd4244 /wd4305 /wd4267)
+endif()
+# Entwicklungsbau: mit Umgebungsvariable WR_SUFFIX=_dev entsteht worldridr_dev.exe (laeuft ein Spiel, ist worldridr.exe gesperrt)
+if(DEFINED ENV{WR_SUFFIX})
+  set_target_properties(worldridr PROPERTIES OUTPUT_NAME "worldridr$ENV{WR_SUFFIX}")
 endif()

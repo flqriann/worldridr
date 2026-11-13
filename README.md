@@ -28,6 +28,7 @@ Optionen: `run.bat --vr`, `run.bat --place "Graz, Hauptplatz"`, `run.bat --chase
 | Kamera (Cockpit / außen), Umsehen | V, rechte Maustaste + Maus | Menü-Taste, Steuerkreuz |
 | Zurück auf die Straße | R | Xbox-Taste |
 | Ort wechseln (Name eingeben) | T | |
+| Minimap-Zoom | N | |
 | Fahrstunden-Menü | F1, dann Ziffer | |
 | Lenkrad-Diagnose, VR neu zentrieren, Screenshot | F3, F5, P | |
 
@@ -42,6 +43,95 @@ Im Cockpit stehen Tempo, Drehzahl, Gang, Blinker und Tempolimit im 3D-Armaturenb
 Satellitenkarte mit Ortsnamen: ziehen zum Verschieben, Mausrad zum Zoomen, „Suchen“ springt zu einem Ortsnamen.
 Ein Klick setzt das Ziel, Doppelklick, Enter oder „Hierhin teleportieren“ setzt das Auto dort auf die nächste Straße.
 
+
+## Navigation und Minimap
+
+Unten rechts zeigt eine **Minimap** (Fahrtrichtung oben, Straßen nach Klasse eingefärbt, Gebäudeumrisse). **N** schaltet den
+Zoom um (150 m, 300 m, 700 m, aus). In der Weltkarte (**M**) einen Ort anklicken und **Navigation** wählen (oder nach einem Ort
+suchen): die Route wird über OSRM (OpenStreetMap-Routing) berechnet und als blaues Band auf der Straße, in der Minimap und in
+der Weltkarte angezeigt. Oben erscheinen Abbiegehinweis mit Entfernung, Restweg und Ankunftszeit; verlässt du die Route, wird
+automatisch neu berechnet. Beenden: Esc-Menü → „Navigation beenden“. Ohne Internet gibt es nur eine Luftlinie zum Ziel.
+Zum Testen: `run.bat --dest 48.2085 16.3721`.
+
+## Autos als .obj
+
+Alle `.obj`-Modelle in `assets/cars` (mit `.mtl` und Farbtextur) werden geladen: Der Spieler fährt das in `config.lua`
+(`car_model = "sedan"`) gewählte Auto, der Verkehr und die Mitspieler nutzen alle vorhandenen Modelle in wechselnden Farben.
+Im Esc-Menü schaltet „Auto: …“ durch (letzter Eintrag „Eigenbau“ = das selbst erzeugte Modell).
+Ein Modell wird automatisch ausgerichtet und skaliert. Räder müssen eigene Gruppen heißen, z. B. `wheel-front-left`,
+`wheel-front-right`, `wheel-back-left`, `wheel-back-right` (dann drehen und lenken sie); die häufigste bunte Fläche gilt als
+Lack und wird für Verkehrsautos umgefärbt. Mitgeliefert sind sechs Autos aus dem **Car Kit von Kenney** (CC0, siehe
+`assets/cars/LICENSE-Kenney-CC0.txt`); weitere findest du auf kenney.nl oder opengameart.org. Im Cockpit bleibt das
+eigene Armaturenbrett, außen siehst du das `.obj`-Auto.
+
+## Gebäude und Straßen
+
+Gebäude entstehen aus dem echten Grundriss mit Höhe (`height`, `building:levels`), Farben (`building:colour`, Material) und
+Dachform (`roof:shape`: Sattel-, Walm-, Zelt-, Pult- und Kuppeldach). Fehlen Tags, werden Dachform und -höhe nach Gebäudeart und
+Grundriss geschätzt; die Dachfarbe wird aus dem Luftbild abgelesen. Straßen sind geglättet (gerundete Kurven, Kreuzungen
+bleiben exakt), haben Gehsteige, weiche Markierungen und folgen einem glatt interpolierten Höhenmodell.
+
+## Hauptmenü, Einstellungen und Leistung
+
+Das Spiel startet mit einem Hauptmenü (Spielen, Fahrstunden, Weltkarte, Mehrspieler, Einstellungen). **Esc** öffnet es jederzeit als Pause.
+Die Oberfläche ist absichtlich ruhig: im Cockpit zeigt nur das Armaturenbrett etwas, außen ein kleines Tempofeld und ein kleines
+Tempolimit. Fehlerpunkte erscheinen nur in Fahrstunden oder wenn „Fehlerpunkte“ in den Einstellungen eingeschaltet ist.
+
+Für schwache Rechner: **Einstellungen → Grafik: Niedrig** (oder `quality = 0` in `config.lua`). Das senkt die Renderauflösung (70 %),
+schaltet Spiegel und Detailrauschen ab, verkürzt die Sichtweite, reduziert Verkehr und Gelände und blendet alles Unsichtbare aus.
+Einzeln einstellbar sind Auflösung, Spiegel, Sichtweite, Verkehr und Kantenglättung (diese gilt erst nach einem Neustart).
+Alles wird in `settings.cfg` gespeichert.
+
+## Polizei
+
+Wer an roten Ampeln oder Stoppschildern vorbeifährt, einen Unfall baut oder deutlich zu schnell fährt, fällt der Polizei auf.
+Eine Streife in der Nähe (oder ein neu losgeschicktes Fahrzeug) schaltet Blaulicht und Sirene ein und ordnet an anzuhalten.
+Hältst du an, gibt es eine kurze Verkehrskontrolle. Fährst du weiter, beginnt die Verfolgung; sie endet, wenn du anhältst oder
+die Polizei abhängst. In Fahrstunden und bei eingeschalteten Fehlerpunkten zählt eine ignorierte Anweisung als Fehler.
+Abschalten: `police = false` in `config.lua` oder im Menü.
+
+## Server und Mehrspieler
+
+- **Spiel hosten** im Menü (Mehrspieler) oder `run.bat --host`: ein Spieler hostet, die anderen treten bei.
+- **Eigenständiger Server** ohne Fenster: `server.bat --name "Mein Server" --port 27015 --max 8` (verteilt Positionen und Chat,
+  braucht keine Grafik und kein Internet für Karten). Den UDP-Port freigeben.
+- Im Menü findet **LAN-Server suchen** Spiele im lokalen Netz, beigetretene Adressen werden in `servers.txt` gemerkt.
+- **Eingabetaste** öffnet den Chat, Beitritte und Abgänge meldet der Server. Namensschilder erscheinen nur in der Nähe.
+
+## Startort, Fußgänger, Spiegel, Kartenfragen
+
+- **Startort:** Standard (`start = "auto"` in `config.lua`) ist dein ungefährer Standort per IP-Adresse (Stadtgenauigkeit). Dafür wird
+  beim Start der Dienst ipwho.is gefragt, das Ergebnis liegt 7 Tage in `cache/ip_location.json`. Wer das nicht möchte, trägt einen
+  Ortsnamen oder Koordinaten ein. Das Auto startet auf einer befahrbaren Straße, nicht in Durchgängen oder vor Wänden.
+- **Fußgänger** laufen auf den Gehsteigen und überqueren an Kreuzungen die Fahrbahn; KI-Autos halten dafür an. Wer einen Fußgänger
+  anfährt, bekommt eine Meldung, einen Fehler (10 Punkte, falls Fehlerpunkte aktiv) und die Polizei wird aufmerksam.
+  Anzahl: Menü → Einstellungen → Fußgänger.
+- **Spiegel:** Die Seitenspiegel zeigen jetzt auch dein eigenes Auto (Flanke und Heck), wie in echt.
+- **Polizei sichtbar:** Eine Verfolgerin startet hinter dir; oben steht ihr Abstand („180 m hinter dir“), auf der Minimap blinkt sie
+  blau/rot (am Rand als Pfeil), im Spiegel siehst du das Blaulicht.
+- **Kartenfragen:** Wechselt auf einer Straße die Spurzahl (z. B. von 2 auf 3), ist unklar, welche Angabe stimmt. Wenn du stehst,
+  fragt das Spiel einmal nach (höchstens alle 25 Sekunden). Deine Antwort gilt dauerhaft für diese Straßenabschnitte und steht in
+  `maps/map_overrides.json` (Datei löschen = Fragen wieder zulassen). „So lassen“ wird ebenfalls gespeichert.
+
+## Autokatalog und eigene Modelle
+
+Menü → **Autokatalog**: Liste aller Autos in `assets/cars` (plus „Eigenbau“), 3D-Vorschau zum Drehen mit der Maus, 15 Lackfarben
+oder die Originalfarbe. Auswahl und Farbe werden gespeichert (`settings.cfg`). Eigene `.obj`-Autos einfach nach `assets/cars` legen,
+auch ohne `.mtl` (Farben werden dann aus den Materialnamen abgeleitet, z. B. `crimson_paint`, `dark_grey`, `tire_black`). Räder dürfen aus
+mehreren Teilen bestehen (`tire_FL`, `rim_FL`, `spoke0_FL` …), Leuchten (`ruby_emissive`, `amber_emissive`, `headlight_lens`) reagieren
+auf Bremse, Blinker, Licht und Rückwärtsgang. Das Fußgängermodell liegt in `assets/pedestrians/pedestrian_walk.obj`.
+
+## Tank, Tankstellen, Supermärkte, Moped und Motorrad
+
+- **Tank und Geld:** Der Tank leert sich mit der Fahrt (Anzeige: Balken im Display bzw. unter dem Tempo, rot bei wenig Sprit); bei leerem Tank
+  geht der Motor aus. **K** navigiert zur nächsten Tankstelle. Tankstand und Geld werden gespeichert.
+- **Tankstellen** (aus OpenStreetMap, mit Dach, Zapfsäulen und Markenfarbe): anhalten, Motor aus (I), **J** zum Tanken, bezahlt wird pro Liter.
+- **Supermärkte** (Werbesäule in Markenfarbe): anhalten und **J** nimmt einen **Lieferauftrag** an. Das Ziel liegt 1,2–2,8 km entfernt, die
+  Navigation startet automatisch. Bezahlt wird nach Strecke, Pünktlichkeit und Fahrstil (Unfälle ziehen ab); davon bezahlst du den Sprit.
+- **Moped und Motorrad:** im Autokatalog „Derbi Senda (Moped)“ (50 ccm, 6 Gänge, ca. 50 km/h) und „Motorrad 125“ (ca. 100 km/h). Eigenes
+  Modell mit Fahrer, neigt sich in Kurven; im Cockpit sitzt du hinter dem Lenker. Auf der Straße fahren auch KI-Mopeds und -Motorräder.
+- **Kreisverkehre** sind ein eigenes Modell: glatter Ring, Mittelinsel mit Bordstein (für Fahrzeuge ein Hindernis), Fußgänger laufen nur außen.
+- Entwicklungsbau: Läuft das Spiel noch, ist `worldridr.exe` gesperrt. Mit `set WR_SUFFIX=_dev` vor `build.bat` entsteht `build\worldridr_dev.exe`.
 ## Verkehr
 
 KI-Fahrzeuge fahren auf dem echten Straßennetz und auf selbst gebauten Straßen. Sie halten Abstand, halten an
@@ -68,7 +158,7 @@ Gespeichert wird in `maps/welt.json` mit Geokoordinaten; die Karte wird beim Sta
 Gebaute Straßen haben Tempolimit, Spuren und Gehsteige und zählen für die Regelprüfung wie echte Straßen.
 Feste Blöcke und Keile ohne Neigung sind befahrbar (Rampen, Podeste), alles Höhere ist ein Hindernis.
 
-## Mehrspieler
+## Mehrspieler (Details)
 
 Menü → Mehrspieler → „Spiel hosten“ zeigt die eigene Adresse; die anderen wählen „Beitreten“ und tippen sie ein.
 Oder per Kommandozeile: `run.bat --host --name Anna` und `run.bat --join 192.168.0.40 --name Ben`.

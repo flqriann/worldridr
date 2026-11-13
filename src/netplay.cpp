@@ -1,5 +1,6 @@
-// Mehrspieler ueber UDP: ein Spieler hostet, die anderen treten per Adresse bei. Der Host verteilt die Positionen.
-// Positionen werden als Geokoordinaten gesendet, damit jeder seinen eigenen lokalen Ursprung behalten kann.
+// Mehrspieler ueber UDP: ein Spieler hostet (oder ein eigenstaendiger Server laeuft), die anderen treten per Adresse bei.
+// Der Host/Server verteilt Positionen und Chatnachrichten. Positionen werden als Geokoordinaten gesendet, damit jeder
+// seinen eigenen lokalen Ursprung behalten kann. LAN-Spiele werden per Broadcast gefunden.
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include "game.h"
@@ -8,29 +9,45 @@
 
 namespace {
 #pragma pack(push, 1)
-struct Packet {
+struct Hdr {
     uint32_t magic;
-    uint8_t type; // 1 Zustand, 2 Abschied
+    uint8_t type; // 1 Zustand, 2 Abschied, 3 Chat, 4 Suche, 5 Antwort auf Suche, 6 Lebenszeichen des Servers
     uint32_t id;
+};
+struct Packet {
+    Hdr h;
     char name[16];
     double lat, lon;
     float y, q[4], steer, speed, wheelRot;
     uint8_t flags;
 };
+struct ChatPacket {
+    Hdr h;
+    char name[16];
+    char text[96];
+};
+struct InfoPacket {
+    Hdr h;
+    char name[24];
+    uint8_t players, maxPlayers;
+};
 #pragma pack(pop)
-const uint32_t MAGIC = 0x57524431; // "WRD1"
+const uint32_t MAGIC = 0x57524432; // "WRD2"
 
-struct Peer { sockaddr_in addr; uint32_t id; double last; };
-SOCKET sock = INVALID_SOCKET;
-bool isHost = false, wsaUp = false;
+struct Peer { sockaddr_in addr; uint32_t id; double last; char name[16]; };
+SOCKET sock = INVALID_SOCKET, discSock = INVALID_SOCKET;
+bool isHost = false, isServer = false, wsaUp = false;
 sockaddr_in hostAddr{};
 std::vector<Peer> peers;
 std::vector<NetCar> remote;
+std::vector<LanServer> lan;
+std::vector<netplay::ChatLine> chatLines;
 uint32_t myId = 0;
-float sendTimer = 0;
-double lastFromHost = -100;
-std::string info;
-int portUsed = 0;
+float sendTimer = 0, beatTimer = 0;
+double lastFromHost = -100, discStart = -100;
+std::string info, serverName = "worldridr";
+int portUsed = 0, maxPlayers = 16;
+double wallNow = 0;
 
 bool openSocket(int bindPort) {
     if (!wsaUp) { WSADATA w; if (WSAStartup(MAKEWORD(2, 2), &w) != 0) return false; wsaUp = true; }
@@ -64,9 +81,124 @@ std::string localAddress() {
     freeaddrinfo(res);
     return best;
 }
-void sendTo(const Packet& p, const sockaddr_in& to) {
+template <class T> void sendTo(const T& p, const sockaddr_in& to) {
     static int errs = 0;
     if (sendto(sock, (const char*)&p, sizeof p, 0, (const sockaddr*)&to, sizeof to) < 0 && errs++ < 3) logMsg("Mehrspieler: Senden fehlgeschlagen (%d)", WSAGetLastError());
+}
+template <class T> void sendAll(const T& p, const Peer* except) {
+    for (const Peer& pe : peers) if (&pe != except) sendTo(p, pe.addr);
+}
+void say(const std::string& name, const std::string& text) {
+    chatLines.push_back({name, text, simTime});
+    if (chatLines.size() > 40) chatLines.erase(chatLines.begin());
+    if (isServer) logMsg("[Chat] %s: %s", name.c_str(), text.c_str());
+}
+void sendChatPacket(const std::string& name, const std::string& text, const Peer* except) {
+    ChatPacket c{};
+    c.h = {MAGIC, 3, myId};
+    strncpy(c.name, name.c_str(), 15);
+    strncpy(c.text, text.c_str(), 95);
+    if (isHost) sendAll(c, except); else sendTo(c, hostAddr);
+}
+std::string addrString(const sockaddr_in& a) {
+    char buf[64];
+    inet_ntop(AF_INET, (void*)&a.sin_addr, buf, sizeof buf);
+    return std::string(buf) + ":" + std::to_string(ntohs(a.sin_port));
+}
+
+void receive() {
+    for (;;) {
+        char buf[512];
+        sockaddr_in from{};
+        int fl = sizeof from;
+        int n = recvfrom(sock, buf, sizeof buf, 0, (sockaddr*)&from, &fl);
+        if (n < 0) {
+            // WSAECONNRESET meldet nur ein frueheres unzustellbares Paket - weiterlesen statt abbrechen
+            static int dbg = 0;
+            int err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK && dbg++ < 3) logMsg("Mehrspieler: Empfangsfehler %d", err);
+            if (err == WSAECONNRESET) continue;
+            break;
+        }
+        if (n < (int)sizeof(Hdr)) continue;
+        Hdr h;
+        memcpy(&h, buf, sizeof h);
+        if (h.magic != MAGIC || h.id == myId) continue;
+        if (h.type == 4 && isHost) { // Suche im LAN: mit Namen und Spielerzahl antworten
+            InfoPacket ip{};
+            ip.h = {MAGIC, 5, myId};
+            strncpy(ip.name, serverName.c_str(), 23);
+            ip.players = (uint8_t)(peers.size() + (isServer ? 0 : 1));
+            ip.maxPlayers = (uint8_t)maxPlayers;
+            sendTo(ip, from);
+            continue;
+        }
+        if (h.type == 6) { lastFromHost = simTime; continue; }
+        Peer* pe = nullptr;
+        if (isHost) {
+            for (Peer& q : peers) if (q.addr.sin_addr.s_addr == from.sin_addr.s_addr && q.addr.sin_port == from.sin_port) pe = &q;
+        } else lastFromHost = simTime;
+        if (n == (int)sizeof(Packet) && (h.type == 1 || h.type == 2)) {
+            Packet p;
+            memcpy(&p, buf, sizeof p);
+            if (isHost) {
+                if (!pe && p.h.type == 1) {
+                    if ((int)peers.size() >= maxPlayers) continue; // Server voll
+                    Peer np{};
+                    np.addr = from; np.id = p.h.id; np.last = simTime;
+                    p.name[15] = 0;
+                    strncpy(np.name, p.name, 15);
+                    peers.push_back(np);
+                    pe = &peers.back();
+                    logMsg("Mehrspieler: %s ist beigetreten (%s)", np.name, addrString(from).c_str());
+                    std::string msg = std::string(np.name) + " ist beigetreten";
+                    say("Server", msg);
+                    ChatPacket c{};
+                    c.h = {MAGIC, 3, myId};
+                    strncpy(c.name, "Server", 15);
+                    strncpy(c.text, msg.c_str(), 95);
+                    sendAll(c, nullptr);
+                }
+                if (pe) { pe->last = simTime; pe->id = p.h.id; }
+                if (p.h.type == 2 && pe) {
+                    std::string msg = std::string(pe->name) + " hat das Spiel verlassen";
+                    say("Server", msg);
+                    peers.erase(peers.begin() + (pe - peers.data()));
+                    pe = nullptr;
+                    ChatPacket c{};
+                    c.h = {MAGIC, 3, myId};
+                    strncpy(c.name, "Server", 15);
+                    strncpy(c.text, msg.c_str(), 95);
+                    sendAll(c, nullptr);
+                } else if (pe) sendAll(p, pe); // an alle anderen weiterreichen
+            }
+            auto it = std::find_if(remote.begin(), remote.end(), [&](const NetCar& c) { return c.id == p.h.id; });
+            if (p.h.type == 2) { if (it != remote.end()) remote.erase(it); continue; }
+            if (it == remote.end()) { remote.push_back(NetCar{}); it = remote.end() - 1; it->id = p.h.id; }
+            p.name[15] = 0;
+            it->name = p.name;
+            it->lat = p.lat; it->lon = p.lon; it->y = p.y;
+            it->q = qnorm(Quat{p.q[0], p.q[1], p.q[2], p.q[3]});
+            it->steer = p.steer; it->speed = p.speed; it->wheelRot = p.wheelRot; it->flags = p.flags;
+            it->lastSeen = simTime;
+        } else if (n == (int)sizeof(ChatPacket) && h.type == 3) {
+            ChatPacket c;
+            memcpy(&c, buf, sizeof c);
+            c.name[15] = 0; c.text[95] = 0;
+            if (isHost && pe) sendAll(c, pe);
+            say(c.name, c.text);
+        }
+    }
+}
+
+void purge() {
+    for (size_t i = 0; i < peers.size();) {
+        if (simTime - peers[i].last > 6) {
+            say("Server", std::string(peers[i].name) + " hat die Verbindung verloren");
+            peers.erase(peers.begin() + i);
+        } else i++;
+    }
+    for (size_t i = 0; i < remote.size();) { if (simTime - remote[i].lastSeen > 5) remote.erase(remote.begin() + i); else i++; }
 }
 } // namespace
 
@@ -74,10 +206,22 @@ namespace netplay {
 
 bool host(int port) {
     if (!openSocket(port)) { info = "Port " + std::to_string(port) + " konnte nicht ge\xC3\xB6" "ffnet werden"; return false; }
-    isHost = true;
+    isHost = true; isServer = false;
     portUsed = port;
+    serverName = cfg.playerName + "s Spiel";
     info = "Host: " + localAddress() + ":" + std::to_string(port);
     logMsg("Mehrspieler: %s", info.c_str());
+    return true;
+}
+
+bool server(int port, const std::string& name, int maxPl) {
+    if (!openSocket(port)) { logMsg("Server: Port %d konnte nicht ge\xC3\xB6" "ffnet werden", port); return false; }
+    isHost = true; isServer = true;
+    portUsed = port;
+    serverName = name.empty() ? "worldridr Server" : name;
+    maxPlayers = std::max(1, maxPl);
+    info = "Server \"" + serverName + "\" " + localAddress() + ":" + std::to_string(port);
+    logMsg("%s (max. %d Spieler)", info.c_str(), maxPlayers);
     return true;
 }
 
@@ -92,7 +236,7 @@ bool join(const std::string& address, int port) {
     if (getaddrinfo(h.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 || !res) { stop(); info = "Adresse \"" + address + "\" nicht gefunden"; return false; }
     hostAddr = *(sockaddr_in*)res->ai_addr;
     freeaddrinfo(res);
-    isHost = false;
+    isHost = false; isServer = false;
     lastFromHost = -100;
     info = "Verbinde mit " + h + ":" + std::to_string(port);
     logMsg("Mehrspieler: %s", info.c_str());
@@ -102,18 +246,21 @@ bool join(const std::string& address, int port) {
 void stop() {
     if (sock != INVALID_SOCKET) {
         Packet p{};
-        p.magic = MAGIC; p.type = 2; p.id = myId;
-        if (isHost) for (const Peer& pe : peers) sendTo(p, pe.addr); else sendTo(p, hostAddr);
+        p.h = {MAGIC, 2, myId};
+        if (isHost) sendAll(p, nullptr); else sendTo(p, hostAddr);
         closesocket(sock);
     }
     sock = INVALID_SOCKET;
-    peers.clear(); remote.clear();
+    peers.clear(); remote.clear(); chatLines.clear();
+    isHost = isServer = false;
     info.clear();
 }
 
 bool active() { return sock != INVALID_SOCKET; }
 bool hosting() { return active() && isHost; }
 std::vector<NetCar>& cars() { return remote; }
+std::vector<ChatLine>& chatLog() { return chatLines; }
+int playerCount() { return (int)remote.size() + (isServer ? 0 : 1); }
 
 std::string status() {
     if (!active()) return info.empty() ? "Nicht verbunden" : info;
@@ -121,53 +268,28 @@ std::string status() {
     return (simTime - lastFromHost < 3 ? "Verbunden" : info + " ...") + std::string("  -  ") + std::to_string(remote.size()) + " Mitspieler";
 }
 
+void chat(const std::string& text) {
+    if (!active() || text.empty()) return;
+    say("Ich", text);
+    // Name wird aus dem Spielerzustand abgeleitet: der Absender traegt seinen Namen im Paket
+    sendChatPacket(cfg.playerName, text, nullptr);
+}
+
 void update(float dt, const NetCar& mine) {
     if (!active()) return;
-    for (;;) { // empfangen
-        Packet p;
-        sockaddr_in from{};
-        int fl = sizeof from;
-        int n = recvfrom(sock, (char*)&p, sizeof p, 0, (sockaddr*)&from, &fl);
-        if (n < 0) {
-            // WSAECONNRESET meldet nur ein frueheres unzustellbares Paket - weiterlesen statt abbrechen
-            static int dbg = 0;
-            int err = WSAGetLastError();
-            if (err != WSAEWOULDBLOCK && dbg++ < 3) logMsg("Mehrspieler: Empfangsfehler %d", err);
-            if (err == WSAECONNRESET) continue;
-            break;
-        }
-        if (n != (int)sizeof p) continue;
-        if (p.magic != MAGIC || p.id == myId) continue;
-        if (isHost) {
-            Peer* pe = nullptr;
-            for (Peer& q : peers) if (q.addr.sin_addr.s_addr == from.sin_addr.s_addr && q.addr.sin_port == from.sin_port) pe = &q;
-            if (!pe && p.type == 1) { peers.push_back({from, p.id, simTime}); pe = &peers.back(); logMsg("Mehrspieler: neuer Mitspieler"); }
-            if (pe) { pe->last = simTime; pe->id = p.id; }
-            for (const Peer& q : peers) if (&q != pe) sendTo(p, q.addr); // an alle anderen weiterreichen
-        } else lastFromHost = simTime;
-        auto it = std::find_if(remote.begin(), remote.end(), [&](const NetCar& c) { return c.id == p.id; });
-        if (p.type == 2) { if (it != remote.end()) remote.erase(it); continue; }
-        if (it == remote.end()) { remote.push_back(NetCar{}); it = remote.end() - 1; it->id = p.id; }
-        p.name[15] = 0;
-        it->name = p.name;
-        it->lat = p.lat; it->lon = p.lon; it->y = p.y;
-        it->q = qnorm(Quat{p.q[0], p.q[1], p.q[2], p.q[3]});
-        it->steer = p.steer; it->speed = p.speed; it->wheelRot = p.wheelRot; it->flags = p.flags;
-        it->lastSeen = simTime;
-    }
+    receive();
     sendTimer -= dt;
     if (sendTimer <= 0) { // 20-mal pro Sekunde eigenen Zustand senden
         sendTimer = 0.05f;
         Packet p{};
-        p.magic = MAGIC; p.type = 1; p.id = myId;
+        p.h = {MAGIC, 1, myId};
         strncpy(p.name, mine.name.c_str(), 15);
         p.lat = mine.lat; p.lon = mine.lon; p.y = mine.y;
         p.q[0] = mine.q.w; p.q[1] = mine.q.x; p.q[2] = mine.q.y; p.q[3] = mine.q.z;
         p.steer = mine.steer; p.speed = mine.speed; p.wheelRot = mine.wheelRot; p.flags = mine.flags;
-        if (isHost) for (const Peer& pe : peers) sendTo(p, pe.addr); else sendTo(p, hostAddr);
+        if (isHost) sendAll(p, nullptr); else sendTo(p, hostAddr);
     }
-    for (size_t i = 0; i < peers.size();) { if (simTime - peers[i].last > 6) peers.erase(peers.begin() + i); else i++; }
-    for (size_t i = 0; i < remote.size();) { if (simTime - remote[i].lastSeen > 5) remote.erase(remote.begin() + i); else i++; }
+    purge();
     // weiche Bewegung der Mitspieler
     for (NetCar& c : remote) {
         Vec3 target;
@@ -182,5 +304,70 @@ void update(float dt, const NetCar& mine) {
         c.wheelRot += c.speed / 0.316f * dt;
     }
 }
+
+// Eigenstaendiger Server ohne Fenster: nur Verteilen, kein Weltmodell noetig
+void serverUpdate(float dt) {
+    if (!active()) return;
+    receive();
+    purge();
+    beatTimer -= dt;
+    if (beatTimer <= 0) {
+        beatTimer = 1.0f;
+        Hdr h{MAGIC, 6, myId};
+        sendAll(h, nullptr);
+    }
+}
+
+// ---------- LAN-Suche ----------
+void discover() {
+    if (!wsaUp) { WSADATA w; if (WSAStartup(MAKEWORD(2, 2), &w) != 0) return; wsaUp = true; }
+    if (discSock != INVALID_SOCKET) closesocket(discSock);
+    discSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (discSock == INVALID_SOCKET) return;
+    u_long nb = 1;
+    ioctlsocket(discSock, FIONBIO, &nb);
+    BOOL bc = TRUE;
+    setsockopt(discSock, SOL_SOCKET, SO_BROADCAST, (const char*)&bc, sizeof bc);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    bind(discSock, (sockaddr*)&a, sizeof a);
+    lan.clear();
+    Hdr h{MAGIC, 4, 0};
+    sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons((u_short)cfg.port);
+    to.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    sendto(discSock, (const char*)&h, sizeof h, 0, (sockaddr*)&to, sizeof to);
+    inet_pton(AF_INET, "127.0.0.1", &to.sin_addr); // gleicher Rechner
+    sendto(discSock, (const char*)&h, sizeof h, 0, (sockaddr*)&to, sizeof to);
+    discStart = simTime;
+}
+
+void pollDiscovery() {
+    if (discSock == INVALID_SOCKET) return;
+    for (;;) {
+        char buf[256];
+        sockaddr_in from{};
+        int fl = sizeof from;
+        int n = recvfrom(discSock, buf, sizeof buf, 0, (sockaddr*)&from, &fl);
+        if (n < 0) break;
+        if (n != (int)sizeof(InfoPacket)) continue;
+        InfoPacket ip;
+        memcpy(&ip, buf, sizeof ip);
+        if (ip.h.magic != MAGIC || ip.h.type != 5) continue;
+        ip.name[23] = 0;
+        LanServer s;
+        s.name = ip.name;
+        s.players = ip.players;
+        s.address = addrString(from);
+        bool known = false;
+        for (LanServer& o : lan) if (o.address == s.address) { o = s; known = true; }
+        if (!known) lan.push_back(s);
+    }
+    if (simTime - discStart > 4) { closesocket(discSock); discSock = INVALID_SOCKET; }
+}
+
+std::vector<LanServer> lanServers() { return lan; }
 
 } // namespace netplay

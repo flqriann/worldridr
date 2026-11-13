@@ -4,6 +4,7 @@
 #include <lua.hpp>
 #include <nlohmann/json.hpp>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
@@ -25,7 +26,7 @@ Font font;
 double simTime = 0;
 
 static Batch propsLit, propsUnlit, stopLines, mirrorQuad[3];
-static Target mirrorRT[3];
+static Target mirrorRT[3], sceneRT;
 static Mesh skyMesh;
 
 static bool spawned = false, belt = false, lights = false, debugOverlay = false, autodrive = false;
@@ -37,7 +38,9 @@ static float lookYaw = 0, lookPitch = 0, crashCooldown = 0;
 static RoadHit roadHit;
 static bool onRoad = true, wrongWay = false, running = true;
 static float laneOffset = 0;
-static bool menuOpen = false;
+static bool menuOpen = false, started = false;
+static float previewYawOff = 0;
+static double spawnedAt = -100;
 static int menuPage = 0;
 static Mat4 mainVP = identity();
 static SDL_Window* win = nullptr;
@@ -58,22 +61,26 @@ static void loadConfig() {
     if (lua_istable(L, -1)) {
         lua_getfield(L, -1, "lat"); if (lua_isnumber(L, -1)) cfg.lat = lua_tonumber(L, -1); lua_pop(L, 1);
         lua_getfield(L, -1, "lon"); if (lua_isnumber(L, -1)) cfg.lon = lua_tonumber(L, -1); lua_pop(L, 1);
-    } else if (lua_type(L, -1) == LUA_TSTRING) cfg.startPlace = lua_tostring(L, -1);
+    } else if (lua_type(L, -1) == LUA_TSTRING) { cfg.startPlace = lua_tostring(L, -1); cfg.startAuto = cfg.startPlace == "auto"; if (cfg.startAuto) cfg.startPlace.clear(); }
+    if (lua_istable(L, -1)) cfg.startAuto = false;
     lua_pop(L, 1);
     cfg.googleKey = str("google_maps_api_key");
     cfg.automatic = str("transmission") == "automatic";
     if (!str("player_name").empty()) cfg.playerName = str("player_name");
+    if (!str("car_model").empty()) cfg.carModel = str("car_model");
     lua_getglobal(L, "auto_clutch");
     if (lua_isboolean(L, -1)) cfg.autoClutch = lua_toboolean(L, -1) ? 1 : 0;
     lua_pop(L, 1);
     cfg.vr = boolean("vr", cfg.vr);
     cfg.fullscreen = boolean("fullscreen", cfg.fullscreen);
-    cfg.mirrors = boolean("mirrors", cfg.mirrors);
+
     cfg.width = (int)num("width", cfg.width);
     cfg.height = (int)num("height", cfg.height);
     cfg.nearZoom = (int)num("near_zoom", cfg.nearZoom);
     cfg.port = (int)num("port", cfg.port);
-    cfg.traffic = (int)num("traffic", cfg.traffic);
+    cfg.quality = clampv((int)num("quality", cfg.quality), 0, 2);
+    cfg.police = boolean("police", cfg.police);
+    cfg.faultPoints = boolean("fault_points", cfg.faultPoints);
     cfg.fov = (float)num("fov", cfg.fov);
     cfg.volume = (float)num("volume", cfg.volume);
     lua_getglobal(L, "wheel");
@@ -93,6 +100,104 @@ static void loadConfig() {
         lua_pop(L, 1);
     }
     lua_close(L);
+}
+
+// ---------- Einstellungen (settings.cfg) und Qualitaetsstufen ----------
+static void presetValues(int q) {
+    q = clampv(q, 0, 2);
+    static const float scale[3] = {0.70f, 0.85f, 1.0f}, bld[3] = {450, 800, 1500}, road[3] = {600, 1000, 1800};
+    static const int traffic[3] = {6, 12, 22}, peds[3] = {4, 10, 20};
+    cfg.quality = q;
+    cfg.renderScale = scale[q]; cfg.bldDist = bld[q]; cfg.roadDist = road[q];
+    cfg.traffic = traffic[q]; cfg.peds = peds[q]; cfg.mirrors = q >= 1; cfg.msaa = q >= 2;
+}
+static void applyQualityGL() {
+    world.setQuality(cfg.quality);
+    gfxQuality(cfg.quality > 0 ? 1 : 0);
+    ped::wanted = cfg.peds;
+    traffic::wanted = cfg.traffic;
+}
+// Fahrzeug des Spielers (Auto / Moped / Motorrad): Physik, Tank und Kameraposition setzen
+static void applyVehicle() {
+    car.setKind(vehKind);
+    EYE = vehKind == 0 ? Vec3{-0.36f, 0.60f, 0.22f} : Vec3{0.0f, 0.98f, 0.14f};
+    static const float cap[3] = {45.0f, 6.5f, 12.0f}, use[3] = {1.0f, 0.12f, 0.25f};
+    float old = econ::fuel;
+    econ::fuel = -1;
+    econ::setTank(cap[vehKind], use[vehKind]);
+    if (old >= 0) econ::fuel = std::min(old, cap[vehKind]);
+}
+static void saveSettings() {
+    FILE* f = fopen("settings.cfg", "w");
+    if (!f) return;
+    fprintf(f, "quality=%d\nscale=%.2f\nmirrors=%d\ntraffic=%d\npolice=%d\nfaults=%d\nhud=%d\nminimap=%d\nautomatic=%d\ncamera=%d\ncar=%s\nmsaa=%d\nbld=%.0f\nroad=%.0f\npeds=%d\nmapq=%d\n",
+            cfg.quality, cfg.renderScale, (int)cfg.mirrors, cfg.traffic, (int)cfg.police, (int)cfg.faultPoints, cfg.hudMode, (int)cfg.minimap, (int)cfg.automatic, camMode,
+            carModelSel >= 0 ? carModelName(carModelSel).c_str() : "builtin", (int)cfg.msaa, cfg.bldDist, cfg.roadDist, cfg.peds, (int)cfg.mapQuestions);
+    if (carColorSet) fprintf(f, "carcolor=%d,%d,%d\n", carColor[0], carColor[1], carColor[2]);
+    fprintf(f, "veh=%d\nfuel=%.2f\nmoney=%.2f\n", vehKind, econ::fuel, econ::money);
+    fclose(f);
+}
+// vor dem Fenster aufrufen (MSAA gilt nur beim Start)
+static bool loadSettings() {
+    presetValues(cfg.quality);
+    FILE* f = fopen("settings.cfg", "r");
+    if (!f) return false;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        std::string k = line, v = eq + 1;
+        while (!v.empty() && (v.back() == '\n' || v.back() == '\r')) v.pop_back();
+        double n = atof(v.c_str());
+        if (k == "quality") presetValues((int)n);
+        else if (k == "scale") cfg.renderScale = clampv((float)n, 0.4f, 1.0f);
+        else if (k == "mirrors") cfg.mirrors = n != 0;
+        else if (k == "traffic") cfg.traffic = clampv((int)n, 0, 40);
+        else if (k == "peds") cfg.peds = clampv((int)n, 0, 40);
+        else if (k == "police") cfg.police = n != 0;
+        else if (k == "faults") cfg.faultPoints = n != 0;
+        else if (k == "hud") cfg.hudMode = clampv((int)n, 0, 1);
+        else if (k == "minimap") cfg.minimap = n != 0;
+        else if (k == "mapq") cfg.mapQuestions = n != 0;
+        else if (k == "veh") vehKind = clampv((int)n, 0, 2);
+        else if (k == "fuel") econ::fuel = (float)n;
+        else if (k == "money") econ::money = (float)n;
+        else if (k == "carcolor") { int r, g, b; carColorSet = sscanf(v.c_str(), "%d,%d,%d", &r, &g, &b) == 3; if (carColorSet) { carColor[0] = (uint8_t)r; carColor[1] = (uint8_t)g; carColor[2] = (uint8_t)b; } }
+        else if (k == "automatic") cfg.automatic = n != 0;
+        else if (k == "camera") camMode = clampv((int)n, 0, 1);
+        else if (k == "car") cfg.carModel = v;
+        else if (k == "msaa") cfg.msaa = n != 0;
+        else if (k == "bld") cfg.bldDist = (float)n;
+        else if (k == "road") cfg.roadDist = (float)n;
+    }
+    fclose(f);
+    return true;
+}
+
+// Standort per IP-Adresse (Stadtgenauigkeit). Das Ergebnis wird 7 Tage zwischengespeichert, damit nicht bei jedem Start gefragt wird.
+static bool ipLocate(double& lat, double& lon, std::string& city) {
+    namespace fs = std::filesystem;
+    const char* cachePath = "cache/ip_location.json";
+    std::error_code ec;
+    if (fs::exists(cachePath, ec)) {
+        auto age = fs::file_time_type::clock::now() - fs::last_write_time(cachePath, ec);
+        std::vector<uint8_t> data;
+        if (!ec && age < std::chrono::hours(24 * 7) && readFile(cachePath, data)) {
+            auto j = nlohmann::json::parse(data.begin(), data.end(), nullptr, false);
+            if (j.is_object() && j.contains("lat") && j.contains("lon")) { lat = j["lat"]; lon = j["lon"]; city = j.value("city", ""); return true; }
+        }
+    }
+    std::vector<uint8_t> out;
+    int st = 0;
+    if (!httpRequest("https://ipwho.is/?fields=success,latitude,longitude,city", out, st) || st != 200) return false;
+    auto j = nlohmann::json::parse(out.begin(), out.end(), nullptr, false);
+    if (!j.is_object() || !j.value("success", false) || !j.contains("latitude")) return false;
+    lat = j["latitude"]; lon = j["longitude"]; city = j.value("city", "");
+    nlohmann::json c = {{"lat", lat}, {"lon", lon}, {"city", city}};
+    std::string s = c.dump();
+    writeFile(cachePath, std::vector<uint8_t>(s.begin(), s.end()));
+    return true;
 }
 
 static bool geocode(const std::string& q, double& lat, double& lon) {
@@ -130,16 +235,47 @@ void gamePosition(double& lat, double& lon) { world.toLatLon(car.pos.x, car.pos.
 
 static void spawnCar(bool nearCurrent) {
     Vec3 p = nearCurrent ? car.pos : Vec3{};
-    RoadHit h = world.nearestRoad(p.x, p.z, 600);
+    // Startpunkt: naechste befahrbare Strasse, deren Umgebung frei von Gebaeuden ist (Durchgaenge/Arkaden sind in den
+    // Daten oft als Gebaeude eingetragen und wuerden das Auto festhalten)
+    struct Cand { RoadSeg s; float d; };
+    std::vector<Cand> cands;
+    world.forSegmentsNear(p.x, p.z, 450, [&](const RoadSeg& s) {
+        float mx = (s.ax + s.bx) * 0.5f, mz = (s.az + s.bz) * 0.5f;
+        if (s.klass > 5 || std::hypot(s.bx - s.ax, s.bz - s.az) < 6.0f) return;
+        cands.push_back({s, std::hypot(mx - p.x, mz - p.z)});
+    });
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.d < b.d; });
     float x = p.x, z = p.z, yaw = 0;
-    if (h.found) {
-        float dx = h.dx, dz = h.dz;
-        if (h.seg->oneway == -1) { dx = -dx; dz = -dz; }
-        float off = h.seg->oneway ? 0.0f : h.seg->hw * 0.5f;
-        x = h.px - dz * off; z = h.pz + dx * off;
+    bool found = false;
+    for (const Cand& c : cands) {
+        float len = std::hypot(c.s.bx - c.s.ax, c.s.bz - c.s.az), dx = (c.s.bx - c.s.ax) / len, dz = (c.s.bz - c.s.az) / len;
+        float mx = (c.s.ax + c.s.bx) * 0.5f, mz = (c.s.az + c.s.bz) * 0.5f;
+        auto clearDist = [&](float fx, float fz) { // wie weit geradeaus frei von Gebaeuden (bis 30 m)
+            for (float t = 4; t <= 30; t += 4) if (world.insideBuilding(mx + fx * t, mz + fz * t)) return t;
+            return 30.0f;
+        };
+        float fwdFree = clearDist(dx, dz), backFree = clearDist(-dx, -dz);
+        if (c.s.oneway == -1) { dx = -dx; dz = -dz; std::swap(fwdFree, backFree); }
+        if (world.insideBuilding(mx, mz) || (c.s.oneway != 0 ? fwdFree : std::max(fwdFree, backFree)) < 22.0f) continue;
+        if (c.s.oneway == 0 && backFree > fwdFree) { dx = -dx; dz = -dz; }
+        float off = c.s.oneway ? 0.0f : c.s.hw * 0.5f;
+        x = mx - dz * off; z = mz + dx * off;
         yaw = std::atan2(-dx, -dz);
+        found = true;
+        break;
+    }
+    if (!found) { // Rueckfall: naechste Strasse wie bisher
+        RoadHit h = world.nearestRoad(p.x, p.z, 600);
+        if (h.found) {
+            float dx = h.dx, dz = h.dz;
+            if (h.seg->oneway == -1) { dx = -dx; dz = -dz; }
+            float off = h.seg->oneway ? 0.0f : h.seg->hw * 0.5f;
+            x = h.px - dz * off; z = h.pz + dx * off;
+            yaw = std::atan2(-dx, -dz);
+        }
     }
     float y = 0;
+    logMsg("Start: %d Kandidaten, gefunden=%d, Gebaeude=%d, x=%.1f z=%.1f", (int)cands.size(), (int)found, (int)world.insideBuilding(x, z), x, z);
     world.surface(x, z, 1e9f, y);
     car.place({x, y + 0.62f, z}, yaw);
 }
@@ -157,6 +293,14 @@ static CarVisual ownVisual() {
     v.blinkR = (blinker == 1 || blinker == 2) && blinkLit;
     v.lights = lights;
     v.reverse = car.gear == -1;
+    carOwnPaint(v);
+    v.kind = car.kind;
+    if (car.kind > 0) { // Zweirad neigt sich in Kurven
+        static float leanS = 0;
+        float target = std::atan(car.speed() * car.angVel.y / 9.81f) * 0.95f;
+        leanS += (clampv(target, -0.6f, 0.6f) - leanS) * 0.12f;
+        v.lean = leanS;
+    }
     return v;
 }
 static DashState ownDash() {
@@ -165,7 +309,7 @@ static DashState ownDash() {
     d.gear = car.gear; d.selector = car.selector; d.automatic = car.automatic;
     d.limit = roadHit.found && onRoad ? (int)roadHit.seg->maxspeed : 0;
     d.blinkL = (blinker == -1 || blinker == 2) && blinkLit; d.blinkR = (blinker == 1 || blinker == 2) && blinkLit;
-    d.handbrake = car.handbrake; d.belt = belt; d.engineOn = car.engineOn; d.lights = lights;
+    d.handbrake = car.handbrake; d.belt = belt; d.engineOn = car.engineOn; d.lights = lights; d.fuel = econ::fuelFrac();
     d.road = roadHit.found && onRoad ? roadHit.name : "";
     return d;
 }
@@ -207,7 +351,7 @@ static void buildProps(Vec3 cam) {
 }
 
 // ---------- Szene ----------
-static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorPass = false) {
+static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorPass = false, int mirrorIdx = -1) {
     Mat4 vp = mul(proj, view);
     gfxCamera(cam, invert(vp));
     gfxModel(identity());
@@ -224,7 +368,7 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
     gfxMVP(vp);
     gfxMode(1);
     for (int level = 0; level < 3; level++) { // fern -> nah; jede Stufe ueberdeckt die groebere
-        world.drawTerrain(level);
+        world.drawTerrain(level, vp);
         if (level < 2) glClear(GL_DEPTH_BUFFER_BIT);
     }
     glEnable(GL_BLEND);
@@ -232,17 +376,18 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
     glDepthMask(GL_FALSE);
     gfxBias(3e-5f);
     gfxMode(2);
-    world.drawRoads();
+    world.drawRoads(vp, cam, mirrorPass ? 250.0f : cfg.roadDist);
     gfxMode(0, FLAG_FOG);
     stopLines.draw();
     glDepthMask(GL_TRUE);
     gfxBias(1e-5f);
     gfxMode(2);
     world.drawCustomRoads(); // selbst gebaute Strassen liegen ueber dem Gelaende und schreiben Tiefe
+    nav::drawWorld();
     glDisable(GL_BLEND);
     gfxBias(0);
     gfxMode(3);
-    world.drawBuildings();
+    world.drawBuildings(vp, cam, mirrorPass ? 250.0f : cfg.bldDist);
     editor::drawWorld();
     gfxMode(0, FLAG_LIT | FLAG_FOG);
     propsLit.draw();
@@ -254,11 +399,16 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
         v.M = fromQuatPos(c.qs, c.pos);
         v.steer = c.steer;
         for (float& r : v.wheelRot) r = c.wheelRot;
-        v.paint = paintOf(c.id);
+        v.paint = paintOf(c.id); v.tinted = true; v.model = carModelCount() > 0 ? (int)(c.id % carModelCount()) : -1;
         v.blinkL = (c.flags & 1) != 0; v.blinkR = (c.flags & 2) != 0; v.brake = (c.flags & 4) != 0; v.lights = (c.flags & 8) != 0;
         carDraw(v, vp, false, nullptr);
     }
-    traffic::draw(vp, cam, mirrorPass ? 160.0f : 700.0f);
+    traffic::draw(vp, cam, mirrorPass ? 160.0f : std::min(700.0f, cfg.bldDist));
+    ped::draw(vp, cam, mirrorPass ? 90.0f : std::min(260.0f, cfg.bldDist * 0.5f));
+    if (mirrorPass && mirrorIdx != 1 && spawned) { // Seitenspiegel zeigen die eigene Karosserie (Flanke und Heck)
+        CarVisual self = ownVisual();
+        carDraw(self, vp, false, nullptr);
+    }
     gfxMVP(vp);
 }
 
@@ -266,7 +416,7 @@ static void drawOwnCar(const Mat4& vp, bool cockpit) {
     CarVisual v = ownVisual();
     DashState d = ownDash();
     carDraw(v, vp, cockpit, &d);
-    if (cockpit && cfg.mirrors) {
+    if (cockpit && cfg.mirrors && car.kind == 0) {
         gfxModel(v.M);
         gfxMode(4);
         gfxTint(0.9f, 0.92f, 0.95f);
@@ -277,95 +427,137 @@ static void drawOwnCar(const Mat4& vp, bool cockpit) {
 
 static void renderMirrors(const Mat4& M) {
     static const float yaw[3] = {PI - 0.17f, PI, PI + 0.17f}, fov[3] = {0.42f, 0.25f, 0.42f};
-    for (int i = 0; i < 3; i++) {
+    static int turn = 0;
+    int count = cfg.quality >= 2 ? 3 : 1; // niedrig/mittel: pro Bild nur ein Spiegel neu rendern
+    for (int n = 0; n < count; n++) {
+        int i = (turn++) % 3;
         Mat4 camM = mul(M, mul(translate(MIRROR_POS[i]), rotY(yaw[i])));
         Mat4 view = rigidInverse(camM);
         Mat4 proj = mul(scaleM(-1, 1, 1), perspective(fov[i], MIRROR_HW[i] / MIRROR_HH[i], 0.5f, 40000.0f));
         glBindFramebuffer(GL_FRAMEBUFFER, mirrorRT[i].fbo);
         glViewport(0, 0, mirrorRT[i].w, mirrorRT[i].h);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        drawScene(view, proj, xformPoint(camM, {0, 0, 0}), true);
+        drawScene(view, proj, xformPoint(camM, {0, 0, 0}), true, i);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
 // ---------- HUD ----------
+static const Color PANEL{14, 17, 23, 150};
+static const Color SOFT{190, 196, 206, 255};
+
+// ---------- HUD: bewusst ruhig. Im Cockpit zeigt das Armaturenbrett alles; ausserhalb nur das Noetigste ----------
 static void buildHUD(bool cockpit, bool loading) {
     float W = ui.W, H = ui.H, cx = W * 0.5f;
     char buf[256];
-    if (!cockpit && spawned) { // Aussenkamera: kompakte Anzeige (im Cockpit zeigt das Armaturenbrett alles)
-        float by = H - 18;
-        ui.geo.rrect(cx - 170, by - 96, 340, 96, 14, col::dark);
+    bool calm = cfg.hudMode == 0;
+    if ((!cockpit || car.kind > 0) && spawned && !loading) { // kompakte Tempoanzeige
+        float by = H - 20;
+        ui.geo.rrect(cx - 78, by - 48, 156, 48, 14, PANEL);
         snprintf(buf, sizeof buf, "%d", (int)std::lround(std::fabs(car.speed() * 3.6f)));
-        ui.labelC(cx - 40, by - 30, 56, col::white, buf);
-        ui.label(cx + 12, by - 30, 16, col::gray, "km/h");
+        ui.labelC(cx - 20, by - 13, 32, col::white, buf);
+        ui.label(cx + 6, by - 14, 13, col::gray, "km/h");
         std::string g = car.automatic ? std::string(1, "PRND"[car.selector]) : (car.gear == -1 ? "R" : car.gear == 0 ? "N" : std::to_string(car.gear));
-        ui.geo.rrect(cx + 86, by - 78, 54, 54, 9, Color{36, 40, 50, 255});
-        ui.labelC(cx + 113, by - 38, 38, col::accent, g);
-        float rf = clampv(car.rpm() / 7000.0f, 0.0f, 1.0f);
-        ui.geo.rrect(cx - 150, by - 16, 300, 6, 3, Color{44, 48, 58, 255});
-        ui.geo.rrect(cx - 150, by - 16, std::max(6.0f, 300 * rf), 6, 3, rf > 0.86f ? col::red : col::blue);
-        for (float s : {-1.0f, 1.0f}) {
-            bool on = (blinker == (int)s || blinker == 2) && blinkLit;
-            float x = cx + s * 148;
-            ui.geo.tri({x + s * 12, by - 54, 0}, {x - s * 6, by - 66, 0}, {x - s * 6, by - 42, 0}, {0, 0, 1}, on ? col::green : Color{40, 60, 46, 255});
+        ui.labelC(cx + 56, by - 13, 22, SOFT, g);
+        if (!calm) {
+            float rf = clampv(car.rpm() / 7000.0f, 0.0f, 1.0f);
+            ui.geo.rrect(cx - 70, by - 6, 140, 3, 1.5f, Color{44, 48, 58, 200});
+            ui.geo.rrect(cx - 70, by - 6, std::max(4.0f, 140 * rf), 3, 1.5f, rf > 0.86f ? col::red : col::blue);
         }
-        std::string warn = !car.engineOn ? "MOTOR AUS" : car.handbrake ? "HANDBREMSE" : !belt ? "GURT" : "";
-        if (!warn.empty()) ui.labelC(cx, by - 104, 15, col::red, warn);
+        std::string warn = !car.engineOn ? "Motor aus" : car.handbrake ? "Handbremse" : "";
+        { // Tankstand: schmaler Balken, wird bei wenig Sprit rot
+            float ff = econ::fuelFrac();
+            ui.geo.rrect(cx - 52, by + 6, 104, 4, 2, Color{44, 48, 58, 200});
+            ui.geo.rrect(cx - 52, by + 6, std::max(3.0f, 104 * ff), 4, 2, ff < 0.15f ? Color{238, 80, 66, 255} : Color{120, 190, 255, 230});
+        }
+        if (!warn.empty()) ui.labelC(cx, by - 58, 14, Color{240, 170, 120, 255}, warn);
     }
-    if (roadHit.found && onRoad && spawned && !cockpit) { // im Cockpit steht das Limit im Mitteldisplay
-        ui.geo.disc(W - 70, 70, 44, Color{215, 30, 35, 255});
-        ui.geo.disc(W - 70, 70, 34, col::white);
-        snprintf(buf, sizeof buf, "%d", (int)roadHit.seg->maxspeed);
-        ui.labelC(W - 70, 82, 34, Color{15, 15, 15, 255}, buf);
-        if (!roadHit.name.empty()) ui.labelR(W - 22, 140, 17, col::white, roadHit.name);
+    if (roadHit.found && onRoad && spawned && !loading) { // Tempolimit: klein, unaufdringlich
+        int lim = (int)roadHit.seg->maxspeed;
+        bool over = std::fabs(car.speed() * 3.6f) > lim + 3;
+        float r = calm ? 23.0f : 32.0f, px = W - r - 20, py = r + 18;
+        ui.geo.disc(px, py, r, over ? Color{238, 70, 60, 255} : Color{200, 52, 52, 235});
+        ui.geo.disc(px, py, r * 0.76f, Color{240, 240, 240, 245});
+        snprintf(buf, sizeof buf, "%d", lim);
+        ui.labelC(px, py + r * 0.3f, r * 0.8f, Color{15, 15, 15, 255}, buf);
+        if (!calm && !roadHit.name.empty()) ui.labelR(W - 20, py + r + 22, 15, SOFT, roadHit.name);
     }
-    if (!hud.title.empty() || !hud.instruction.empty()) {
-        auto lines = wrapText(hud.instruction, 21, 700);
-        float h = 46 + lines.size() * 27.0f;
-        ui.geo.rrect(cx - 380, 14, 760, h, 14, col::dark);
-        ui.geo.rrect(cx - 380, 14, 6, h, 3, col::accent);
-        ui.labelC(cx, 40, 18, col::accent, hud.title);
-        for (size_t i = 0; i < lines.size(); i++) ui.labelC(cx, 70 + i * 27.0f, 21, col::white, lines[i]);
+    float ty = 14;
+    bool lessonText = !hud.instruction.empty() && (hud.lessonActive || !hud.title.empty());
+    if (lessonText) { // Fahrstunde: ein ruhiges Feld oben
+        auto lines = wrapText(hud.instruction, 17, 520);
+        float h = 22 + (hud.title.empty() ? 0 : 20) + lines.size() * 23.0f;
+        ui.geo.rrect(cx - 290, ty, 580, h, 12, PANEL);
+        float y = ty + 22;
+        if (!hud.title.empty()) { ui.labelC(cx, y, 13, col::gray, hud.title); y += 22; }
+        for (size_t i = 0; i < lines.size(); i++) ui.labelC(cx, y + i * 23.0f, 17, col::white, lines[i]);
+        ty += h + 8;
     }
-    float my = H * 0.36f;
+    std::string pol = traffic::policeStatus();
+    if (!pol.empty() && spawned) {
+        bool flash = std::fmod(simTime, 0.8) < 0.4;
+        float w = font.width(pol, 17) + 40;
+        ui.geo.rrect(cx - w / 2, ty, w, 34, 12, Color{14, 17, 23, 190});
+        ui.geo.disc(cx - w / 2 + 16, ty + 17, 5, flash ? Color{70, 120, 255, 255} : Color{255, 70, 60, 255});
+        ui.labelC(cx + 6, ty + 23, 17, col::white, pol);
+        ty += 42;
+    }
+    float my = H * 0.30f; // kurze Meldungen, hoechstens zwei
+    int shown = 0;
     for (auto& m : hud.msgs) {
-        float w = font.width(m.text, 24) + 40;
+        if (shown++ >= 2) break;
+        float w = font.width(m.text, 19) + 32;
         uint8_t a = (uint8_t)(255 * clampv(m.ttl, 0.0f, 1.0f));
-        ui.geo.rrect(cx - w / 2, my - 27, w, 40, 12, Color{16, 18, 24, (uint8_t)(a * 0.8f)});
-        ui.labelC(cx, my, 24, Color{255, 228, 140, a}, m.text);
-        my += 46;
+        ui.geo.rrect(cx - w / 2, my - 22, w, 34, 11, Color{14, 17, 23, (uint8_t)(a * 0.62f)});
+        ui.labelC(cx, my, 19, Color{236, 232, 220, a}, m.text);
+        my += 40;
     }
     float ly = 14;
-    if (!hud.faults.empty() || hud.points > 0) {
-        float h = 40 + hud.faults.size() * 21.0f;
-        ui.geo.rrect(14, ly, 380, h, 12, col::dark);
-        snprintf(buf, sizeof buf, "Fehlerpunkte: %d", hud.points);
-        ui.label(28, ly + 27, 19, hud.points > 0 ? col::red : col::white, buf);
-        for (size_t i = 0; i < hud.faults.size(); i++) ui.label(28, ly + 50 + i * 21.0f, 15, col::gray, hud.faults[i]);
+    if (hud.faultsOn && (hud.points > 0 || hud.lessonActive)) { // Fehlerpunkte nur im Pruefungsmodus oder in Fahrstunden
+        snprintf(buf, sizeof buf, "Fehlerpunkte  %d", hud.points);
+        float w = font.width(buf, 15) + 28, h = 32 + (calm ? 0 : (float)hud.faults.size() * 19.0f);
+        ui.geo.rrect(14, ly, std::max(w, calm ? w : 300.0f), h, 11, PANEL);
+        ui.label(28, ly + 22, 15, hud.points > 0 ? Color{240, 130, 110, 255} : col::white, buf);
+        if (!calm) for (size_t i = 0; i < hud.faults.size(); i++) ui.label(28, ly + 44 + i * 19.0f, 13, col::gray, hud.faults[i]);
         ly += h + 8;
     }
     if (netplay::active()) {
-        std::string s = "Mehrspieler: " + netplay::status();
-        ui.geo.rrect(14, ly, font.width(s, 15) + 28, 30, 10, col::dark);
-        ui.label(28, ly + 21, 15, col::blue, s);
-        for (const NetCar& c : netplay::cars()) { // Namensschilder ueber den Mitspielern
+        std::string s = netplay::status();
+        ui.geo.rrect(14, ly, font.width(s, 13) + 24, 26, 9, PANEL);
+        ui.label(26, ly + 18, 13, SOFT, s);
+        ly += 34;
+        for (const NetCar& c : netplay::cars()) { // Namensschilder nur in der Naehe
             const float* m = mainVP.m;
-            Vec3 p = c.pos + Vec3{0, 1.5f, 0};
+            Vec3 p = c.pos + Vec3{0, 1.7f, 0};
             float w = m[3] * p.x + m[7] * p.y + m[11] * p.z + m[15];
-            if (!c.placed || w < 1 || w > 400) continue;
+            if (!c.placed || w < 1 || w > 120) continue;
             float sx = ((m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12]) / w * 0.5f + 0.5f) * W, sy = (1 - ((m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13]) / w * 0.5f + 0.5f)) * H;
-            float tw = font.width(c.name, 15) + 16;
-            ui.geo.rrect(sx - tw / 2, sy - 20, tw, 24, 8, Color{16, 18, 24, 190});
-            ui.labelC(sx, sy - 3, 15, col::white, c.name);
+            float tw = font.width(c.name, 13) + 14;
+            ui.geo.rrect(sx - tw / 2, sy - 18, tw, 22, 8, Color{14, 17, 23, 170});
+            ui.labelC(sx, sy - 3, 13, col::white, c.name);
+        }
+        // Chat: letzte Nachrichten unten links, blenden nach 12 s aus
+        auto& log = netplay::chatLog();
+        float cy = H - 40;
+        for (int i = (int)log.size() - 1, n = 0; i >= 0 && n < 5; i--, n++) {
+            double age = simTime - log[i].t;
+            if (age > 12 && !(typing == 4)) break;
+            uint8_t a = (uint8_t)(255 * clampv((float)(14 - age), 0.0f, 1.0f));
+            std::string t = log[i].name + ": " + log[i].text;
+            ui.geo.rrect(14, cy - 16, font.width(t, 14) + 20, 22, 8, Color{14, 17, 23, (uint8_t)(a * 0.6f)});
+            ui.label(24, cy, 14, Color{232, 232, 236, a}, t);
+            cy -= 26;
         }
     }
-    ui.label(14, H - 10, 12, Color{220, 220, 220, 190}, world.attribution());
+    // Quellenangabe: dezent (Pflicht der Datenanbieter), ausgeblendet nach einigen Sekunden im Spiel
+    if (spawned && !loading) econ::buildHUD();
+    if (!spawned || simTime - spawnedAt < 12 || menuOpen) ui.label(14, H - 8, 10, Color{210, 210, 214, 120}, world.attribution());
     if (loading) {
-        ui.geo.rrect(cx - 250, H * 0.5f - 46, 500, 80, 14, Color{16, 18, 24, 235});
-        ui.labelC(cx, H * 0.5f - 10, 26, col::white, "Lade Welt ...");
-        snprintf(buf, sizeof buf, "%d Kacheln unterwegs (Satellitenbilder, H\xC3\xB6hen, Stra\xC3\x9F" "en)", world.pendingJobs());
-        ui.labelC(cx, H * 0.5f + 16, 15, col::gray, buf);
+        float w = 300;
+        ui.geo.rrect(cx - w / 2, H * 0.5f - 26, w, 52, 14, Color{14, 17, 23, 200});
+        ui.labelC(cx, H * 0.5f - 2, 19, col::white, "Welt wird geladen ...");
+        snprintf(buf, sizeof buf, "%d Kacheln", world.pendingJobs());
+        ui.labelC(cx, H * 0.5f + 17, 12, col::gray, buf);
     }
     if (debugOverlay) {
         ui.geo.rrect(14, H - 240, 580, 204, 12, col::dark);
@@ -387,6 +579,36 @@ static void buildHUD(bool cockpit, bool loading) {
                  vr.running ? "aktiv" : (vr.available ? "bereit (Headset aufsetzen)" : "aus"));
         ui.label(26, y, 15, col::gray, buf);
     }
+}
+
+// ---------- Kartenfragen: wenn die Daten widerspruechlich sind (z. B. Spurzahl wechselt), einmal nachfragen und dauerhaft merken ----------
+static std::vector<MapConflict> mapQ;
+static void buildMapQuestion() {
+    if (!cfg.mapQuestions) { world.takeConflicts(); mapQ.clear(); return; } // Kartenfragen ausgeschaltet
+    for (MapConflict& c : world.takeConflicts()) { mapQ.push_back(c); logMsg("Kartenfrage: %s, Spuren %d <-> %d", c.name.c_str(), c.lanesA, c.lanesB); }
+    if (mapQ.empty() || !spawned || menuOpen || typing || worldmap::active() || editor::active()) return;
+    static double nextAsk = 0;
+    if (std::fabs(car.speed()) > 0.8f || simTime < nextAsk || simTime - spawnedAt < 6) return; // nur im Stand, selten (hoechstens alle 25 s)
+    int best = -1;
+    float bd = 300;
+    for (size_t i = 0; i < mapQ.size(); i++) {
+        float x, z;
+        world.toLocal(mapQ[i].lat, mapQ[i].lon, x, z);
+        float d = std::hypot(x - car.pos.x, z - car.pos.z);
+        if (d < bd) { bd = d; best = (int)i; }
+    }
+    if (best < 0) return;
+    MapConflict c = mapQ[best];
+    float W = ui.W, H = ui.H, w = 380, x = W - w - 24, y = H * 0.30f;
+    ui.panel(x, y, w, 196, Color{14, 17, 23, 225}, 14);
+    ui.label(x + 18, y + 28, 15, col::accent, "Kartenfrage");
+    std::string name = c.name.empty() ? "Diese Stra\xC3\x9F" "e" : c.name;
+    ui.label(x + 18, y + 54, 16, col::white, name);
+    ui.label(x + 18, y + 76, 13, col::gray, "Die Spurzahl wechselt hier von " + std::to_string(c.lanesA) + " auf " + std::to_string(c.lanesB) + ".");
+    ui.label(x + 18, y + 94, 13, col::gray, "Wie viele Spuren stimmen? Die Antwort wird gespeichert.");
+    if (ui.button(x + 18, y + 108, 110, 36, std::to_string(c.lanesA) + " Spuren", false, 16)) { nextAsk = simTime + 25; world.resolveConflict(c, c.lanesA); mapQ.erase(mapQ.begin() + best); return; }
+    if (ui.button(x + 136, y + 108, 110, 36, std::to_string(c.lanesB) + " Spuren", false, 16)) { nextAsk = simTime + 25; world.resolveConflict(c, c.lanesB); mapQ.erase(mapQ.begin() + best); return; }
+    if (ui.button(x + 18, y + 152, 228, 32, "So lassen, nicht mehr fragen", false, 14)) { nextAsk = simTime + 25; world.resolveConflict(c, 0); mapQ.erase(mapQ.begin() + best); return; }
 }
 
 // ---------- H-Schalthebel einrichten: jede Stellung einmal einlegen, die gemeldete Taste wird gemerkt ----------
@@ -442,7 +664,8 @@ static void buildPrompt() {
     if (!typing && statusLine.empty()) return;
     std::string s = typing == 1 ? "Ort eingeben (Enter = hinfahren, Esc = abbrechen): " + typed + "_"
                   : typing == 2 ? "Adresse des Hosts (z. B. 192.168.0.12): " + typed + "_"
-                  : typing == 3 ? "Ort auf der Karte suchen: " + typed + "_" : statusLine;
+                  : typing == 3 ? "Ort auf der Karte suchen: " + typed + "_"
+                  : typing == 4 ? "Chat (Enter = senden, Esc = abbrechen): " + typed + "_" : statusLine;
     float w = font.width(s, 22) + 44;
     ui.geo.rrect(cx - w / 2, H * 0.66f - 30, w, 46, 12, Color{16, 18, 24, 240});
     ui.labelC(cx, H * 0.66f, 22, col::white, s);
@@ -452,38 +675,248 @@ static void beginTyping(int mode) { typing = mode; typed.clear(); statusLine.cle
 
 void gameSearchOnMap() { beginTyping(3); }
 
+// ---------- Hauptmenue / Pause / Einstellungen / Mehrspieler ----------
+static std::vector<std::string> savedServers() {
+    std::vector<std::string> out;
+    FILE* f = fopen("servers.txt", "r");
+    if (!f) return out;
+    char line[200];
+    while (fgets(line, sizeof line, f)) {
+        std::string s = line;
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+        if (!s.empty() && s[0] != '#') out.push_back(s);
+    }
+    fclose(f);
+    return out;
+}
+static void rememberServer(const std::string& addr) {
+    for (const std::string& s : savedServers()) if (s == addr) return;
+    FILE* f = fopen("servers.txt", "a");
+    if (f) { fprintf(f, "%s\n", addr.c_str()); fclose(f); }
+}
+
+static void closeMenu() { menuOpen = false; started = true; menuPage = 0; }
+
 static void buildMenu() {
-    float W = ui.W, H = ui.H, w = 400, x = W * 0.5f - w * 0.5f;
-    ui.geo.rect(0, 0, W, H, Color{6, 8, 12, 120});
-    int rows = menuPage == 0 ? 11 : 4;
-    float h = 118 + rows * 48.0f, y = H * 0.5f - h * 0.5f;
-    ui.panel(x, y, w, h, Color{14, 16, 22, 240}, 18);
-    ui.geo.rrect(x, y, w, 6, 3, col::accent);
-    ui.labelC(W * 0.5f, y + 54, 38, col::white, "worldridr");
-    ui.labelC(W * 0.5f, y + 80, 14, col::gray, menuPage == 0 ? "Fahrschule auf der ganzen Welt" : netplay::status());
-    float by = y + 104;
-    auto item = [&](const std::string& label, bool active = false) { bool hit = ui.button(x + 24, by, w - 48, 40, label, active, 18); by += 48; return hit; };
+    float W = ui.W, H = ui.H;
+    if (menuPage != 3) ui.geo.rect(0, 0, W, H, Color{4, 6, 10, started ? (uint8_t)150 : (uint8_t)70});
+    float pw = menuPage == 2 ? 820.0f : (menuPage == 3 ? 480.0f : 440.0f);
+    ui.geo.rect(0, 0, pw + 64, H, Color{8, 10, 15, 215});
+    ui.geo.rect(pw + 64, 0, 2, H, Color{255, 184, 48, 90});
+    const float x = 64;
+    ui.label(x, 118, 54, col::white, "worldridr");
+    ui.label(x, 148, 16, col::gray, menuPage == 1 ? "Mehrspieler" : menuPage == 2 ? "Einstellungen" : menuPage == 3 ? "Autokatalog" : "Fahrschule auf echten Karten");
+    float by = 190, bw = 360;
+    auto item = [&](const std::string& label, bool active = false, float bx = -1, float w = -1) {
+        return ui.button(bx < 0 ? x : bx, by, w < 0 ? bw : w, 42, label, active, 17);
+    };
+    auto next = [&]() { by += 52; };
     if (menuPage == 0) {
-        if (item(spawned ? "Weiterfahren" : "Fahren")) menuOpen = false;
-        if (item("Fahrstunden")) { menuOpen = false; if (editor::active()) editor::close(); script.event("key", "f1"); }
-        if (item("Weltkarte: \xC3\xBC" "berall hin teleportieren")) { menuOpen = false; if (editor::active()) editor::close(); worldmap::open(); }
-        if (item("Ort per Namen suchen")) { menuOpen = false; beginTyping(1); }
-        if (item(traffic::wanted > 0 ? "Verkehr: an" : "Verkehr: aus")) traffic::wanted = traffic::wanted > 0 ? 0 : std::max(1, cfg.traffic);
-        if (item(editor::active() ? "Studio verlassen" : "Studio: bauen und Stra\xC3\x9F" "en legen")) {
-            menuOpen = false;
-            if (editor::active()) editor::close();
-            else { Vec3 f = car.forward(); editor::open(car.pos, std::atan2(-f.x, -f.z)); }
-        }
+        if (item(started ? "Weiterfahren" : "Spielen", !started)) closeMenu();
+        next();
+        if (item("Fahrstunden")) { closeMenu(); if (editor::active()) editor::close(); script.event("lesson", "0"); }
+        next();
+        if (item("Weltkarte und Navigation")) { closeMenu(); if (editor::active()) editor::close(); worldmap::open(); }
+        next();
         if (item("Mehrspieler")) menuPage = 1;
-        if (item(cfg.automatic ? "Getriebe: Automatik" : "Getriebe: Schaltung")) cfg.automatic = !cfg.automatic;
-        if (item(camMode == 0 ? "Kamera: Cockpit" : "Kamera: au\xC3\x9F" "en")) camMode = (camMode + 1) % 2;
-        if (item(input.shifterReady() ? "Schalthebel neu einrichten" : "Schalthebel (H-Schaltung) einrichten")) { menuOpen = false; startShifterSetup(); }
+        next();
+        if (item("Autokatalog")) menuPage = 3;
+        next();
+        if (item("Einstellungen")) menuPage = 2;
+        next();
+        if (spawned) {
+            if (item(editor::active() ? "Studio verlassen" : "Studio: bauen und Stra\xC3\x9F" "en legen")) {
+                closeMenu();
+                if (editor::active()) editor::close();
+                else { Vec3 f = car.forward(); editor::open(car.pos, std::atan2(-f.x, -f.z)); }
+            }
+            next();
+        }
+        if (nav::active()) {
+            if (item("Navigation beenden")) nav::clear();
+            next();
+        }
         if (item("Beenden")) running = false;
-    } else {
+        if (!spawned) ui.label(x, H - 66, 14, Color{255, 200, 120, 255}, "Welt wird geladen ...");
+        ui.label(x, H - 40, 12, col::gray, "Esc  Men\xC3\xBC     M  Weltkarte     N  Minimap     F2  Studio     Eingabetaste  Chat");
+        ui.label(x, H - 20, 10, Color{180, 184, 192, 120}, world.attribution());
+    } else if (menuPage == 1) {
+        ui.label(x, by - 8, 14, col::gray, netplay::status());
+        by += 14;
         if (item("Spiel hosten", netplay::hosting())) netplay::host(cfg.port);
-        if (item("Beitreten (Adresse eingeben)")) { menuOpen = false; beginTyping(2); }
-        if (item("Trennen")) netplay::stop();
+        next();
+        if (item("Adresse eingeben und beitreten")) { closeMenu(); beginTyping(2); }
+        next();
+        if (item("LAN-Server suchen")) netplay::discover();
+        next();
+        std::vector<LanServer> lan = netplay::lanServers();
+        for (const LanServer& s : lan) {
+            if (by > H - 170) break;
+            if (item(s.name + "  (" + std::to_string(s.players) + ")  " + s.address)) { netplay::join(s.address, cfg.port); rememberServer(s.address); }
+            next();
+        }
+        int shown = 0;
+        for (const std::string& s : savedServers()) {
+            if (shown++ >= 3 || by > H - 170) break;
+            if (item("Gespeichert: " + s)) netplay::join(s, cfg.port);
+            next();
+        }
+        if (netplay::active()) {
+            if (item("Trennen")) netplay::stop();
+            next();
+        }
         if (item("Zur\xC3\xBC" "ck")) menuPage = 0;
+        if (netplay::active()) {
+            float px = pw + 100;
+            ui.panel(px, 190, 300, 40 + netplay::cars().size() * 26.0f, PANEL, 12);
+            ui.label(px + 16, 216, 15, col::white, "Mitspieler");
+            float py = 244;
+            for (const NetCar& c : netplay::cars()) { ui.label(px + 16, py, 14, SOFT, c.name); py += 26; }
+        }
+        ui.label(x, H - 40, 12, col::gray, "Server ohne Fenster:  worldridr.exe --server  (siehe README)");
+    } else if (menuPage == 3) {
+        // ---------- Autokatalog: Liste, Farbauswahl; die 3D-Vorschau wird rechts daneben gezeichnet ----------
+        static float lastX = 0;
+        if (ui.down && ui.mx > pw + 70 && !ui.captured) previewYawOff += (ui.mx - lastX) * 0.012f;
+        lastX = ui.mx;
+        int count = carModelCount();
+        auto pretty = [](std::string s) {
+            for (char& c : s) if (c == '-' || c == '_') c = ' ';
+            if (!s.empty()) s[0] = (char)toupper((unsigned char)s[0]);
+            return s;
+        };
+        int entries = count + 3; // Eigenbau + Autos + Moped + Motorrad
+        bool two = entries > 9;
+        float bwid = two ? 196.0f : 400.0f;
+        float ly = 172;
+        for (int idx = 0; idx < entries; idx++) {
+            int col2 = two ? idx % 2 : 0, row = two ? idx / 2 : idx;
+            float bx = x + col2 * (bwid + 8), byy = ly + row * 40;
+            float old = by;
+            by = byy;
+            std::string label;
+            bool active;
+            if (idx <= count) { int ci = idx - 1; label = ci < 0 ? "Eigenbau" : pretty(carModelName(ci)); active = vehKind == 0 && carModelSel == ci; }
+            else { label = idx == count + 1 ? "Derbi Senda (Moped)" : "Motorrad 125"; active = vehKind == idx - count; }
+            if (item(label, active, bx, bwid)) {
+                int oldKind = vehKind;
+                if (idx <= count) { vehKind = 0; carModelSel = idx - 1; } else vehKind = idx - count;
+                if (vehKind != oldKind) { applyVehicle(); if (spawned) spawnCar(true); }
+                saveSettings();
+            }
+            by = old;
+        }
+        float cy0 = ly + ((entries + (two ? 1 : 0)) / (two ? 2 : 1)) * 40 + 14;
+        ui.label(x, cy0 + 4, 14, col::gray, "Farbe");
+        static const uint8_t pal[15][3] = {{200, 30, 40}, {230, 110, 30}, {235, 190, 30}, {40, 140, 80}, {30, 150, 150}, {40, 90, 190}, {25, 45, 100}, {120, 50, 150},
+                                           {220, 100, 160}, {235, 235, 238}, {170, 174, 182}, {100, 104, 112}, {28, 30, 34}, {120, 80, 50}, {210, 190, 150}};
+        for (int i = 0; i < 16; i++) {
+            float sx = x + (i % 8) * 46, sy = cy0 + 14 + (i / 8) * 46;
+            bool orig = i == 0;
+            Color c = orig ? Color{70, 76, 90, 255} : Color{pal[i - 1][0], pal[i - 1][1], pal[i - 1][2], 255};
+            bool sel = orig ? !carColorSet : (carColorSet && carColor[0] == pal[i - 1][0] && carColor[1] == pal[i - 1][1] && carColor[2] == pal[i - 1][2]);
+            bool hot = ui.over(sx, sy, 38, 38);
+            if (hot) ui.captured = true;
+            if (sel) ui.geo.rrect(sx - 3, sy - 3, 44, 44, 10, Color{255, 255, 255, 255});
+            ui.geo.rrect(sx, sy, 38, 38, 8, hot ? Color{(uint8_t)std::min(255, c.r + 30), (uint8_t)std::min(255, c.g + 30), (uint8_t)std::min(255, c.b + 30), 255} : c);
+            if (orig) ui.labelC(sx + 19, sy + 25, 13, col::white, "Orig.");
+            if (hot && ui.clicked) {
+                ui.clicked = false;
+                carColorSet = !orig;
+                if (!orig) { carColor[0] = pal[i - 1][0]; carColor[1] = pal[i - 1][1]; carColor[2] = pal[i - 1][2]; }
+                saveSettings();
+            }
+        }
+        by = cy0 + 14 + 2 * 46 + 6;
+        if (item("Fertig")) { menuPage = 0; saveSettings(); }
+        // Beschriftung der Vorschau
+        float px = pw + 100;
+        ui.label(px, 70, 30, col::white, vehKind == 1 ? "Derbi Senda (Moped)" : vehKind == 2 ? "Motorrad 125" : (carModelSel >= 0 ? pretty(carModelName(carModelSel)) : "Eigenbau"));
+        std::string info;
+        if (vehKind == 1) ui.label(px, 96, 14, col::gray, "50 ccm · 6 Gänge · ca. 50 km/h · Tank 6,5 l");
+        else if (vehKind == 2) ui.label(px, 96, 14, col::gray, "125 ccm · 6 Gänge · ca. 100 km/h · Tank 12 l");
+        else if (carModelSel >= 0 && carModelInfo(carModelSel, info)) ui.label(px, 96, 14, col::gray, info);
+        else if (carModelSel < 0) ui.label(px, 96, 14, col::gray, "Im Spiel erzeugtes Modell");
+        ui.label(px, H - 28, 13, Color{150, 156, 166, 200}, "Mit der Maus ziehen = drehen");
+    } else {
+        // Einstellungen in zwei Spalten
+        float x2 = x + 380;
+        auto left = [&](const std::string& label, bool active = false) { return item(label, active, x, 360); };
+        auto right = [&](const std::string& label, float ry, bool active = false) {
+            float old = by;
+            by = ry;
+            bool h = item(label, active, x2, 360);
+            by = old;
+            return h;
+        };
+        static const char* qn[3] = {"Niedrig", "Mittel", "Hoch"};
+        bool changed = false;
+        float ry = by;
+        if (left(std::string("Grafik: ") + qn[cfg.quality])) { presetValues((cfg.quality + 1) % 3); applyQualityGL(); changed = true; }
+        next();
+        {
+            static const float steps[5] = {0.5f, 0.6f, 0.7f, 0.85f, 1.0f};
+            int cur = 0;
+            for (int i = 0; i < 5; i++) if (std::fabs(steps[i] - cfg.renderScale) < 0.03f) cur = i;
+            char b[48];
+            snprintf(b, sizeof b, "Aufl\xC3\xB6sung: %d %%", (int)std::lround(steps[cur] * 100));
+            if (left(b)) { cfg.renderScale = steps[(cur + 1) % 5]; changed = true; }
+        }
+        next();
+        if (left(cfg.mirrors ? "Spiegel: an" : "Spiegel: aus")) { cfg.mirrors = !cfg.mirrors; changed = true; }
+        next();
+        {
+            const char* n = cfg.bldDist < 600 ? "Kurz" : cfg.bldDist < 1100 ? "Mittel" : "Weit";
+            if (left(std::string("Sichtweite: ") + n)) {
+                if (cfg.bldDist < 600) { cfg.bldDist = 800; cfg.roadDist = 1000; }
+                else if (cfg.bldDist < 1100) { cfg.bldDist = 1500; cfg.roadDist = 1800; }
+                else { cfg.bldDist = 450; cfg.roadDist = 600; }
+                changed = true;
+            }
+        }
+        next();
+        {
+            static const int steps[6] = {0, 4, 8, 12, 18, 24};
+            int cur = 0;
+            for (int i = 0; i < 6; i++) if (steps[i] <= cfg.traffic) cur = i;
+            if (left(cfg.traffic == 0 ? std::string("Verkehr: aus") : "Verkehr: " + std::to_string(cfg.traffic) + " Fahrzeuge")) {
+                cfg.traffic = steps[(cur + 1) % 6];
+                traffic::wanted = cfg.traffic;
+                changed = true;
+            }
+        }
+        next();
+        if (left(cfg.msaa ? "Kantengl\xC3\xA4ttung: an (nach Neustart)" : "Kantengl\xC3\xA4ttung: aus")) { cfg.msaa = !cfg.msaa; changed = true; }
+        next();
+        if (left(cfg.mapQuestions ? "Kartenfragen: an" : "Kartenfragen: aus")) { cfg.mapQuestions = !cfg.mapQuestions; changed = true; }
+        next();
+        float leftEnd = by;
+        if (right(cfg.police ? "Polizei: an" : "Polizei: aus", ry)) { cfg.police = !cfg.police; changed = true; }
+        ry += 52;
+        {
+            static const int steps[5] = {0, 5, 10, 20, 30};
+            int cur = 0;
+            for (int i = 0; i < 5; i++) if (steps[i] <= cfg.peds) cur = i;
+            if (right(cfg.peds == 0 ? std::string("Fu\xC3\x9Fg\xC3\xA4nger: aus") : "Fu\xC3\x9Fg\xC3\xA4nger: " + std::to_string(cfg.peds), ry)) { cfg.peds = steps[(cur + 1) % 5]; ped::wanted = cfg.peds; changed = true; }
+            ry += 52;
+        }
+        if (right(cfg.faultPoints ? "Fehlerpunkte: an" : "Fehlerpunkte: aus", ry)) { cfg.faultPoints = !cfg.faultPoints; changed = true; }
+        ry += 52;
+        if (right(cfg.hudMode == 0 ? "Anzeige: ruhig" : "Anzeige: ausf\xC3\xBC" "hrlich", ry)) { cfg.hudMode = 1 - cfg.hudMode; changed = true; }
+        ry += 52;
+        if (right(cfg.minimap ? "Minimap: an" : "Minimap: aus", ry)) { cfg.minimap = !cfg.minimap; changed = true; }
+        ry += 52;
+        if (right(cfg.automatic ? "Getriebe: Automatik" : "Getriebe: Schaltung", ry)) { cfg.automatic = !cfg.automatic; changed = true; }
+        ry += 52;
+        if (right(camMode == 0 ? "Kamera: Cockpit" : "Kamera: au\xC3\x9F" "en", ry)) { camMode = (camMode + 1) % 2; changed = true; }
+        ry += 52;
+        if (right("Auto: " + carModelName(carModelSel) + "  (Katalog)", ry)) menuPage = 3;
+        ry += 52;
+        if (right(input.shifterReady() ? "Schalthebel neu einrichten" : "Schalthebel einrichten", ry)) { closeMenu(); startShifterSetup(); }
+        by = std::max(leftEnd, ry + 52) + 8;
+        if (item("Zur\xC3\xBC" "ck")) menuPage = 0;
+        if (changed) saveSettings();
+        ui.label(x, H - 24, 12, col::gray, "Niedrig = schnellste Darstellung f\xC3\xBCr schwache Rechner. \xC3\x84nderungen werden automatisch gespeichert.");
     }
 }
 
@@ -505,8 +938,8 @@ static void checkControls() {
         t.seen = simTime;
         if (dd > -16 && dd < 1.5f && std::fabs(car.speed()) < 0.4f) t.stopped = true;
         if (t.prevD < 0 && dd >= 0 && lat > -1.0f && lat < c.hw + 1.0f && align > 0.5f && car.speed() > 0.5f) {
-            if (c.type == 0) { int s = World::signalState(c, simTime); if (s == 0 || s == 1) script.event("red_light"); }
-            else if (c.type == 1 && !t.stopped) script.event("stop_sign");
+            if (c.type == 0) { int s = World::signalState(c, simTime); if (s == 0 || s == 1) { script.event("red_light"); traffic::offence(0); } }
+            else if (c.type == 1 && !t.stopped) { script.event("stop_sign"); traffic::offence(1); }
         }
         t.prevD = dd;
     });
@@ -532,14 +965,26 @@ int main(int argc, char** argv) {
         }
     }
     loadConfig();
+    bool haveSettings = loadSettings();
     double shotAt = -1;
     std::string shotPath, startLesson, joinAddr;
     bool startEditor = false, startHost = false, showMenu = true, startMap = false, testTp = false;
-    double testTpLat = 0, testTpLon = 0;
+    double testTpLat = 0, testTpLon = 0, destLat = 0, destLon = 0;
+    bool haveDest = false;
     bool revTest = false;
+    int serverMax = 16;
+    bool policeTest = false, pedShow = false;
+    int poiTest = 0;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--vr") cfg.vr = true;
+        else if (a == "--server") cfg.server = true;
+        else if (a == "--page" && i + 1 < argc) menuPage = atoi(argv[++i]);
+        else if (a == "--policetest") policeTest = true;
+        else if (a == "--pedshow") pedShow = true;
+        else if (a == "--poitest") poiTest = 1;
+        else if (a == "--port" && i + 1 < argc) cfg.port = atoi(argv[++i]);
+        else if (a == "--max" && i + 1 < argc) serverMax = atoi(argv[++i]);
         else if (a == "--autodrive") { autodrive = true; showMenu = false; }
         else if (a == "--chase") camMode = 1;
         else if (a == "--editor") { startEditor = true; showMenu = false; }
@@ -547,22 +992,42 @@ int main(int argc, char** argv) {
         else if (a == "--nomenu") showMenu = false;
         else if (a == "--map") { startMap = true; showMenu = false; }
         else if (a == "--revtest") { revTest = true; showMenu = false; cfg.traffic = 0; }
+        else if (a == "--dest" && i + 2 < argc) { destLat = atof(argv[i + 1]); destLon = atof(argv[i + 2]); haveDest = true; i += 2; }
         else if (a == "--tp" && i + 2 < argc) { testTpLat = atof(argv[i + 1]); testTpLon = atof(argv[i + 2]); testTp = true; i += 2; } // Selbsttest: nach 4 s teleportieren
         else if (a == "--traffic" && i + 1 < argc) cfg.traffic = atoi(argv[++i]);
         else if (a == "--join" && i + 1 < argc) joinAddr = argv[++i];
         else if (a == "--name" && i + 1 < argc) cfg.playerName = argv[++i];
-        else if (a == "--place" && i + 1 < argc) cfg.startPlace = argv[++i];
+        else if (a == "--place" && i + 1 < argc) { cfg.startPlace = argv[++i]; cfg.startAuto = false; }
         else if (a == "--lesson" && i + 1 < argc) { startLesson = argv[++i]; showMenu = false; }
         else if (a == "--shot" && i + 2 < argc) { shotAt = atof(argv[i + 1]); shotPath = argv[i + 2]; i += 2; }
     }
 
+    if (cfg.server) { // eigenstaendiger Server: kein Fenster, keine Grafik - verteilt nur Positionen und Chat
+        std::string sname = cfg.playerName == "Fahrer" ? "worldridr Server" : cfg.playerName;
+        if (!netplay::server(cfg.port, sname, serverMax)) return 1;
+        logMsg("Server laeuft. Beenden mit Strg+C. Spieler treten mit der Adresse oben bei (UDP-Port %d freigeben).", cfg.port);
+        Uint64 lastT = SDL_GetPerformanceCounter();
+        double lastReport = 0;
+        for (;;) {
+            Uint64 nowT = SDL_GetPerformanceCounter();
+            float dt = (float)((double)(nowT - lastT) / (double)SDL_GetPerformanceFrequency());
+            lastT = nowT;
+            simTime += dt;
+            netplay::serverUpdate(dt);
+            if (simTime - lastReport > 60) {
+                lastReport = simTime;
+                logMsg("Server: %d Spieler online", (int)netplay::cars().size());
+            }
+            SDL_Delay(8);
+        }
+    }
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC)) { logMsg("SDL_Init: %s", SDL_GetError()); return 1; }
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    if (!cfg.vr) { SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1); SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4); }
+    if (!cfg.vr && cfg.msaa) { SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1); SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4); }
     win = SDL_CreateWindow("worldridr", cfg.width, cfg.height, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | (cfg.fullscreen ? SDL_WINDOW_FULLSCREEN : 0));
     if (!win) { logMsg("Fenster: %s", SDL_GetError()); return 1; }
     SDL_GLContext ctx = SDL_GL_CreateContext(win);
@@ -584,18 +1049,28 @@ int main(int argc, char** argv) {
     input.init(cfg.wheel);
     loadShifter();
     world.init(cfg);
+    if (cfg.startAuto && cfg.startPlace.empty()) { // Standard: Startort aus der IP-Adresse
+        double la, lo;
+        std::string city;
+        if (ipLocate(la, lo, city)) { cfg.lat = la; cfg.lon = lo; logMsg("Startort per IP-Adresse: %s (%.3f, %.3f)", city.c_str(), la, lo); }
+        else logMsg("IP-Standort nicht verfügbar - verwende Standardort");
+    }
     if (!cfg.startPlace.empty()) {
         double lat, lon;
         if (geocode(cfg.startPlace, lat, lon)) { cfg.lat = lat; cfg.lon = lon; }
         else logMsg("Startort \"%s\" nicht gefunden - verwende Standardkoordinaten", cfg.startPlace.c_str());
     }
     world.setOrigin(cfg.lat, cfg.lon);
+    applyQualityGL();
+    applyVehicle();
+    (void)haveSettings;
     editor::init();
     script.init(&hud);
     if (cfg.vr) vr.init();
     if (startHost) netplay::host(cfg.port);
     if (!joinAddr.empty()) netplay::join(joinAddr, cfg.port);
     menuOpen = showMenu;
+    started = !showMenu;
     traffic::wanted = cfg.traffic;
     int swapInterval = -1;
 
@@ -621,8 +1096,9 @@ int main(int argc, char** argv) {
                     int mode = typing;
                     typing = 0; SDL_StopTextInput(win);
                     if (!typed.empty() && mode == 1) startTeleport(typed);
-                    if (!typed.empty() && mode == 2) { netplay::join(typed, cfg.port); statusLine = netplay::status(); }
+                    if (!typed.empty() && mode == 2) { if (netplay::join(typed, cfg.port)) rememberServer(typed); statusLine = netplay::status(); }
                     if (!typed.empty() && mode == 3) startTeleport(typed, true);
+                    if (!typed.empty() && mode == 4) netplay::chat(typed);
                 }
                 continue;
             }
@@ -630,7 +1106,8 @@ int main(int argc, char** argv) {
                 SDL_Keycode k = e.key.key;
                 if (k == SDLK_ESCAPE && calStep >= 0) { calStep = -1; statusLine.clear(); continue; }
                 if (k == SDLK_ESCAPE && worldmap::active()) { worldmap::close(); statusLine.clear(); continue; }
-                if (k == SDLK_ESCAPE) { menuOpen = !menuOpen; menuPage = 0; statusLine.clear(); continue; }
+                if (k == SDLK_ESCAPE) { menuOpen = !menuOpen; menuPage = 0; statusLine.clear(); if (!menuOpen) started = true; continue; }
+                if (k == SDLK_RETURN && !menuOpen && !edit && !worldmap::active() && netplay::active()) { beginTyping(4); continue; }
                 if (k == SDLK_M && !edit && !menuOpen) { if (worldmap::active()) worldmap::close(); else worldmap::open(); continue; }
                 if (k == SDLK_P) { wantShot = true; continue; }
                 if (k == SDLK_F2 && spawned) { if (edit) editor::close(); else { Vec3 f = car.forward(); editor::open(car.pos, std::atan2(-f.x, -f.z)); } continue; }
@@ -647,6 +1124,9 @@ int main(int argc, char** argv) {
                 SDL_Keycode k = e.key.key;
                 if (k == SDLK_T) beginTyping(1);
                 else if (k == SDLK_F3) debugOverlay = !debugOverlay;
+                else if (k == SDLK_N) nav::zoomCycle();
+                else if (k == SDLK_J) econ::keyJ();
+                else if (k == SDLK_K) econ::navToNearest(0);
                 else if (k == SDLK_F5) vr.recenter();
                 else if (k == SDLK_F1) script.event("key", "f1");
                 else if (k >= SDLK_0 && k <= SDLK_9) { char s[2] = {(char)('0' + (k - SDLK_0)), 0}; script.event("key", s); }
@@ -677,6 +1157,7 @@ int main(int argc, char** argv) {
         bool controls = driving && !menuOpen && !typing && !mapOpen;
         input.update(dt, car.speed(), !controls);
         updateShifterSetup(dt);
+        netplay::pollDiscovery();
         Vec3 focus = edit ? editor::cameraPos() : (spawned ? car.pos : Vec3{});
         world.update(focus, simTime);
         editor::refresh(simTime);
@@ -686,10 +1167,11 @@ int main(int argc, char** argv) {
         bool ready =world.ready(spawned ? car.pos : Vec3{}, simTime);
         if (!spawned && ready) {
             spawnCar(false);
-            spawned = true; spawnTime = simTime;
+            spawned = true; spawnTime = simTime; spawnedAt = simTime;
             script.event("spawn");
             if (!startLesson.empty()) { script.event("key", "f1"); script.event("key", startLesson.c_str()); startLesson.clear(); }
             if (startMap) { worldmap::open(); startMap = false; }
+            if (haveDest) { nav::setDestination(destLat, destLon); haveDest = false; }
             if (startEditor) { // Selbsttest: Uebersicht von oben auf den Startpunkt
                 editor::open(car.pos, 0);
                 editor::setCamera({10, car.pos.y + 45, 55}, 0, -0.62f);
@@ -715,7 +1197,7 @@ int main(int argc, char** argv) {
         bool cockpit = camMode == 0 && !edit;
         ui.begin(uiW, uiH, mxp * uiH / wh, myp * uiH / wh, (mb & SDL_BUTTON_LMASK) != 0, uiClick);
         if (mapOpen && !menuOpen) worldmap::buildUI();
-        else if (!edit) buildHUD(cockpit, !spawned);
+        else if (!edit && !menuOpen) { buildHUD(cockpit, !spawned); if (spawned) nav::buildHUD(); buildMapQuestion(); }
         if (edit && !menuOpen) editor::buildUI();
         buildPrompt();
         if (menuOpen) buildMenu();
@@ -798,12 +1280,15 @@ int main(int argc, char** argv) {
                 car.pos.x = prev.x; car.pos.z = prev.z;
                 bool hard = length(car.vel) > 1.5f;
                 car.vel = car.vel * -0.15f;
-                if (hard && crashCooldown <= 0) { script.event("crash"); crashCooldown = 2.0f; }
+                if (hard && crashCooldown <= 0) { script.event("crash"); traffic::offence(2); econ::onCrash(); crashCooldown = 2.0f; }
             }
             if (car.evStall) script.event("stall");
             if (car.evGrind) { script.event("grind"); car.evGrind = false; }
             checkControls();
             traffic::update(dt);
+            nav::update(dt);
+            econ::update(dt);
+            ped::update(dt);
 
             // Blinker: Takt + automatisches Zuruecksetzen nach dem Abbiegen
             bool lit = blinker != 0 && std::fmod(simTime, 0.74) < 0.37;
@@ -846,23 +1331,35 @@ int main(int argc, char** argv) {
             script.carBool("wheel", input.wheelPresent);
             script.carStr("road_name", roadHit.found ? roadHit.name : "");
             script.carEnd();
+            hud.faultsOn = cfg.faultPoints || hud.lessonActive;
+            if (pedShow && simTime - spawnTime > 7) { ped::debugSpawnAhead(); pedShow = false; }
+            if (poiTest == 1 && simTime - spawnTime > 7) { // Selbsttest: zur naechsten Tankstelle setzen, Tank fast leer, tanken
+                float bd = 1e9f; Poi bp; bool fnd = false;
+                world.forPoisNear(car.pos.x, car.pos.z, 4000, [&](const Poi& p) { float d = std::hypot(p.x - car.pos.x, p.z - car.pos.z); if (p.kind == 0 && d < bd) { bd = d; bp = p; fnd = true; } });
+                if (fnd) { float yy = 0; world.surface(bp.x - bp.ux * 12, bp.z - bp.uz * 12, 1e9f, yy); car.place({bp.x - bp.ux * 12.0f, yy + 0.62f, bp.z - bp.uz * 12.0f}, std::atan2(-bp.ux, -bp.uz)); econ::fuel = 8; logMsg("Tankstelle: %.0f m entfernt, Preis %.2f, Marke %s", bd, bp.price, bp.name.c_str()); }
+                poiTest = 2;
+            }
+            if (poiTest == 2 && simTime - spawnTime > 9) { econ::keyJ(); poiTest = 3; }
+            if (policeTest && simTime - spawnTime > 8) { traffic::offence(2); traffic::offence(2); traffic::offence(0); policeTest = false; }
             script.update(dt);
 
             float load = car.engineOn ? clampv(car.throttle * 0.9f + 0.1f, 0.0f, 1.0f) : (car.starter ? 0.5f : 0.0f);
             audioSet(car.rpm(), load, std::fabs(car.speed()), input.horn);
+            audioSiren(traffic::sirenLevel());
             input.setFFB(car.ffb, dt);
 
             if (autodrive && simTime - lastTelemetry > 1.0) {
                 lastTelemetry = simTime;
                 float gh = 0;
                 world.surface(car.pos.x, car.pos.z, car.pos.y, gh);
-                logMsg("t=%.0f v=%.1f km/h rpm=%.0f gang=%d hoehe=%.2f strasse=%d spur=%+.1f mitspieler=%d", simTime, car.speed() * 3.6f, car.rpm(), car.gear,
-                       car.pos.y - gh, (int)onRoad, laneOffset, (int)netplay::cars().size());
+                logMsg("t=%.0f v=%.1f km/h rpm=%.0f gang=%d hoehe=%.2f strasse=%d spur=%+.1f mitspieler=%d fussgaenger=%d dist=%.1f bld=%d x=%.1f z=%.1f", simTime, car.speed() * 3.6f, car.rpm(), car.gear,
+                       car.pos.y - gh, (int)onRoad, laneOffset, (int)netplay::cars().size(), ped::count(), roadHit.found ? roadHit.dist : -1.0f, (int)world.insideBuilding(car.pos.x, car.pos.z), car.pos.x, car.pos.z);
                 for (const NetCar& c : netplay::cars())
                     logMsg("   Mitspieler %s: Abstand %.1f m (dx %.1f dy %.1f dz %.1f)", c.name.c_str(), length(c.pos - car.pos), c.pos.x - car.pos.x, c.pos.y - car.pos.y, c.pos.z - car.pos.z);
             }
         } else {
             audioSet(edit ? 0.0f : car.rpm(), 0.1f, 0, false);
+            audioSiren(0);
             input.setFFB(0, dt);
         }
         for (auto it = hud.msgs.begin(); it != hud.msgs.end();) { it->ttl -= dt; it = it->ttl <= 0 ? hud.msgs.erase(it) : it + 1; }
@@ -883,7 +1380,7 @@ int main(int argc, char** argv) {
         bool vrFrame = !edit && vr.beginFrame();
         int wantInterval = vr.running ? 0 : 1;
         if (wantInterval != swapInterval) { SDL_GL_SetSwapInterval(wantInterval); swapInterval = wantInterval; }
-        if (cfg.mirrors && (cockpit || vrFrame) && spawned) renderMirrors(M);
+        if (cfg.mirrors && (cockpit || vrFrame) && spawned && car.kind == 0) renderMirrors(M);
 
         bool drewWindow = false;
         if (vrFrame) {
@@ -912,11 +1409,23 @@ int main(int argc, char** argv) {
             vr.endFrame();
         }
         if (!drewWindow) {
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            glViewport(0, 0, ww, wh);
+            bool scaled = cfg.renderScale < 0.97f && !edit;
+            int rw = scaled ? std::max(320, (int)(ww * cfg.renderScale)) : ww, rh = scaled ? std::max(180, (int)(wh * cfg.renderScale)) : wh;
+            if (scaled) {
+                if (sceneRT.w != rw || sceneRT.h != rh) sceneRT.create(rw, rh);
+                glBindFramebuffer(GL_FRAMEBUFFER, sceneRT.fbo);
+            } else glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, rw, rh);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             Mat4 camM;
             if (edit) camM = editor::camera();
+            else if (menuOpen && !started) { // Hauptmenue: langsame Kamerafahrt um den Startpunkt
+                Vec3 c = spawned ? car.pos : Vec3{};
+                float gh = c.y;
+                if (!spawned) world.height(0, 0, gh);
+                float a = (float)simTime * 0.06f;
+                camM = mul(translate(c + Vec3{std::sin(a) * 16.0f, 0, std::cos(a) * 16.0f} + Vec3{0, spawned ? 3.5f : (gh - c.y + 30.0f), 0}), mul(rotY(a), rotX(-0.14f)));
+            }
             else if (cockpit) camM = mul(M, mul(translate(EYE), mul(rotY(lookYaw + input.lookYaw), rotX(lookPitch - 0.13f))));
             else {
                 Vec3 f = car.forward();
@@ -928,8 +1437,20 @@ int main(int argc, char** argv) {
             mainVP = mul(proj, view);
             if (edit && !menuOpen) editor::update(dt, mainVP, (float)ww, (float)wh);
             drawScene(view, proj, xformPoint(camM, {0, 0, 0}));
-            if (spawned) drawOwnCar(mainVP, cockpit);
+            if (spawned) drawOwnCar(mainVP, cockpit && !(menuOpen && !started));
             if (edit) editor::drawGizmos(mainVP);
+            if (scaled) { // niedrigere Renderaufloesung auf Fenstergroesse hochskalieren; Oberflaeche bleibt scharf
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, sceneRT.fbo);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+                glViewport(0, 0, ww, wh);
+                glBlitFramebuffer(0, 0, rw, rh, 0, 0, ww, wh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            }
+            if (menuOpen && menuPage == 3) { // Autokatalog: Vorschau rechts neben der Liste
+                int x0 = (int)((480.0f + 66) * wh / uiH);
+                carPreviewDraw(x0, 0, ww - x0, wh, (float)simTime * 0.45f + previewYawOff);
+                glViewport(0, 0, ww, wh);
+            }
             if (worldmap::active()) worldmap::draw(ortho(0, uiW, uiH, 0), ww, wh);
             ui.flush(ortho(0, uiW, uiH, 0));
         }
@@ -944,6 +1465,7 @@ int main(int argc, char** argv) {
         SDL_GL_SwapWindow(win);
     }
     input.setFFB(0, 0);
+    saveSettings();
     netplay::stop();
     SDL_Quit();
     _exit(0); // Netzwerk-Threads nicht abwarten

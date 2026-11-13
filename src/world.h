@@ -16,6 +16,7 @@ struct RoadSeg {
     int8_t oneway;
     uint8_t klass, lanes, marked;
     int name;
+    uint8_t ring = 0;   // Kreisverkehr: 1 = Aussenseite rechts der Laufrichtung, 2 = links, 0 = kein Kreisverkehr
 };
 // Ampel (0), Stoppschild (1), Vorrang geben (2) - jeweils fuer eine Anfahrtsrichtung
 struct Control {
@@ -24,6 +25,17 @@ struct Control {
     int type, group;
     float phase;
     bool oneway;
+};
+struct Poi { // Tankstelle (0) oder Supermarkt (1)
+    int kind = 0;
+    float x = 0, z = 0, ux = 1, uz = 0, price = 1.6f;
+    std::string name;
+};
+struct MapConflict { // Unklarheit in den Kartendaten (z. B. Spurzahl wechselt von 2 auf 3)
+    std::string key, name;
+    int64_t idA = 0, idB = 0;
+    int lanesA = 0, lanesB = 0;
+    double lat = 0, lon = 0;
 };
 struct Building {
     float minx, minz, maxx, maxz;
@@ -43,13 +55,17 @@ public:
     void update(Vec3 carPos, double now);
     bool height(float x, float z, float& h);
     Vec3 normal(float x, float z);
-    RoadHit nearestRoad(float x, float z, float maxDist);
+    RoadHit nearestRoad(float x, float z, float maxDist, int maxKlass = 7);
     bool insideBuilding(float x, float z);
     void forControls(Vec3 p, float radius, const std::function<void(const Control&)>& fn);
     static int signalState(const Control& c, double t); // 0 rot, 1 rot-gelb, 2 gruen, 3 gelb
-    void drawTerrain(int level); // 0 fern, 1 mittel, 2 nah
-    void drawRoads();
-    void drawBuildings();
+    void drawTerrain(int level, const Mat4& vp); // 0 fern, 1 mittel, 2 nah (nur Sichtbares)
+    void forPoisNear(float x, float z, float r, const std::function<void(const Poi&)>& fn) const;
+    std::vector<MapConflict> takeConflicts();              // neu erkannte Unklarheiten abholen
+    void resolveConflict(const MapConflict& c, int lanes); // lanes > 0: Spurzahl setzen, 0: so lassen (wird gespeichert)
+    void setQuality(int q);                       // 0 niedrig, 1 mittel, 2 hoch: Reichweite des Gelaendes
+    void drawRoads(const Mat4& vp, Vec3 cam, float maxDist);
+    void drawBuildings(const Mat4& vp, Vec3 cam, float maxDist);
     bool ready(Vec3 p, double now);
     void toLatLon(float x, float z, double& lat, double& lon) const;
     void toLocal(double lat, double lon, float& x, float& z) const;
@@ -61,6 +77,9 @@ public:
     void drawCustomRoads();
     int roadVersion() const;                          // aendert sich, wenn Strassen nachgeladen/entfernt wurden
     void collectSegs(std::vector<RoadSeg>& out) const; // alle geladenen Strassenabschnitte (fuer den Verkehr)
+    // Strassenabschnitte / Gebaeude im Umkreis (fuer Minimap und Navigation)
+    void forSegmentsNear(float x, float z, float r, const std::function<void(const RoadSeg&)>& fn) const;
+    void forBuildingsNear(float x, float z, float r, const std::function<void(const Building&)>& fn) const;
     std::function<bool(float x, float z, float yRef, float& h)> surfaceHook;
     bool surface(float x, float z, float yRef, float& h); // Gelaende oder hoechste befahrbare Flaeche unter yRef
     Vec3 surfaceNormal(float x, float z, float yRef);

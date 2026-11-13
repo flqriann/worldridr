@@ -1,8 +1,9 @@
 -- worldridr Einstellungen
 
--- Startort: Ortsname (wird per OpenStreetMap gesucht) oder Koordinaten { lat = ..., lon = ... }.
+-- Startort: "auto" = dein ungefaehrer Standort per IP-Adresse (Stadtgenauigkeit; fragt dazu einen Geodienst), ein Ortsname
+-- (wird per OpenStreetMap gesucht) oder Koordinaten { lat = ..., lon = ... }.
 -- Im Spiel jederzeit mit T einen neuen Ort eingeben.
-start = "Wien, Schwarzenbergplatz"
+start = "auto"
 
 -- Optional: eigener Google-Maps-Platform-Schluessel (Map Tiles API aktivieren).
 -- Leer = Satellitenbilder von Esri World Imagery (kein Schluessel noetig).
@@ -11,7 +12,9 @@ google_maps_api_key = ""
 transmission = "manual"   -- "manual" (6 Gaenge + Kupplung) oder "automatic"
 -- auto_clutch = false    -- weglassen: automatisch (mit Lenkrad/Pedalen aus, mit Tastatur an)
 
-traffic = 22              -- Anzahl KI-Fahrzeuge in der Umgebung (0 = kein Verkehr)
+quality = 1               -- 0 niedrig (schwache Rechner), 1 mittel, 2 hoch. Weitere Feineinstellungen im Spiel: Menue > Einstellungen (settings.cfg)
+police = true            -- Polizei-KI: haelt dich an oder verfolgt dich bei Verstoessen
+fault_points = false     -- Fehlerpunkte auch im freien Fahren zaehlen (in Fahrstunden immer an)
 player_name = "Fahrer"   -- Name im Mehrspieler
 port = 27015              -- UDP-Port zum Hosten (im Router/Firewall freigeben fuer Spiele ueber das Internet)
 
@@ -19,7 +22,6 @@ vr = false               -- true oder Start mit --vr: VR ueber OpenXR (Meta Hori
 fullscreen = false
 width, height = 1600, 900
 fov = 62                 -- vertikaler Blickwinkel am Monitor (Grad)
-mirrors = true            -- echte Rueckspiegel (kostet etwas Leistung)
 near_zoom = 18            -- Detailstufe der Satellitenbilder am Auto (17 falls Kacheln fehlen, 19 = schaerfer)
 volume = 0.6
 
@@ -39,3 +41,4 @@ wheel = {
   handbrake = 0, ignition = 3,           -- A / Y
   seatbelt = 8, horn = 9, lights = 7, camera = 6, reset = 10,
 }
+car_model = "sedan"   -- Datei aus assets/cars (ohne .obj): sedan, sedan-sports, hatchback-sports, suv, suv-luxury, delivery, police - oder "builtin"
