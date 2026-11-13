@@ -35,6 +35,9 @@ struct AI {
     int kind = 0;         // 0 Auto, 1 Moped, 2 Motorrad
     int uid = 0;
     int turn = 0;
+    bool freeBody = false;   // nach einem Zusammenstoss: frei beweglicher Starrkoerper statt Spurfolge
+    Vec3 vel;                // Geschwindigkeit im freien Zustand (x, z)
+    float yawRate = 0, freeT = 0, slowT = 0;
 };
 std::vector<AI> cars;
 
@@ -214,6 +217,137 @@ void spawn(bool pursuer = false) {
     }
 }
 
+
+// ---------- Zusammenstoesse: Rechtecke (2D) mit Impuls, Drehimpuls und Reibung ----------
+struct Body { Vec3 pos, fwd, vel; float hl = 2.15f, hw = 0.92f, m = 1300, w = 0; float I() const { return m * (4 * hl * hl + 4 * hw * hw) / 12.0f; } };
+bool insideBox(const Body& X, Vec3 p) {
+    Vec3 d = p - X.pos, r{-X.fwd.z, 0, X.fwd.x};
+    return std::fabs(dot(d, X.fwd)) <= X.hl + 0.03f && std::fabs(dot(d, r)) <= X.hw + 0.03f;
+}
+// n zeigt von A nach B; liefert Eindringtiefe und Kontaktpunkt
+bool obbContact(const Body& A, const Body& B, Vec3& n, float& pen, Vec3& pt) {
+    Vec3 ar{-A.fwd.z, 0, A.fwd.x}, br{-B.fwd.z, 0, B.fwd.x};
+    Vec3 axes[4] = {A.fwd, ar, B.fwd, br};
+    Vec3 d = B.pos - A.pos;
+    d.y = 0;
+    float best = 1e9f;
+    for (int k = 0; k < 4; k++) {
+        const Vec3& ax = axes[k];
+        float ra = A.hl * std::fabs(dot(ax, A.fwd)) + A.hw * std::fabs(dot(ax, ar));
+        float rb = B.hl * std::fabs(dot(ax, B.fwd)) + B.hw * std::fabs(dot(ax, br));
+        float dist = dot(d, ax), ov = ra + rb - std::fabs(dist);
+        if (ov <= 0) return false;
+        if (ov < best) { best = ov; n = dist >= 0 ? ax : ax * -1.0f; }
+    }
+    pen = best;
+    auto corners = [&](const Body& X, Vec3* c) {
+        Vec3 r{-X.fwd.z, 0, X.fwd.x};
+        c[0] = X.pos + X.fwd * X.hl + r * X.hw; c[1] = X.pos + X.fwd * X.hl - r * X.hw;
+        c[2] = X.pos - X.fwd * X.hl + r * X.hw; c[3] = X.pos - X.fwd * X.hl - r * X.hw;
+    };
+    Vec3 ca[4], cb[4];
+    corners(A, ca); corners(B, cb);
+    int ia = 0, ib = 0;
+    for (int k = 1; k < 4; k++) { if (dot(ca[k], n) > dot(ca[ia], n)) ia = k; if (dot(cb[k], n) < dot(cb[ib], n)) ib = k; }
+    if (insideBox(A, cb[ib])) pt = cb[ib];
+    else if (insideBox(B, ca[ia])) pt = ca[ia];
+    else pt = (ca[ia] + cb[ib]) * 0.5f;
+    return true;
+}
+// Impuls mit Rotation und Coulomb-Reibung. Liefert die Annaeherungsgeschwindigkeit entlang der Normalen (m/s)
+float resolveContact(Body& A, Body& B, Vec3 n, float pen, Vec3 pt, bool moveB = true) {
+    float ima = 1.0f / A.m, imb = moveB ? 1.0f / B.m : 0.0f;
+    float sum = ima + imb;
+    A.pos = A.pos - n * (pen * ima / sum * 0.8f);
+    if (moveB) B.pos += n * (pen * imb / sum * 0.8f);
+    Vec3 rA = pt - A.pos, rB = pt - B.pos;
+    Vec3 vA = A.vel + Vec3{A.w * rA.z, 0, -A.w * rA.x}, vB = B.vel + Vec3{B.w * rB.z, 0, -B.w * rB.x};
+    Vec3 vr = vB - vA;
+    float vn = dot(vr, n);
+    if (vn >= 0) return 0;
+    float iA = 1.0f / A.I(), iB = moveB ? 1.0f / B.I() : 0.0f;
+    float rAn = rA.z * n.x - rA.x * n.z, rBn = rB.z * n.x - rB.x * n.z;
+    float j = -(1.0f + 0.16f) * vn / (ima + imb + rAn * rAn * iA + rBn * rBn * iB);
+    Vec3 J = n * j;
+    A.vel = A.vel - J * ima; A.w -= (rA.z * J.x - rA.x * J.z) * iA;
+    if (moveB) { B.vel += J * imb; B.w += (rB.z * J.x - rB.x * J.z) * iB; }
+    // Reibung entlang der Beruehrflaeche (Lack schleift, Fahrzeuge werden mitgenommen)
+    Vec3 t = vr - n * vn;
+    float tl = length(t);
+    if (tl > 0.05f) {
+        t = t * (1.0f / tl);
+        float rAt = rA.z * t.x - rA.x * t.z, rBt = rB.z * t.x - rB.x * t.z;
+        float jt = -dot(vr, t) / (ima + imb + rAt * rAt * iA + rBt * rBt * iB);
+        jt = clampv(jt, -0.4f * j, 0.4f * j);
+        Vec3 Jt = t * jt;
+        A.vel = A.vel - Jt * ima; A.w -= (rA.z * Jt.x - rA.x * Jt.z) * iA;
+        if (moveB) { B.vel += Jt * imb; B.w += (rB.z * Jt.x - rB.x * Jt.z) * iB; }
+    }
+    return -vn;
+}
+Body aiBody(const AI& c) {
+    Body b;
+    b.fwd = {-std::sin(c.yaw), 0, -std::cos(c.yaw)};
+    b.pos = c.pos;
+    if (c.kind > 0 && !c.police) { b.hl = 1.0f; b.hw = 0.4f; b.m = 220; }
+    b.vel = c.freeBody ? c.vel : b.fwd * c.v;
+    b.w = c.freeBody ? c.yawRate : 0;
+    return b;
+}
+void storeAi(AI& c, const Body& b) {
+    c.pos.x = b.pos.x; c.pos.z = b.pos.z;
+    c.vel = Vec3{b.vel.x, 0, b.vel.z};
+    c.yawRate = b.w;
+    c.v = length(c.vel);
+    if (!c.freeBody) { c.freeBody = true; c.freeT = 0; c.slowT = 0; }
+}
+// Frei beweglicher Wagen: Reifen bauen Querbewegung ab, Drehung klingt ab, Gebaeude lassen ihn abprallen
+void stepFree(AI& c, float dt) {
+    Vec3 fwd{-std::sin(c.yaw), 0, -std::cos(c.yaw)}, right{-fwd.z, 0, fwd.x};
+    float vf = dot(c.vel, fwd), vl = dot(c.vel, right);
+    auto toward0 = [](float v, float d) { return v > 0 ? std::max(0.0f, v - d) : std::min(0.0f, v + d); };
+    vl = toward0(vl, 7.0f * dt);
+    vf = toward0(vf, (c.freeT < 0.4f ? 1.5f : 4.0f) * dt);
+    c.vel = fwd * vf + right * vl;
+    float sp = length(c.vel);
+    c.yawRate *= std::exp(-(0.9f + 0.45f * sp) * dt);
+    Vec3 prev = c.pos;
+    float prevYaw = c.yaw;
+    c.yaw += c.yawRate * dt;
+    c.pos += c.vel * dt;
+    Vec3 nf{-std::sin(c.yaw), 0, -std::cos(c.yaw)};
+    if (world.insideBuilding(c.pos.x, c.pos.z) || world.insideBuilding(c.pos.x + nf.x * 2, c.pos.z + nf.z * 2) || world.insideBuilding(c.pos.x - nf.x * 2, c.pos.z - nf.z * 2)) {
+        c.pos = prev; c.yaw = prevYaw;
+        c.vel = c.vel * -0.25f; c.yawRate *= -0.3f;
+    }
+    float h;
+    if (world.surface(c.pos.x, c.pos.z, c.pos.y + 1.2f, h)) c.pos.y += (h - c.pos.y) * std::min(1.0f, dt * 12);
+    c.v = length(c.vel);
+    c.wheelRot = std::fmod(c.wheelRot + vf / 0.316f * dt, 2 * PI);
+    c.braking = true; c.steerVis *= 0.9f;
+    c.freeT += dt;
+}
+// Wieder auf die Strasse setzen, wenn das Fahrzeug steht und auf einer Fahrbahn liegt
+bool reattach(AI& c) {
+    Vec3 f{-std::sin(c.yaw), 0, -std::cos(c.yaw)};
+    int best = -1;
+    float bd = 3.0f;
+    for (size_t e = 0; e < E.size(); e++) {
+        const Edge& ed = E[e];
+        float t = clampv((c.pos.x - ed.s.ax) * ed.dx + (c.pos.z - ed.s.az) * ed.dz, 0.0f, ed.len);
+        float dd = std::hypot(c.pos.x - (ed.s.ax + ed.dx * t), c.pos.z - (ed.s.az + ed.dz * t)) - ed.s.hw;
+        float al = f.x * ed.dx + f.z * ed.dz;
+        if (dd < bd && std::fabs(al) > 0.5f && allowed((int)e, al < 0)) { bd = dd; best = (int)e; }
+    }
+    if (best < 0) return false;
+    c.e = best;
+    c.rev = f.x * E[best].dx + f.z * E[best].dz < 0;
+    c.s = clampv(dot(c.pos - nodeP[fromNode(c.e, c.rev)], dirOf(c.e, c.rev)), 0.0f, E[best].len - 0.5f);
+    c.freeBody = false; c.v = 0; c.vel = {}; c.yawRate = 0; c.latBias = 0; c.crashWait = 1.5f; c.waited = 0; c.stopDone = false;
+    chooseNext(c);
+    return true;
+}
+
 float stopLaw(float dist) { return std::sqrt(2.0f * 2.6f * std::max(0.0f, dist)); }
 void endCase(AI* p, float coolDown, const char* msg) {
     if (msg) hud.msgs.push_back({msg, 5.0f});
@@ -346,6 +480,15 @@ void update(float dt) {
 
     for (size_t i = 0; i < cars.size();) {
         AI& c = cars[i];
+        if (c.freeBody) { // nach Zusammenstoss: Starrkoerper
+            stepFree(c, dt);
+            obs[i].pos = c.pos; obs[i].v = c.v; obs[i].fwd = {-std::sin(c.yaw), 0, -std::cos(c.yaw)};
+            bool gone = std::hypot(c.pos.x - playerPos().x, c.pos.z - playerPos().z) > 700.0f || c.freeT > 60;
+            if (c.v < 1.0f) { c.slowT += dt; if (c.slowT > 1.5f && reattach(c)) { i++; continue; } if (c.slowT > 14) gone = true; } else c.slowT = 0;
+            if (gone) { cars.erase(cars.begin() + i); obs.erase(obs.begin() + i); for (Obs& o : obs) if (o.ai > (int)i) o.ai--; continue; }
+            i++;
+            continue;
+        }
         const Edge& ed = E[c.e];
         Vec3 dir = dirOf(c.e, c.rev), fwd{-std::sin(c.yaw), 0, -std::cos(c.yaw)}, right{-fwd.z, 0, fwd.x};
         int N = toNode(c.e, c.rev);
@@ -474,22 +617,55 @@ void update(float dt) {
         i++;
     }
 
-    // --- Zusammenstoss mit dem Spieler: zwei Kreise pro Fahrzeug ---
-    for (AI& c : cars) {
-        Vec3 f{-std::sin(c.yaw), 0, -std::cos(c.yaw)};
-        for (float sa : {-1.2f, 1.2f})
-            for (float sb : {-1.2f, 1.2f}) {
-                Vec3 a = car.pos + pf * sa, b = c.pos + f * sb;
-                float dx = a.x - b.x, dz = a.z - b.z, d = std::hypot(dx, dz);
-                if (d >= 1.9f || d < 1e-3f || std::fabs(car.pos.y - 0.54f - c.pos.y) > 1.5f) continue;
-                float pen = 1.9f - d;
-                Vec3 n{dx / d, 0, dz / d};
-                car.pos += n * pen;
-                float vn = dot(car.vel, n);
-                if (vn < 0) car.vel += n * (-vn * 1.2f);
-                car.vel = car.vel * 0.9f;
-                c.v = 0; c.crashWait = 3;
-                if (simTime > crashCooldown && (std::fabs(vn) > 0.8f || c.v > 1)) { crashCooldown = simTime + 2.5; script.event("crash"); }
+    // --- Zusammenstoesse: Spieler gegen KI, Spieler gegen Mitspieler, KI gegen KI (nur mit freien Fahrzeugen) ---
+    {
+        Body P;
+        P.fwd = pf; P.pos = car.pos; P.vel = Vec3{car.vel.x, 0, car.vel.z}; P.w = car.angVel.y;
+        if (car.kind > 0) { P.hl = 1.0f; P.hw = 0.4f; P.m = 220; }
+        bool pHit = false;
+        float hardest = 0;
+        for (AI& c : cars) {
+            if (std::fabs(c.pos.x - P.pos.x) > 6 || std::fabs(c.pos.z - P.pos.z) > 6 || std::fabs(car.pos.y - 0.54f - c.pos.y) > 1.5f) continue;
+            Body B = aiBody(c);
+            Vec3 n, pt;
+            float pen;
+            if (!obbContact(P, B, n, pen, pt)) continue;
+            hardest = std::max(hardest, resolveContact(P, B, n, pen, pt));
+            storeAi(c, B);
+            pHit = true;
+        }
+        for (const NetCar& nc : netplay::cars()) {
+            if (!nc.placed || std::fabs(nc.pos.x - P.pos.x) > 6 || std::fabs(nc.pos.z - P.pos.z) > 6 || std::fabs(car.pos.y - nc.pos.y) > 1.5f) continue;
+            Vec3 f = qrot(nc.qs, {0, 0, -1});
+            f.y = 0;
+            if (length(f) < 0.1f) continue;
+            Body B;
+            B.fwd = normalize(f); B.pos = nc.pos; B.vel = B.fwd * nc.speed;
+            if (nc.kind > 0) { B.hl = 1.0f; B.hw = 0.4f; B.m = 220; }
+            Vec3 n, pt;
+            float pen;
+            if (!obbContact(P, B, n, pen, pt)) continue;
+            hardest = std::max(hardest, resolveContact(P, B, n, pen, pt, false));
+            pHit = true;
+        }
+        if (pHit) {
+            car.pos.x = P.pos.x; car.pos.z = P.pos.z;
+            car.vel.x = P.vel.x; car.vel.z = P.vel.z;
+            car.angVel.y = P.w;
+            if (hardest > 1.5f && simTime > crashCooldown) { crashCooldown = simTime + 2.5; script.event("crash"); }
+        }
+        // KI gegen KI: nur wenn mindestens ein Fahrzeug frei ist (ein Unfall zieht andere mit hinein)
+        for (size_t i = 0; i < cars.size(); i++)
+            for (size_t j = i + 1; j < cars.size(); j++) {
+                AI &a = cars[i], &b = cars[j];
+                if (!a.freeBody && !b.freeBody) continue;
+                if (std::fabs(a.pos.x - b.pos.x) > 6 || std::fabs(a.pos.z - b.pos.z) > 6 || std::fabs(a.pos.y - b.pos.y) > 1.5f) continue;
+                Body A = aiBody(a), B = aiBody(b);
+                Vec3 n, pt;
+                float pen;
+                if (!obbContact(A, B, n, pen, pt)) continue;
+                resolveContact(A, B, n, pen, pt);
+                storeAi(a, A); storeAi(b, B);
             }
     }
 }

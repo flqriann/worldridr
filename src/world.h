@@ -17,6 +17,7 @@ struct RoadSeg {
     uint8_t klass, lanes, marked;
     int name;
     uint8_t ring = 0;   // Kreisverkehr: 1 = Aussenseite rechts der Laufrichtung, 2 = links, 0 = kein Kreisverkehr
+    int64_t wid = 0;    // OSM-Weg-ID (fuer Hoehen-Overrides im Studio)
 };
 // Ampel (0), Stoppschild (1), Vorrang geben (2) - jeweils fuer eine Anfahrtsrichtung
 struct Control {
@@ -66,10 +67,14 @@ public:
     int forestAt(float x, float z) const;   // 1 dunkle Waldflaeche im Satellitenbild, 0 sonst, -1 Bild noch nicht geladen
     bool osmReady(float x, float z) const;  // Strassen/Gebaeude der Kachel sind geladen
     std::vector<MapConflict> takeConflicts();              // neu erkannte Unklarheiten abholen
-    void resolveConflict(const MapConflict& c, int lanes); // lanes > 0: Spurzahl setzen, 0: so lassen (wird gespeichert)
+    void resolveConflict(const MapConflict& c, int lanes);
+    // Strassenhoehe per OSM-Weg-ID ueberschreiben: mode 0 automatisch, 1 Boden (Rampe zwischen den Enden, fuer Unterfuehrungen), 2 Versatz in m
+    bool roadHeightOverride(int64_t id, int& mode, float& delta);
+    void setRoadHeight(int64_t id, int mode, float delta); // lanes > 0: Spurzahl setzen, 0: so lassen (wird gespeichert)
     void setQuality(int q);                       // 0 niedrig, 1 mittel, 2 hoch: Reichweite des Gelaendes
     void drawRoads(const Mat4& vp, Vec3 cam, float maxDist);
     void drawBuildings(const Mat4& vp, Vec3 cam, float maxDist);
+    void drawWater(const Mat4& vp, Vec3 cam, float maxDist);
     bool ready(Vec3 p, double now);
     void toLatLon(float x, float z, double& lat, double& lon) const;
     void toLocal(double lat, double lon, float& x, float& z) const;

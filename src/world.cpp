@@ -146,9 +146,11 @@ struct Cell { Mesh m; Vec3 lo, hi; };               // Teilnetz eines Chunks, ei
 struct CellRes { std::vector<Vertex> v; Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f}; };
 static const int GC = 6;                              // Zellen pro Achse
 struct TileRes { int gen, z, x, y; bool ok = false; std::vector<Vertex> v; std::vector<uint8_t> rgb; int w = 0, h = 0; std::vector<uint8_t> forest; };
+struct RoadPatch { std::vector<float> px, pz, py; float hw = 3; };
 struct Chunk {
+    std::vector<RoadPatch> patches;   // ueberschriebene Strassenhoehen (Fahrflaeche unter der Gelaendehoehe)
     Mesh roads;                       // nur fuer selbst gebaute Strassen
-    std::vector<Cell> sideCells, roadCells, bldCells;
+    std::vector<Cell> sideCells, roadCells, bldCells, waterCells;
     std::vector<RoadSeg> segs;
     std::vector<std::string> names;
     std::vector<Control> controls;
@@ -160,10 +162,11 @@ struct Chunk {
     bool ok = false;
 };
 struct ChunkRes {
+    std::vector<RoadPatch> patches;
     int gen, cx, cy;
     bool ok = false;
     std::vector<Vertex> roadV, bldV;
-    std::vector<CellRes> sideCells, roadCells, bldCells;
+    std::vector<CellRes> sideCells, roadCells, bldCells, waterCells;
     std::vector<RoadSeg> segs;
     std::vector<std::string> names;
     std::vector<Control> controls;
@@ -838,6 +841,7 @@ static void buildingMesh(std::vector<Vertex>& out, const std::vector<float>& pol
 struct Overrides {
     std::mutex m;
     std::unordered_map<int64_t, int> lanes;       // OSM-Weg-ID -> Spurzahl
+    std::unordered_map<int64_t, std::pair<int, float>> hov; // OSM-Weg-ID -> (Modus, Versatz)
     std::unordered_map<std::string, bool> resolved; // Schluessel "idA_idB" -> beantwortet
     std::vector<MapConflict> found;               // neu erkannte, noch nicht abgeholte Unklarheiten
     std::unordered_map<std::string, bool> seen;
@@ -854,6 +858,9 @@ static void loadOverrides() {
     if (!j.is_object()) return;
     if (j.contains("lanes") && j["lanes"].is_object())
         for (auto it = j["lanes"].begin(); it != j["lanes"].end(); ++it) OV.lanes[std::strtoll(it.key().c_str(), nullptr, 10)] = it.value().get<int>();
+    if (j.contains("height") && j["height"].is_object())
+        for (auto it = j["height"].begin(); it != j["height"].end(); ++it)
+            if (it.value().is_array() && it.value().size() == 2) OV.hov[std::strtoll(it.key().c_str(), nullptr, 10)] = {it.value()[0].get<int>(), it.value()[1].get<float>()};
     if (j.contains("resolved") && j["resolved"].is_array())
         for (const json& k : j["resolved"]) if (k.is_string()) OV.resolved[k.get<std::string>()] = true;
 }
@@ -861,10 +868,19 @@ static void saveOverrides() { // Aufrufer haelt OV.m
     json j;
     j["lanes"] = json::object();
     for (auto& kv : OV.lanes) j["lanes"][std::to_string(kv.first)] = kv.second;
+    j["height"] = json::object();
+    for (auto& kv : OV.hov) j["height"][std::to_string(kv.first)] = json::array({kv.second.first, kv.second.second});
     j["resolved"] = json::array();
     for (auto& kv : OV.resolved) j["resolved"].push_back(kv.first);
     std::string s = j.dump(1);
     writeFile(OV_FILE, std::vector<uint8_t>(s.begin(), s.end()));
+}
+static bool heightOverride(int64_t id, int& mode, float& delta) {
+    std::lock_guard<std::mutex> lk(OV.m);
+    auto it = OV.hov.find(id);
+    if (it == OV.hov.end()) return false;
+    mode = it->second.first; delta = it->second.second;
+    return true;
 }
 static bool laneOverride(int64_t id, int& lanes) {
     std::lock_guard<std::mutex> lk(OV.m);
@@ -886,6 +902,125 @@ struct WayTmp {
     std::vector<float> px, pz;
     std::vector<int64_t> nodes;
 };
+
+// ---------- Gewaesser (OpenStreetMap: natural=water, Flussufer, Fluesse/Kanaele/Baeche) ----------
+// Die Umrisse werden auf ein 4-m-Raster gezeichnet (Scanline, gerade-ungerade-Regel: Inseln bleiben frei),
+// zusammenhaengende Zellen einer Zeile werden zu einem Rechteck auf Wasserhoehe.
+static bool fetchWater(int cx, int cy, json& j) {
+    char cache[128];
+    snprintf(cache, sizeof cache, "cache/osm/water_14_%d_%d.json", cx, cy);
+    std::vector<uint8_t> data;
+    if (readFile(cache, data)) {
+        j = json::parse(data.begin(), data.end(), nullptr, false);
+        if (!j.is_discarded() && j.contains("elements")) return true;
+    }
+    double n = myToLat(cy / 16384.0), s = myToLat((cy + 1) / 16384.0), w = cx / 16384.0 * 360 - 180, e = (cx + 1) / 16384.0 * 360 - 180;
+    char bb[128], q[1024];
+    snprintf(bb, sizeof bb, "(%.6f,%.6f,%.6f,%.6f)", s, w, n, e);
+    snprintf(q, sizeof q, "[out:json][timeout:60];(way[\"natural\"=\"water\"]%s;way[\"waterway\"=\"riverbank\"]%s;way[\"waterway\"~\"^(river|canal|stream)$\"]%s;relation[\"natural\"=\"water\"]%s;relation[\"waterway\"=\"riverbank\"]%s;);out geom;", bb, bb, bb, bb, bb);
+    static const char* servers[] = {"https://overpass.openstreetmap.fr/api/interpreter", "https://overpass-api.de/api/interpreter",
+                                    "https://overpass.private.coffee/api/interpreter"};
+    for (int attempt = 0; attempt < 4; attempt++) {
+        std::string url = std::string(servers[attempt % 3]) + "?data=" + urlEncode(q);
+        int st = 0;
+        if (httpRequest(url, data, st) && st == 200) {
+            j = json::parse(data.begin(), data.end(), nullptr, false);
+            if (!j.is_discarded() && j.contains("elements") && !j.contains("remark")) { writeFile(cache, data); return true; }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1500 * (attempt + 1)));
+    }
+    return false;
+}
+
+static void buildWater(World::Impl* d, const GeoRef& g, int cx, int cy, float x0, float z0, float x1, float z1, std::vector<Vertex>& out) {
+    json j;
+    if (!fetchWater(cx, cy, j)) return;
+    const float CS = 4.0f;
+    int nx = (int)std::ceil((x1 - x0) / CS), nz = (int)std::ceil((z1 - z0) / CS);
+    if (nx < 1 || nz < 1 || nx > 1000 || nz > 1000) return;
+    std::vector<uint8_t> mask((size_t)nx * nz, 0);
+    std::vector<std::vector<float>> cross(nz);
+    bool any = false;
+    auto toXZ = [&](const json& pt, float& x, float& z) {
+        x = (float)((lonToMx(pt.value("lon", 0.0)) - g.mx0) * g.S);
+        z = (float)((latToMy(pt.value("lat", 0.0)) - g.my0) * g.S);
+    };
+    auto addEdge = [&](float ax, float az, float bx, float bz) {
+        if (az == bz) return;
+        if (az > bz) { std::swap(ax, bx); std::swap(az, bz); }
+        int r0 = std::max(0, (int)std::ceil((az - z0) / CS - 0.5f)), r1 = std::min(nz - 1, (int)std::floor((bz - z0) / CS - 0.5f));
+        for (int r = r0; r <= r1; r++) {
+            float zc = z0 + (r + 0.5f) * CS;
+            if (zc < az || zc >= bz) continue;
+            cross[r].push_back(ax + (bx - ax) * (zc - az) / (bz - az));
+        }
+    };
+    auto stroke = [&](const std::vector<float>& px, const std::vector<float>& pz, float hw) {
+        for (size_t i = 0; i + 1 < px.size(); i++) {
+            float dx = px[i + 1] - px[i], dz = pz[i + 1] - pz[i], len = std::hypot(dx, dz);
+            int steps = std::max(1, (int)(len / 2.0f));
+            for (int s = 0; s <= steps; s++) {
+                float x = px[i] + dx * s / steps, z = pz[i] + dz * s / steps;
+                int c0 = (int)std::floor((x - hw - x0) / CS), c1 = (int)std::floor((x + hw - x0) / CS);
+                int r0 = (int)std::floor((z - hw - z0) / CS), r1 = (int)std::floor((z + hw - z0) / CS);
+                for (int r = std::max(0, r0); r <= std::min(nz - 1, r1); r++)
+                    for (int c = std::max(0, c0); c <= std::min(nx - 1, c1); c++) { mask[(size_t)r * nx + c] = 1; any = true; }
+            }
+        }
+    };
+    // Relationen zuerst: ihre Mitglieder nicht noch einmal als einzelne Wege zeichnen
+    std::unordered_map<int64_t, bool> inRel;
+    for (const json& e : j["elements"])
+        if (e.value("type", "") == "relation" && e.contains("members"))
+            for (const json& m : e["members"]) if (m.value("type", "") == "way") inRel[m.value("ref", (int64_t)0)] = true;
+    for (const json& e : j["elements"]) {
+        std::string type = e.value("type", "");
+        if (type == "relation" && e.contains("members")) {
+            for (const json& m : e["members"]) {
+                if (m.value("type", "") != "way" || !m.contains("geometry")) continue;
+                const json& gm = m["geometry"];
+                for (size_t i = 0; i + 1 < gm.size(); i++) { float ax, az, bx, bz; toXZ(gm[i], ax, az); toXZ(gm[i + 1], bx, bz); addEdge(ax, az, bx, bz); any = true; }
+            }
+        } else if (type == "way" && e.contains("geometry")) {
+            if (inRel.count(e.value("id", (int64_t)0))) continue;
+            const json& gm = e["geometry"];
+            std::string ww = tagOf(e, "waterway");
+            if (ww == "river" || ww == "canal" || ww == "stream") {
+                std::vector<float> px, pz;
+                for (const json& pt : gm) { float x, z; toXZ(pt, x, z); px.push_back(x); pz.push_back(z); }
+                float w = tagOf(e, "width").empty() ? (ww == "river" ? 14.0f : ww == "canal" ? 8.0f : 3.0f) : std::strtof(tagOf(e, "width").c_str(), nullptr);
+                stroke(px, pz, std::max(1.5f, std::min(w, 80.0f)) * 0.5f);
+            } else if (gm.size() >= 4) { // geschlossener Umriss
+                for (size_t i = 0; i + 1 < gm.size(); i++) { float ax, az, bx, bz; toXZ(gm[i], ax, az); toXZ(gm[i + 1], bx, bz); addEdge(ax, az, bx, bz); }
+                any = true;
+            }
+        }
+    }
+    if (!any) return;
+    for (int r = 0; r < nz; r++) {
+        auto& cr = cross[r];
+        std::sort(cr.begin(), cr.end());
+        for (size_t k = 0; k + 1 < cr.size(); k += 2) {
+            int c0 = std::max(0, (int)std::ceil((cr[k] - x0) / CS - 0.5f)), c1 = std::min(nx - 1, (int)std::floor((cr[k + 1] - x0) / CS - 0.5f));
+            for (int c = c0; c <= c1; c++) mask[(size_t)r * nx + c] = 1;
+        }
+    }
+    auto H = [&](float x, float z) { float h = 0; d->elev.height(g.mx0 + x / g.S, g.my0 + z / g.S, h, true); return h; };
+    Color col{44, 96, 128, 238};
+    for (int r = 0; r < nz; r++)
+        for (int c = 0; c < nx;) {
+            if (!mask[(size_t)r * nx + c]) { c++; continue; }
+            int e = c;
+            while (e < nx && mask[(size_t)r * nx + e]) e++;
+            float xa = x0 + c * CS, xb = x0 + e * CS, za = z0 + r * CS, zb = za + CS;
+            // Wasserhoehe: Mittel der Gelaendehoehe am Anfang, in der Mitte und am Ende der Zeile
+            float lvl = (H(xa, za + CS * 0.5f) + H((xa + xb) * 0.5f, za + CS * 0.5f) + H(xb, za + CS * 0.5f)) / 3.0f + 0.1f;
+            Vec3 n{0, 1, 0};
+            Vec3 a{xa, lvl, za}, b{xb, lvl, za}, cc{xb, lvl, zb}, dd{xa, lvl, zb};
+            for (const Vec3& q : {a, dd, cc, a, cc, b}) out.push_back({{q.x, q.y, q.z}, {n.x, n.y, n.z}, {0, 0}, col});
+            c = e;
+        }
+}
 
 static void buildChunk(World::Impl* d, GeoRef g, int cx, int cy) {
     ChunkRes r;
@@ -1081,6 +1216,20 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
         std::stable_sort(ways.begin(), ways.end(), [](const WayTmp& a, const WayTmp& b) { return a.klass > b.klass; });
         std::vector<Vertex> sideV, asphV;
         int treeCount = 0, lampCount = 0;
+        // Gegenstaende (Baeume, Laternen) nie auf einer Fahrbahn: Abstand zu allen Wegen der Kachel pruefen
+        auto onAnyRoad = [&](float x, float z, float margin) {
+            for (const WayTmp& o : ways) {
+                float reach = o.hw + margin;
+                for (size_t i = 0; i + 1 < o.px.size(); i++) {
+                    float ax = o.px[i], az = o.pz[i], bx = o.px[i + 1], bz = o.pz[i + 1];
+                    if (x < std::min(ax, bx) - reach || x > std::max(ax, bx) + reach || z < std::min(az, bz) - reach || z > std::max(az, bz) + reach) continue;
+                    float vx = bx - ax, vz = bz - az, l2 = vx * vx + vz * vz;
+                    float t = l2 > 1e-6f ? clampv(((x - ax) * vx + (z - az) * vz) / l2, 0.0f, 1.0f) : 0.0f;
+                    if (std::hypot(x - (ax + vx * t), z - (az + vz * t)) < reach) return true;
+                }
+            }
+            return false;
+        };
         struct JN { float x, z, hw; };
         std::unordered_map<int64_t, JN> jmap;
         for (const WayTmp& w : ways) {
@@ -1140,7 +1289,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
             int sn = (int)sx.size();
             for (int i = 0; i + 1 < sn; i++) {
                 if (!inside((sx[i] + sx[i + 1]) * 0.5f, (sz[i] + sz[i + 1]) * 0.5f)) continue;
-                r.segs.push_back({sx[i], sz[i], sx[i + 1], sz[i + 1], w.hw, w.maxspeed, (int8_t)w.oneway, (uint8_t)w.klass, (uint8_t)w.lanes, (uint8_t)(w.flags & 1), w.name, (uint8_t)(w.ring ? w.ringOuter : 0)});
+                r.segs.push_back({sx[i], sz[i], sx[i + 1], sz[i + 1], w.hw, w.maxspeed, (int8_t)w.oneway, (uint8_t)w.klass, (uint8_t)w.lanes, (uint8_t)(w.flags & 1), w.name, (uint8_t)(w.ring ? w.ringOuter : 0), w.id});
             }
             std::vector<float> rx, rz, rd;
             float dist = 0;
@@ -1157,6 +1306,23 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
             }
             rx.push_back(sx[sn - 1]); rz.push_back(sz[sn - 1]); rd.push_back(dist);
             int m = (int)rx.size();
+            std::vector<float> ry;       // Hoehenprofil der Fahrbahn bei einem Override
+            {
+                int hm = 0; float hd = 0;
+                if (m >= 2 && heightOverride(w.id, hm, hd) && hm != 0) {
+                    ry.resize(m);
+                    if (hm == 1) { // Boden: Rampe zwischen den Hoehen kurz vor Anfang und kurz hinter Ende (Unterfuehrungen)
+                        float d0x = rx[1] - rx[0], d0z = rz[1] - rz[0], l0 = std::max(0.01f, std::hypot(d0x, d0z));
+                        float d1x = rx[m - 1] - rx[m - 2], d1z = rz[m - 1] - rz[m - 2], l1 = std::max(0.01f, std::hypot(d1x, d1z));
+                        float hA = H(rx[0] - d0x / l0 * 6.0f, rz[0] - d0z / l0 * 6.0f), hB = H(rx[m - 1] + d1x / l1 * 6.0f, rz[m - 1] + d1z / l1 * 6.0f);
+                        float tot = std::max(0.01f, rd[m - 1]);
+                        for (int k = 0; k < m; k++) ry[k] = hA + (hB - hA) * (rd[k] / tot);
+                    } else for (int k = 0; k < m; k++) ry[k] = H(rx[k], rz[k]) + hd;
+                    RoadPatch pt;
+                    pt.px = rx; pt.pz = rz; pt.py = ry; pt.hw = w.hw;
+                    r.patches.push_back(pt);
+                }
+            }
             bool hasSw = (w.flags & 8) != 0;
             if ((int)w.nodes.size() == n) for (int i = 0; i < n; i++) if (junction[w.nodes[i]] >= 3 && !w.ring) { JN& jn = jmap[w.nodes[i]]; jn.x = w.px[i]; jn.z = w.pz[i]; jn.hw = std::max(jn.hw, w.hw); }
             float hwq = std::min(255.0f, w.hw * 10.0f) / 10.0f;
@@ -1179,7 +1345,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                     mx /= l; mz /= l;
                     float ch = std::max(0.6f, mx * n0x + mz * n0z); // Gehrung: Breite bleibt in Kurven gleich
                     float x = rx[k] + mx * half * side / ch, z = rz[k] + mz * half * side / ch;
-                    o = {{x, H(x, z) + 0.03f, z}, {0, 1, 0}, {half * side, rd[k]}, col};
+                    o = {{x, (ry.empty() ? H(x, z) : ry[k]) + 0.03f, z}, {0, 1, 0}, {half * side, rd[k]}, col};
                 };
                 for (int k = 0; k + 1 < m; k++) {
                     if (!inside((rx[k] + rx[k + 1]) * 0.5f, (rz[k] + rz[k + 1]) * 0.5f)) continue;
@@ -1205,7 +1371,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                         float px2 = rx[k] + nx * off * sideT, pz2 = rz[k] + nz * off * sideT;
                         nextTree += (w.klass >= 4 ? 17.0f : 26.0f) + hash2((int)(px2 * 2), (int)(pz2 * 2)) * 8.0f;
                         sideT = -sideT;
-                        if (!inside(px2, pz2) || treeCount > 1600) continue;
+                        if (!inside(px2, pz2) || treeCount > 1600 || onAnyRoad(px2, pz2, 1.0f)) continue;
                         bool inB = false;
                         for (const Building& bb : r.buildings) { if (px2 < bb.minx - 1 || px2 > bb.maxx + 1 || pz2 < bb.minz - 1 || pz2 > bb.maxz + 1) continue; if (pointInPoly(bb.poly, px2, pz2)) { inB = true; break; } }
                         if (inB) continue;
@@ -1219,7 +1385,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                         float px2 = rx[k] + nx * off * sg, pz2 = rz[k] + nz * off * sg;
                         nextLamp += 38.0f;
                         sideL = -sideL;
-                        if (!inside(px2, pz2) || lampCount > 1200) continue;
+                        if (!inside(px2, pz2) || lampCount > 1200 || onAnyRoad(px2, pz2, 0.4f)) continue;
                         pushLamp(r.bldV, px2, H(px2, pz2), pz2, -nx * sg, -nz * sg);
                         lampCount++;
                     }
@@ -1354,6 +1520,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
         bucketCells(sideV, r.x0, r.z0, r.x1, r.z1, r.sideCells);
         bucketCells(asphV, r.x0, r.z0, r.x1, r.z1, r.roadCells);
         bucketCells(r.bldV, r.x0, r.z0, r.x1, r.z1, r.bldCells);
+        { std::vector<Vertex> wv; buildWater(d, g, cx, cy, r.x0, r.z0, r.x1, r.z1, wv); bucketCells(wv, r.x0, r.z0, r.x1, r.z1, r.waterCells); }
         r.bldV.clear(); r.bldV.shrink_to_fit();
         r.ok = true;
     }
@@ -1397,7 +1564,7 @@ void World::setOrigin(double lat, double lon) {
     d->tilePool.clear();
     d->osmPool.clear();
     for (auto& t : d->tiles) { t.second.mesh.destroy(); if (t.second.tex) glDeleteTextures(1, &t.second.tex); }
-    for (auto& c : d->chunks) { for (Cell& q : c.second.sideCells) q.m.destroy(); for (Cell& q : c.second.roadCells) q.m.destroy(); for (Cell& q : c.second.bldCells) q.m.destroy(); }
+    for (auto& c : d->chunks) { for (Cell& q : c.second.sideCells) q.m.destroy(); for (Cell& q : c.second.roadCells) q.m.destroy(); for (Cell& q : c.second.bldCells) q.m.destroy(); for (Cell& q : c.second.waterCells) q.m.destroy(); }
     d->tiles.clear(); d->chunks.clear(); d->requested.clear(); d->chunkReq.clear();
     d->custom.segs.clear();
     d->version++;
@@ -1459,8 +1626,9 @@ void World::update(Vec3 p, double now) {
         uploadCells(r.sideCells, c.sideCells);
         uploadCells(r.roadCells, c.roadCells);
         uploadCells(r.bldCells, c.bldCells);
+        uploadCells(r.waterCells, c.waterCells);
         c.segs = std::move(r.segs); c.names = std::move(r.names);
-        c.controls = std::move(r.controls); c.buildings = std::move(r.buildings); c.pois = std::move(r.pois); c.trees = std::move(r.trees);
+        c.controls = std::move(r.controls); c.buildings = std::move(r.buildings); c.pois = std::move(r.pois); c.trees = std::move(r.trees); c.patches = std::move(r.patches);
         if (r.ok) logMsg("OSM-Kachel %d/%d: %d Strassenabschnitte, %d Gebaeude, %d Ampeln/Schilder, %d Tankstellen/Supermärkte", r.cx, r.cy, (int)c.segs.size(), (int)c.buildings.size(), (int)c.controls.size(), (int)c.pois.size());
     }
 
@@ -1517,7 +1685,7 @@ void World::update(Vec3 p, double now) {
             }
     for (auto it = D.chunks.begin(); it != D.chunks.end();) {
         if (it->second.touched < now - 30) {
-            for (Cell& q : it->second.sideCells) q.m.destroy(); for (Cell& q : it->second.roadCells) q.m.destroy(); for (Cell& q : it->second.bldCells) q.m.destroy();
+            for (Cell& q : it->second.sideCells) q.m.destroy(); for (Cell& q : it->second.roadCells) q.m.destroy(); for (Cell& q : it->second.bldCells) q.m.destroy(); for (Cell& q : it->second.waterCells) q.m.destroy();
             it = D.chunks.erase(it);
             D.version++;
         } else ++it;
@@ -1579,9 +1747,38 @@ void World::forBuildingsNear(float x, float z, float r, const std::function<void
 
 bool World::surface(float x, float z, float yRef, float& h) {
     if (!height(x, z, h)) return false;
+    // ueberschriebene Strassen (z. B. Unterfuehrung unter einer im Hoehenmodell enthaltenen Bruecke): hoechste Flaeche unter yRef
+    float bestP = -1e9f;
+    for (auto& kv : d->chunks) {
+        if (kv.second.patches.empty() || x < kv.second.x0 - 40 || x > kv.second.x1 + 40 || z < kv.second.z0 - 40 || z > kv.second.z1 + 40) continue;
+        for (const RoadPatch& p : kv.second.patches)
+            for (size_t i = 0; i + 1 < p.px.size(); i++) {
+                float vx = p.px[i + 1] - p.px[i], vz = p.pz[i + 1] - p.pz[i], l2 = vx * vx + vz * vz;
+                if (l2 < 1e-6f) continue;
+                float t = clampv(((x - p.px[i]) * vx + (z - p.pz[i]) * vz) / l2, 0.0f, 1.0f);
+                if (std::hypot(x - (p.px[i] + vx * t), z - (p.pz[i] + vz * t)) > p.hw + 0.6f) continue;
+                float y = p.py[i] + (p.py[i + 1] - p.py[i]) * t + 0.03f;
+                if (y <= yRef && y > bestP) bestP = y;
+            }
+    }
+    if (bestP > -1e8f && (h > yRef || bestP > h)) h = bestP; // ueberschriebene Fahrbahn gilt auch, wenn das gemessene Gelaende darueber liegt
     float hh;
     if (surfaceHook && surfaceHook(x, z, yRef, hh) && hh > h) h = hh;
     return true;
+}
+bool World::roadHeightOverride(int64_t id, int& mode, float& delta) { return heightOverride(id, mode, delta); }
+void World::setRoadHeight(int64_t id, int mode, float delta) {
+    {
+        std::lock_guard<std::mutex> lk(OV.m);
+        if (mode == 0) OV.hov.erase(id); else OV.hov[id] = {mode, delta};
+        std::error_code ec;
+        std::filesystem::create_directories("maps", ec);
+        saveOverrides();
+    }
+    for (auto& ch : d->chunks) { for (Cell& q : ch.second.sideCells) q.m.destroy(); for (Cell& q : ch.second.roadCells) q.m.destroy(); for (Cell& q : ch.second.bldCells) q.m.destroy(); for (Cell& q : ch.second.waterCells) q.m.destroy(); }
+    d->chunks.clear();
+    d->chunkReq.clear();
+    d->version++;
 }
 Vec3 World::surfaceNormal(float x, float z, float yRef) {
     float a, b, c, e;
@@ -1671,6 +1868,12 @@ void World::drawRoads(const Mat4& vp, Vec3 cam, float maxDist) {
             for (const Cell& c : pass == 0 ? kv.second.sideCells : kv.second.roadCells)
                 if (boxDist(c.lo, c.hi, cam) < maxDist && fr.sees(c.lo, c.hi)) c.m.draw();
 }
+void World::drawWater(const Mat4& vp, Vec3 cam, float maxDist) {
+    Frustum fr(vp);
+    for (auto& kv : d->chunks)
+        for (const Cell& c : kv.second.waterCells)
+            if (boxDist(c.lo, c.hi, cam) < maxDist && fr.sees(c.lo, c.hi)) c.m.draw();
+}
 void World::drawBuildings(const Mat4& vp, Vec3 cam, float maxDist) {
     Frustum fr(vp);
     for (auto& kv : d->chunks)
@@ -1695,7 +1898,7 @@ void World::resolveConflict(const MapConflict& c, int lanes) {
         saveOverrides();
     }
     if (lanes > 0) { // Strassen mit der neuen Angabe neu aufbauen (aus dem Zwischenspeicher, ohne neuen Download)
-        for (auto& ch : d->chunks) { for (Cell& q : ch.second.sideCells) q.m.destroy(); for (Cell& q : ch.second.roadCells) q.m.destroy(); for (Cell& q : ch.second.bldCells) q.m.destroy(); }
+        for (auto& ch : d->chunks) { for (Cell& q : ch.second.sideCells) q.m.destroy(); for (Cell& q : ch.second.roadCells) q.m.destroy(); for (Cell& q : ch.second.bldCells) q.m.destroy(); for (Cell& q : ch.second.waterCells) q.m.destroy(); }
         d->chunks.clear();
         d->chunkReq.clear();
         d->version++;

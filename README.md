@@ -191,6 +191,15 @@ Gespeichert wird in `maps/welt.json` mit Geokoordinaten (inklusive Mesh-Flächen
 Gebaute Straßen haben Tempolimit, Spuren und Gehsteige und zählen für die Regelprüfung wie echte Straßen.
 Feste Objekte sind Hindernis und Untergrund: Rampen, Podeste und **Treppen** (Mesh) kann man befahren bzw. zu Fuß hochgehen.
 
+## Kollisionen, Wasser, Straßenhöhe
+
+- **Kollisionen:** Spieler, KI-Autos und Mitspieler sind Rechtecke mit Masse, Drehimpuls und Reibung. Ein Treffer am Heck oder in
+  die Flanke dreht das andere Auto (PIT-Manöver gehen); getroffene KI-Autos fahren als freie Körper weiter, schleudern,
+  stoßen weitere Autos an und reihen sich danach wieder in den Verkehr ein.
+- **Wasser:** Seen, Flüsse, Kanäle und Bäche kommen aus OpenStreetMap und werden mit Himmelsspiegelung gezeichnet.
+- **Straßenhöhe (Studio, Taste 5):** Straße anklicken und „Boden / Unterführung“ oder ±1 m wählen. Für Unterführungen, die das Höhenmodell
+  als Brücke zeigt. Gespeichert in `maps/map_overrides.json`.
+
 ## Bäume und Wälder
 
 Straßenbäume und Wälder nutzen die Modelle `assets/trees/tree.glb` (Laubbaum) und `assets/trees/pine.glb` (Kiefer); eigene `.glb`

@@ -260,7 +260,7 @@ void Vehicle::substep(float dt) {
     } else {
         manifold = boost = 0;
         Te = -(fric + (4.0f + 0.0012f * r) * TQ) * clampv(engW / 2.0f, 0.0f, 1.0f);
-        if (starter) Te += 75.0f * TQ;
+        if (starter) Te += 110.0f * TQ;
     }
 
     // --- Reifen ---
@@ -318,7 +318,10 @@ void Vehicle::substep(float dt) {
     // Abwuergen: erst wenn die Drehzahl laenger unter der Schwelle bleibt (Schwungrad, Leerlaufregler); sehr niedrig sofort
     if (engineOn && engW * 9.5493f < STALL) stallTimer += dt; else stallTimer = 0;
     if (engineOn && (stallTimer > STALLT || engW * 9.5493f < STALL * 0.45f)) { engineOn = false; evStall = true; stallTimer = 0; }
-    if (!engineOn && starter && engW * 9.5493f > START) engineOn = true;
+    // Anlasser: nach ca. 0,8 s Kurbeln springt der Motor an, auch wenn der Anlasser gegen Getriebe-/Fahrwiderstand nur ~400 U/min schafft
+    static float crankT = 0;
+    if (!engineOn && starter) crankT += dt; else crankT = 0;
+    if (!engineOn && starter && (engW * 9.5493f > START || (crankT > 0.8f && engW * 9.5493f > 220.0f))) { engineOn = true; crankT = 0; }
 
     // --- Starrkoerper integrieren ---
     vel += F * (dt / MASS);

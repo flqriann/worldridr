@@ -106,6 +106,9 @@ struct Modal {                                // Blender-artiges Verschieben / D
     Vec3 pivotW, hit0, normalW;
 } mo;
 bool lmbReleased = false;
+int64_t selWay = 0;                          // Werkzeug 5: gewaehlte OSM-Strasse
+std::string selWayName;
+Vec3 selWayPos;
 Vec3 dragStart;                               // Objekt-Gizmo: Ausgangswert beim Ziehen
 float dragAcc = 0;
 float gridStep = 0.5f;
@@ -1218,7 +1221,7 @@ void event(const SDL_Event& e) {
             float d = k == SDLK_PAGEUP ? gridStep : -gridStep;
             if (sel >= 0 && sel < (int)objs.size()) { pushUndo(); objs[sel].pos.y += d; syncGeo(objs[sel]); }
             else if (selRoad >= 0 && selPt >= 0) { pushUndo(); roads[selRoad].pts[selPt].lift = std::max(0.0f, roads[selRoad].pts[selPt].lift + d * 2); dirty = true; nextBuild = 0; }
-        } else if (!ctrl && k >= SDLK_1 && k <= SDLK_4) { tool = k - SDLK_1; if (tool != 3) drawing = false; }
+        } else if (!ctrl && k >= SDLK_1 && k <= SDLK_5) { tool = k - SDLK_1; if (tool != 3) drawing = false; }
     }
 }
 
@@ -1276,7 +1279,13 @@ void update(float dt, const Mat4& vp, float ww, float wh) {
     }
     boxSelecting = false;
 
-    if (click) {
+    if (click && tool == 4) { // Strassenhoehe: OSM-Strasse unter dem Mauszeiger waehlen
+        if (rayGround(ro, rd, hit, false)) {
+            RoadHit rh = world.nearestRoad(hit.x, hit.z, 9.0f);
+            if (rh.found && rh.seg && rh.seg->wid != 0) { selWay = rh.seg->wid; selWayName = rh.name; selWayPos = hit; }
+            else { selWay = 0; say("Hier ist keine OSM-Stra\xC3\x9F" "e"); }
+        }
+    } else if (click) {
         if (tool == 3) { // Strasse: Punkt setzen
             if (rayGround(ro, rd, hit, false)) {
                 RPoint np{0, 0, 0, hit.x, hit.z};
@@ -1438,8 +1447,8 @@ void buildUI() {
     if (ui.button(x, 7, 84, 32, "Wiederh.", false, 15)) redo();
     x += 100;
     if (!eo) {
-        const char* tools[4] = {"Bewegen", "Drehen", "Skalieren", "Stra\xC3\x9F" "e"};
-        for (int i = 0; i < 4; i++) {
+        const char* tools[5] = {"Bewegen", "Drehen", "Skalieren", "Stra\xC3\x9F" "e", "H\xC3\xB6he"};
+        for (int i = 0; i < 5; i++) {
             if (ui.button(x, 7, 100, 32, std::string(1, (char)('1' + i)) + "  " + tools[i], tool == i, 15)) { tool = i; if (i != 3) drawing = false; }
             x += 104;
         }
@@ -1466,10 +1475,17 @@ void buildUI() {
 
     // ---- Linke Leiste: Einfuegen / Strassentyp, darunter der Explorer ----
     float lh;
-    if (tool == 3 && !eo) lh = 56 + NTYPES * 38.0f + 30;
+    if (tool == 4 && !eo) lh = 160;
+    else if (tool == 3 && !eo) lh = 56 + NTYPES * 38.0f + 30;
     else lh = 56 + 5 * 36.0f + (modelList.empty() ? 0 : 26 + modelList.size() * 34.0f) + 28;
     ui.panel(10, 58, 232, lh);
-    if (tool == 3 && !eo) {
+    if (tool == 4 && !eo) {
+        ui.label(24, 82, 17, col::accent, "Stra\xC3\x9F" "enh\xC3\xB6he");
+        ui.label(24, 108, 13, col::white, "Stra\xC3\x9F" "e anklicken, dann rechts");
+        ui.label(24, 128, 13, col::white, "H\xC3\xB6he anpassen (z. B. bei");
+        ui.label(24, 148, 13, col::white, "Unterf\xC3\xBChrungen, die wie");
+        ui.label(24, 168, 13, col::white, "Br\xC3\xBC" "cken aussehen).");
+    } else if (tool == 3 && !eo) {
         ui.label(24, 82, 17, col::accent, "Stra\xC3\x9F" "entyp");
         float y = 94;
         for (int i = 0; i < NTYPES; i++) { if (ui.button(20, y, 212, 32, TYPES[i].name, roadType == i, 15)) roadType = i; y += 38; }
@@ -1511,7 +1527,27 @@ void buildUI() {
 
     // ---- Rechte Leiste: Eigenschaften / Bearbeiten ----
     float px = W - 282;
-    if (sel >= 0 && sel < (int)objs.size()) {
+    if (tool == 4 && !eo) {
+        ui.panel(px, 58, 272, selWay ? 290 : 80);
+        ui.label(px + 14, 82, 17, col::accent, "Stra\xC3\x9F" "enh\xC3\xB6he");
+        if (!selWay) ui.label(px + 14, 108, 13, col::gray, "Keine Stra\xC3\x9F" "e gew\xC3\xA4hlt");
+        else {
+            int hm = 0; float hd = 0;
+            world.roadHeightOverride(selWay, hm, hd);
+            ui.label(px + 14, 108, 14, col::white, selWayName.empty() ? "(ohne Namen)" : selWayName);
+            char b2[96];
+            if (hm == 0) snprintf(b2, sizeof b2, "Aktuell: automatisch (H\xC3\xB6henmodell)");
+            else if (hm == 1) snprintf(b2, sizeof b2, "Aktuell: Boden (Rampe, Unterf\xC3\xBChrung)");
+            else snprintf(b2, sizeof b2, "Aktuell: %+.1f m gegen\xC3\xBC" "ber Automatik", hd);
+            ui.label(px + 14, 130, 13, col::gray, b2);
+            if (ui.button(px + 14, 144, 244, 30, "Automatisch", hm == 0, 14)) { world.setRoadHeight(selWay, 0, 0); say("Zur\xC3\xBC" "ck auf Automatik - Stra\xC3\x9F" "en laden neu"); }
+            if (ui.button(px + 14, 180, 244, 30, "Boden / Unterf\xC3\xBChrung (tief legen)", hm == 1, 13)) { world.setRoadHeight(selWay, 1, 0); say("Stra\xC3\x9F" "e liegt jetzt am Boden - l\xC3\xA4" "dt neu"); }
+            float cur = hm == 2 ? hd : 0;
+            if (ui.button(px + 14, 216, 118, 30, "- 1 m", false, 14)) { world.setRoadHeight(selWay, 2, cur - 1.0f); say("Stra\xC3\x9F" "e 1 m tiefer"); }
+            if (ui.button(px + 140, 216, 118, 30, "+ 1 m", false, 14)) { world.setRoadHeight(selWay, 2, cur + 1.0f); say("Stra\xC3\x9F" "e 1 m h\xC3\xB6her"); }
+            ui.label(px + 14, 266, 12, col::gray, "Gespeichert in maps/map_overrides.json");
+        }
+    } else if (sel >= 0 && sel < (int)objs.size()) {
         Obj& o = objs[sel];
         float y = 58;
         if (eo) {
@@ -1735,6 +1771,10 @@ void drawGizmos(const Mat4& vp) {
             gizmo.beam(I, o.pos, o.pos + d * L, L * (dragAxis == a ? 0.035f : 0.022f), ac[a]);
             gizmo.box(I, o.pos + d * L, {L * 0.06f, L * 0.06f, L * 0.06f}, ac[a]);
         }
+    }
+    if (tool == 4 && selWay) {
+        float sz = std::max(0.4f, length(selWayPos - camP) * 0.012f);
+        gizmo.box(I, selWayPos + Vec3{0, sz, 0}, {sz, sz * 2, sz}, yellow);
     }
     for (size_t a = 0; a < roads.size(); a++)
         for (size_t i = 0; i < roads[a].pts.size(); i++) {

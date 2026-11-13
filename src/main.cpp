@@ -406,6 +406,9 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
     }
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    gfxBias(2e-5f);
+    gfxMode(0, FLAG_LIT | FLAG_FOG | FLAG_GLOSS);
+    world.drawWater(vp, cam, mirrorPass ? 1200.0f : 3500.0f);
     glDepthMask(GL_FALSE);
     gfxBias(3e-5f);
     gfxMode(2);

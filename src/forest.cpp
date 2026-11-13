@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <unordered_map>
 #include <cstring>
+#include <functional>
 
 using json = nlohmann::json;
 
@@ -51,7 +52,7 @@ bool loadGlb(const std::string& path, std::vector<Vertex>& out) {
         return a;
     };
     auto srgb = [](float c) { return std::pow(std::min(std::max(c, 0.0f), 1.0f), 1.0f / 2.2f); };
-    for (const json& m : j["meshes"])
+    auto emit = [&](const json& m, const Mat4& T) {
         for (const json& pr : m["primitives"]) {
             if (pr.value("mode", 4) != 4 || !pr["attributes"].contains("POSITION")) continue;
             Acc P = acc(pr["attributes"]["POSITION"]);
@@ -77,15 +78,37 @@ bool loadGlb(const std::string& path, std::vector<Vertex>& out) {
                     int vi = idx[k + q];
                     if (vi < 0 || vi >= P.count) continue;
                     Vertex v{};
-                    for (int c = 0; c < 3; c++) v.p[c] = readComp(P.p + vi * P.stride + c * compSize(P.ct), P.ct, false);
-                    if (hasN) for (int c = 0; c < 3; c++) v.n[c] = readComp(N.p + vi * N.stride + c * compSize(N.ct), N.ct, false);
-                    else v.n[1] = 1;
+                    Vec3 pp, nn{0, 1, 0};
+                    pp.x = readComp(P.p + vi * P.stride, P.ct, false); pp.y = readComp(P.p + vi * P.stride + compSize(P.ct), P.ct, false); pp.z = readComp(P.p + vi * P.stride + 2 * compSize(P.ct), P.ct, false);
+                    if (hasN) { nn.x = readComp(N.p + vi * N.stride, N.ct, false); nn.y = readComp(N.p + vi * N.stride + compSize(N.ct), N.ct, false); nn.z = readComp(N.p + vi * N.stride + 2 * compSize(N.ct), N.ct, false); }
+                    pp = xformPoint(T, pp); nn = normalize(xformDir(T, nn));
+                    v.p[0] = pp.x; v.p[1] = pp.y; v.p[2] = pp.z; v.n[0] = nn.x; v.n[1] = nn.y; v.n[2] = nn.z;
                     float col[3] = {base[0], base[1], base[2]};
                     if (hasC) for (int c = 0; c < 3; c++) col[c] *= readComp(C.p + vi * C.stride + c * compSize(C.ct), C.ct, C.norm);
                     v.c = Color{(uint8_t)(srgb(col[0]) * 235), (uint8_t)(srgb(col[1]) * 235), (uint8_t)(srgb(col[2]) * 235), 255};
                     out.push_back(v);
                 }
         }
+    };
+    // Knotenhierarchie (Matrizen oder Position/Drehung/Skalierung) abarbeiten
+    std::function<void(int, const Mat4&)> visit = [&](int ni, const Mat4& parent) {
+        const json& n = j["nodes"][ni];
+        Mat4 L = identity();
+        if (n.contains("matrix")) { for (int i = 0; i < 16; i++) L.m[i] = n["matrix"][i].get<float>(); }
+        else {
+            Vec3 t{0, 0, 0}, sc{1, 1, 1};
+            Quat q{1, 0, 0, 0};
+            if (n.contains("translation")) t = {n["translation"][0].get<float>(), n["translation"][1].get<float>(), n["translation"][2].get<float>()};
+            if (n.contains("scale")) sc = {n["scale"][0].get<float>(), n["scale"][1].get<float>(), n["scale"][2].get<float>()};
+            if (n.contains("rotation")) q = Quat{n["rotation"][3].get<float>(), n["rotation"][0].get<float>(), n["rotation"][1].get<float>(), n["rotation"][2].get<float>()};
+            L = mul(fromQuatPos(q, t), scaleM(sc.x, sc.y, sc.z));
+        }
+        Mat4 W = mul(parent, L);
+        if (n.contains("mesh")) emit(j["meshes"][n["mesh"].get<int>()], W);
+        if (n.contains("children")) for (const json& c : n["children"]) visit(c.get<int>(), W);
+    };
+    if (j.contains("scenes") && j.contains("nodes"))
+        for (const json& r : j["scenes"][j.value("scene", 0)]["nodes"]) visit(r.get<int>(), identity());
     return !out.empty();
 }
 
@@ -174,7 +197,7 @@ struct TreeI { float x, y, z, s; uint8_t kind; };
 struct FCell { std::vector<TreeI> t; };
 std::unordered_map<int64_t, FCell> cells;
 const float CELL = 48.0f, SPACING = 8.0f;
-const float FULL_R = 60, LOD1_R = 160, LOD2_R = 380, STREET_R = 320;
+const float FULL_R = 130, LOD1_R = 260, LOD2_R = 480, STREET_R = 400;
 
 float hash3(int a, int b, int c) {
     uint32_t h = (uint32_t)a * 374761393u + (uint32_t)b * 668265263u + (uint32_t)c * 2246822519u;
