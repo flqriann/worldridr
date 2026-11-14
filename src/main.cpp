@@ -386,12 +386,7 @@ static void buildProps(Vec3 cam) {
             propsUnlit.box(B, {0, 3.33f, 0.125f}, {0.10f, 0.10f, 0.02f}, red ? Color{255, 40, 30, 255} : Color{70, 14, 12, 255});
             propsUnlit.box(B, {0, 3.0f, 0.125f}, {0.10f, 0.10f, 0.02f}, yel ? Color{255, 200, 30, 255} : Color{70, 55, 10, 255});
             propsUnlit.box(B, {0, 2.67f, 0.125f}, {0.10f, 0.10f, 0.02f}, grn ? Color{50, 255, 90, 255} : Color{12, 60, 22, 255});
-        } else {
-            propsLit.box(B, {0, 1.1f, 0}, {0.04f, 1.1f, 0.04f}, gray);
-            propsUnlit.box(B, {0, 2.3f, 0.02f}, {0.34f, 0.34f, 0.02f}, Color{205, 22, 28, 255});
-            if (c.type == 1) propsUnlit.box(B, {0, 2.3f, 0.05f}, {0.25f, 0.07f, 0.01f}, Color{245, 245, 245, 255});
-            else propsUnlit.box(B, {0, 2.3f, 0.05f}, {0.22f, 0.22f, 0.01f}, Color{245, 245, 245, 255});
-        }
+        }   // Stopp- und Vorrangschilder zeichnet signs.cpp (echte Formen)
         if (c.type <= 1) {
             Vec3 a = c.pos + right * (c.oneway ? -c.hw + 0.3f : 0.15f), b = c.pos + right * (c.hw - 0.3f);
             Vec3 up{0, 0.06f, 0}, back = dir * -0.45f;
@@ -435,7 +430,7 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
     gfxMVP(vp);
     gfxMode(1);
     for (int level = 0; level < 3; level++) { // fern -> nah; jede Stufe ueberdeckt die groebere
-        world.drawTerrain(level, vp);
+        world.drawTerrain(level, vp, cam);
         if (level < 2) glClear(GL_DEPTH_BUFFER_BIT);
     }
     glEnable(GL_BLEND);
@@ -458,6 +453,16 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
     gfxBias(0);
     gfxMode(3);
     world.drawBuildings(vp, cam, mirrorPass ? 250.0f : cfg.bldDist);
+    { // Fahrbahnen auf Bruecken: nach der Brueckenplatte, mit Tiefenwerten
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        gfxBias(1e-5f);
+        gfxMode(2);
+        world.drawDecks(vp, cam, mirrorPass ? 250.0f : cfg.roadDist);
+        glDisable(GL_BLEND);
+        gfxBias(0);
+        gfxMode(3);
+    }
     editor::drawWorld();
     gfxMode(0, FLAG_LIT | FLAG_FOG);
     forest::draw(mirrorPass);

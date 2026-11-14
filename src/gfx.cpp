@@ -32,7 +32,7 @@ void logMsg(const char* fmt, ...) {
 
 static const char* VS = R"(#version 330 core
 layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNrm; layout(location=2) in vec2 aUV; layout(location=3) in vec4 aCol; layout(location=4) in vec4 aInst;
-uniform mat4 uMVP; uniform mat4 uModel; uniform float uBias; uniform int uInst;
+uniform mat4 uMVP; uniform mat4 uModel; uniform float uBias; uniform int uInst; uniform vec4 uSink;
 out vec3 vW; out vec3 vN; out vec2 vUV; out vec4 vC;
 void main(){
   vec3 lp=aPos, ln=aNrm; vec4 col=aCol;
@@ -43,6 +43,8 @@ void main(){
     col.rgb*=0.82+0.3*fract(h*13.7);
   }
   vec4 w=uModel*vec4(lp,1.0); mat3 m=mat3(uModel);
+  // grobes Gelaende unter dem feinen absenken (rund um die Kamera), sonst ragt es ueber die Kamera und verdeckt den Himmel
+  if(uSink.z>0.0){ float sd=distance(w.xz,uSink.xy); w.y-=uSink.w*(1.0-smoothstep(uSink.z*0.55,uSink.z,sd)); }
   vW=w.xyz; vN=m*(ln/vec3(dot(m[0],m[0]),dot(m[1],m[1]),dot(m[2],m[2]))); vUV=aUV; vC=col;
   gl_Position=uMVP*w; if(uBias>0.0){ float sw=uBias*3000.0; sw+=gl_Position.w*0.0004; gl_Position.z-=sw*0.4/max(gl_Position.w,0.1); }
 }
@@ -183,6 +185,7 @@ void main(){
       c=mix(c, vec3(0.84,0.86,0.90), uSnow*0.55*(1.0-0.7*line));
     }
     c*=envLight()+hl*0.95;
+    if(a<0.02) discard;
     o=vec4(fog(c),a); return;
   }
   if(uMode==3){
@@ -216,7 +219,7 @@ void main(){
 
 static struct {
     GLuint prog = 0, dynVao = 0, dynVbo = 0;
-    GLint uMVP, uMode, uFlags, uTex, uCam, uSun, uInvVP, uBias, uTint, uModel, uTile, uQ, uInst, uEnv, uSnow, uHP, uHD, uHOn;
+    GLint uMVP, uMode, uFlags, uTex, uCam, uSun, uInvVP, uBias, uTint, uModel, uTile, uQ, uInst, uEnv, uSnow, uHP, uHD, uHOn, uSink;
     float maxAniso = 1;
 } G;
 
@@ -257,6 +260,7 @@ bool gfxInit() {
     G.uInvVP = glGetUniformLocation(G.prog, "uInvVP"); G.uBias = glGetUniformLocation(G.prog, "uBias");
     G.uTint = glGetUniformLocation(G.prog, "uTint"); G.uQ = glGetUniformLocation(G.prog, "uQ");
     G.uEnv = glGetUniformLocation(G.prog, "uEnv"); G.uSnow = glGetUniformLocation(G.prog, "uSnow");
+    G.uSink = glGetUniformLocation(G.prog, "uSink"); glUniform4f(G.uSink, 0, 0, 0, 0);
     G.uHP = glGetUniformLocation(G.prog, "uHP"); G.uHD = glGetUniformLocation(G.prog, "uHD"); G.uHOn = glGetUniformLocation(G.prog, "uHOn");
     glUniform1i(G.uQ, 1);
     G.uModel = glGetUniformLocation(G.prog, "uModel"); G.uTile = glGetUniformLocation(G.prog, "uTile"); G.uInst = glGetUniformLocation(G.prog, "uInst");
@@ -314,6 +318,7 @@ void Batch::rrect(float x, float y, float w, float h, float r, Color col) {
 void gfxMVP(const Mat4& mvp) { glUniformMatrix4fv(G.uMVP, 1, GL_FALSE, mvp.m); }
 void gfxCamera(Vec3 cam, const Mat4& inv) { glUniform3f(G.uCam, cam.x, cam.y, cam.z); glUniformMatrix4fv(G.uInvVP, 1, GL_FALSE, inv.m); }
 void gfxBias(float b) { glUniform1f(G.uBias, b); }
+void gfxSink(float x, float z, float radius, float depth) { glUniform4f(G.uSink, x, z, radius, depth); }
 void gfxEnv(float day, float overcast, float fogK, float wet, float snow, Vec3 sun) {
     glUniform4f(G.uEnv, day, overcast, fogK, wet); glUniform1f(G.uSnow, snow); glUniform3f(G.uSun, sun.x, sun.y, sun.z);
 }

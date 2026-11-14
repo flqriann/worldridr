@@ -4,6 +4,7 @@
 #include "net.h"
 #include "editor_mesh.h"
 #include <memory>
+#include <random>
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <fstream>
@@ -30,12 +31,15 @@ struct Obj {
     bool solid = true;
     Vec3 pos;              // lokal, abgeleitet
     std::string name;
+    uint32_t uid = 0;      // eindeutige Kennung (gemeinsames Bauen im Mehrspiel)
     EMesh mesh;            // shape 5: frei bearbeitbares Mesh (Eckpunkte und Flaechen mit eigenen Farben)
     std::shared_ptr<Mesh> emesh;
 };
 struct RPoint { double lat, lon; float lift; float x, z; };
 struct Road {
     int type = 1;
+    uint32_t uid = 0;
+    std::vector<int> arrA, arrB;   // Richtungspfeile je Zufahrtsspur am Anfang / Ende: -1 automatisch, 0 keine, Bits 1 links, 2 geradeaus, 4 rechts
     std::vector<RPoint> pts;
     std::vector<Vec3> line;     // abgetastete Mittellinie mit Fahrbahnhoehe
     std::vector<int> ptSample;
@@ -76,6 +80,7 @@ Batch gizmo;
 std::string statusMsg;
 double statusUntil = 0;
 
+uint32_t newUid() { static std::mt19937 g{std::random_device{}()}; uint32_t v; do v = g(); while (v == 0); return v; }
 double lonToMx(double lon) { return (lon + 180.0) / 360.0; }
 double latToMy(double lat) { return (1.0 - std::asinh(std::tan(lat * DPI / 180.0)) / DPI) / 2.0; }
 void toLocal(double lat, double lon, float& x, float& z) {
@@ -319,71 +324,83 @@ void boundsOf(const Obj& o, Vec3& lo, Vec3& hi) {
 }
 
 // ---------- Speichern / Laden ----------
+json objToJson(const Obj& o) {
+    json je = {{"shape", o.shape}, {"lat", o.lat}, {"lon", o.lon}, {"alt", o.alt}, {"rot", {o.rot.x, o.rot.y, o.rot.z}},
+               {"scale", {o.scale.x, o.scale.y, o.scale.z}}, {"color", {o.color.r, o.color.g, o.color.b}}, {"texture", o.texture},
+               {"model", o.model}, {"solid", o.solid}, {"tile", o.tile}, {"name", o.name}, {"uid", o.uid}};
+    if (o.shape == 5) { // frei bearbeitbares Mesh: Eckpunkte und Flaechen mit Farbe
+        json mv = json::array(), mf = json::array();
+        for (const Vec3& p : o.mesh.v) mv.push_back({p.x, p.y, p.z});
+        for (const EFace& f : o.mesh.f) mf.push_back({{"i", f.v}, {"c", {f.c.r, f.c.g, f.c.b}}});
+        je["mesh"] = {{"v", mv}, {"f", mf}};
+    }
+    return je;
+}
+json roadToJson(const Road& r) {
+    json pts = json::array();
+    for (const RPoint& p : r.pts) pts.push_back({p.lat, p.lon, p.lift});
+    return {{"type", r.type}, {"points", pts}, {"uid", r.uid}, {"arrowsA", r.arrA}, {"arrowsB", r.arrB}};
+}
+bool objFromJson(const json& e, Obj& o) {
+    try {
+        o.shape = e.value("shape", 0); o.lat = e.value("lat", 0.0); o.lon = e.value("lon", 0.0); o.alt = e.value("alt", 0.0f);
+        o.rot = Vec3(e["rot"][0].get<float>(), e["rot"][1].get<float>(), e["rot"][2].get<float>());
+        o.scale = Vec3(e["scale"][0].get<float>(), e["scale"][1].get<float>(), e["scale"][2].get<float>());
+        o.color = Color{e["color"][0].get<uint8_t>(), e["color"][1].get<uint8_t>(), e["color"][2].get<uint8_t>(), 255};
+        o.texture = e.value("texture", ""); o.model = e.value("model", ""); o.solid = e.value("solid", true); o.tile = e.value("tile", 2.0f);
+        o.name = e.value("name", ""); o.uid = e.value("uid", (uint32_t)0);
+        if (o.uid == 0) o.uid = newUid();
+        if (o.shape == 5 && e.contains("mesh")) {
+            for (const json& p : e["mesh"]["v"]) o.mesh.v.push_back({p[0].get<float>(), p[1].get<float>(), p[2].get<float>()});
+            for (const json& fj : e["mesh"]["f"]) {
+                EFace f;
+                f.v = fj["i"].get<std::vector<int>>();
+                f.c = Color{fj["c"][0].get<uint8_t>(), fj["c"][1].get<uint8_t>(), fj["c"][2].get<uint8_t>(), 255};
+                bool ok = f.v.size() >= 3;
+                for (int i : f.v) if (i < 0 || i >= (int)o.mesh.v.size()) ok = false;
+                if (ok) o.mesh.f.push_back(f);
+            }
+            rebuildMesh(o);
+        }
+        if (o.name.empty()) o.name = newName(o.shape == 4 ? o.model : SHAPE_NAMES[o.shape]);
+        return true;
+    } catch (...) { return false; }
+}
+bool roadFromJson(const json& e, Road& r) {
+    try {
+        r.type = clampv(e.value("type", 0), 0, NTYPES - 1);
+        r.uid = e.value("uid", (uint32_t)0);
+        if (r.uid == 0) r.uid = newUid();
+        for (const json& p : e["points"]) r.pts.push_back(RPoint{p[0].get<double>(), p[1].get<double>(), p[2].get<float>(), 0, 0});
+        if (e.contains("arrowsA")) r.arrA = e["arrowsA"].get<std::vector<int>>();
+        if (e.contains("arrowsB")) r.arrB = e["arrowsB"].get<std::vector<int>>();
+        return r.pts.size() >= 2;
+    } catch (...) { return false; }
+}
 json serialize() {
     json j;
     j["objects"] = json::array();
-    for (const Obj& o : objs) {
-        json je = {{"shape", o.shape}, {"lat", o.lat}, {"lon", o.lon}, {"alt", o.alt}, {"rot", {o.rot.x, o.rot.y, o.rot.z}},
-                   {"scale", {o.scale.x, o.scale.y, o.scale.z}}, {"color", {o.color.r, o.color.g, o.color.b}}, {"texture", o.texture},
-                   {"model", o.model}, {"solid", o.solid}, {"tile", o.tile}, {"name", o.name}};
-        if (o.shape == 5) { // frei bearbeitbares Mesh: Eckpunkte und Flaechen mit Farbe
-            json mv = json::array(), mf = json::array();
-            for (const Vec3& p : o.mesh.v) mv.push_back({p.x, p.y, p.z});
-            for (const EFace& f : o.mesh.f) mf.push_back({{"i", f.v}, {"c", {f.c.r, f.c.g, f.c.b}}});
-            je["mesh"] = {{"v", mv}, {"f", mf}};
-        }
-        j["objects"].push_back(je);
-    }
+    for (const Obj& o : objs) j["objects"].push_back(objToJson(o));
     j["palette"] = json::array();
     for (const Color& c : customPal) j["palette"].push_back({c.r, c.g, c.b});
     j["roads"] = json::array();
-    for (const Road& r : roads) {
-        json pts = json::array();
-        for (const RPoint& p : r.pts) pts.push_back({p.lat, p.lon, p.lift});
-        j["roads"].push_back({{"type", r.type}, {"points", pts}});
-    }
+    for (const Road& r : roads) j["roads"].push_back(roadToJson(r));
     return j;
 }
 void deserialize(const json& j) {
     objs.clear(); roads.clear();
     try {
         if (j.contains("objects"))
-            for (const json& e : j["objects"]) {
-                Obj o;
-                o.shape = e.value("shape", 0); o.lat = e.value("lat", 0.0); o.lon = e.value("lon", 0.0); o.alt = e.value("alt", 0.0f);
-                o.rot = Vec3(e["rot"][0].get<float>(), e["rot"][1].get<float>(), e["rot"][2].get<float>());
-                o.scale = Vec3(e["scale"][0].get<float>(), e["scale"][1].get<float>(), e["scale"][2].get<float>());
-                o.color = Color{e["color"][0].get<uint8_t>(), e["color"][1].get<uint8_t>(), e["color"][2].get<uint8_t>(), 255};
-                o.texture = e.value("texture", ""); o.model = e.value("model", ""); o.solid = e.value("solid", true); o.tile = e.value("tile", 2.0f);
-                o.name = e.value("name", "");
-                if (o.shape == 5 && e.contains("mesh")) {
-                    for (const json& p : e["mesh"]["v"]) o.mesh.v.push_back({p[0].get<float>(), p[1].get<float>(), p[2].get<float>()});
-                    for (const json& fj : e["mesh"]["f"]) {
-                        EFace f;
-                        f.v = fj["i"].get<std::vector<int>>();
-                        f.c = Color{fj["c"][0].get<uint8_t>(), fj["c"][1].get<uint8_t>(), fj["c"][2].get<uint8_t>(), 255};
-                        bool ok = f.v.size() >= 3;
-                        for (int i : f.v) if (i < 0 || i >= (int)o.mesh.v.size()) ok = false;
-                        if (ok) o.mesh.f.push_back(f);
-                    }
-                    rebuildMesh(o);
-                }
-                if (o.name.empty()) o.name = newName(o.shape == 4 ? o.model : SHAPE_NAMES[o.shape]);
-                objs.push_back(o);
-            }
+            for (const json& e : j["objects"]) { Obj o; if (objFromJson(e, o)) objs.push_back(o); }
         customPal.clear();
         if (j.contains("palette"))
             for (const json& p : j["palette"]) customPal.push_back(Color{p[0].get<uint8_t>(), p[1].get<uint8_t>(), p[2].get<uint8_t>(), 255});
         if (j.contains("roads"))
-            for (const json& e : j["roads"]) {
-                Road r;
-                r.type = clampv(e.value("type", 0), 0, NTYPES - 1);
-                for (const json& p : e["points"]) r.pts.push_back(RPoint{p[0].get<double>(), p[1].get<double>(), p[2].get<float>(), 0, 0});
-                if (r.pts.size() >= 2) roads.push_back(r);
-            }
+            for (const json& e : j["roads"]) { Road r; if (roadFromJson(e, r)) roads.push_back(r); }
     } catch (...) { logMsg("Kartendatei fehlerhaft"); }
     geoGen = -1; dirty = true; nextBuild = 0;
 }
+
 void pushUndo() {
     undoStack.push_back(serialize().dump());
     if (undoStack.size() > 60) undoStack.erase(undoStack.begin());
@@ -408,24 +425,75 @@ void redo() {
 }
 
 // ---------- Strassen aufbauen ----------
+// ---------- Strassenbau: Fahrbahnbaender, zusammenfliessende Kreuzungen, Haltelinien und Richtungspfeile ----------
+// Kreuzung = Stelle, an der sich Stuetzpunkte mehrerer Strassen treffen (beim Zeichnen rastet der Mauszeiger ein).
+// Jeder Arm wird so weit zurueckgenommen, dass sich die Fahrbahnraender der Nachbararme nicht schneiden; dazwischen
+// verbindet eine ausgerundete Flaeche (Bezier-Boegen) die Raender, Gehsteige laufen um die Ecken mit.
+struct RSamp { std::vector<Vec3> c, rt; std::vector<float> hl, hr, dist; bool ok = false; };
+struct RAt { Vec3 c, rt, t; float hl, hr; };
+RAt sampAt(const RSamp& S, float d) {
+    int m = (int)S.c.size();
+    d = clampv(d, 0.0f, S.dist[m - 1]);
+    int k = 0;
+    while (k + 2 < m && S.dist[k + 1] < d) k++;
+    float sg = S.dist[k + 1] - S.dist[k], f = sg > 1e-5f ? (d - S.dist[k]) / sg : 0.0f;
+    RAt a;
+    a.c = S.c[k] + (S.c[k + 1] - S.c[k]) * f;
+    a.rt = normalize(S.rt[k] + (S.rt[k + 1] - S.rt[k]) * f);
+    a.t = {a.rt.z, 0, -a.rt.x};   // Vorwaertsrichtung (rt = rechts davon)
+    a.hl = S.hl[k] + (S.hl[k + 1] - S.hl[k]) * f; a.hr = S.hr[k] + (S.hr[k + 1] - S.hr[k]) * f;
+    return a;
+}
+struct JArm { int road, ctrl, sign; float d0, hw, setback, endDist, avail, ang; bool sidewalk; Vec3 o, pe, lo, hi; };
+void markTriE(std::vector<Vertex>& out, Vec3 a, Vec3 b, Vec3 c) {
+    Color col{0, 0, 9, 0};
+    for (Vec3 q : {a, b, c}) out.push_back({{q.x, q.y, q.z}, {0, 1, 0}, {0, 0}, col});
+}
+void markBarE(std::vector<Vertex>& out, Vec3 a, Vec3 b, float half) {
+    Vec3 d = b - a; d.y = 0;
+    float l = length(d);
+    if (l < 1e-4f) return;
+    Vec3 n{-d.z / l * half, 0, d.x / l * half};
+    markTriE(out, a - n, a + n, b + n); markTriE(out, a - n, b + n, b - n);
+}
+// Pfeil auf der Fahrbahn: f = Fahrtrichtung, r = rechts davon; mask 1 links, 2 geradeaus, 4 rechts
+void arrowE(std::vector<Vertex>& out, Vec3 c, Vec3 f, Vec3 r, int mask, float sc) {
+    auto P = [&](float u, float v) { return c + f * (u * sc) + r * (v * sc); };
+    auto head = [&](Vec3 tip, Vec3 dir) { Vec3 b = tip - dir * (0.9f * sc), n{-dir.z, 0, dir.x}; markTriE(out, tip, b + n * (0.42f * sc), b - n * (0.42f * sc)); };
+    if (mask & 2) { markBarE(out, P(-1.3f, 0), P(0.6f, 0), 0.10f * sc); head(P(1.45f, 0), f); }
+    else if (mask & 5) markBarE(out, P(-1.3f, 0), P(-0.1f, 0), 0.10f * sc);
+    for (int side = -1; side <= 1; side += 2) {
+        if (!(mask & (side < 0 ? 1 : 4))) continue;
+        Vec3 dir = normalize(f * 0.35f + r * (float)side);
+        Vec3 a = P(-0.15f, 0), b = a + dir * (0.75f * sc);
+        markBarE(out, a, b, 0.10f * sc);
+        head(b + dir * (0.85f * sc), dir);
+    }
+}
+
 void buildRoads() {
-    std::vector<Vertex> rv;
+    std::vector<Vertex> rv, marks;
     std::vector<RoadSeg> segs;
     Batch solid;
     bool incomplete = false;
     Color concrete{122, 122, 118, 255}, walk{172, 172, 166, 255}, curb{140, 140, 136, 255};
-    for (Road& r : roads) {
+    const int NR = (int)roads.size();
+    std::vector<RSamp> SS(NR);
+    // ---- 1. Mittellinien abtasten (Catmull-Rom durch die Stuetzpunkte), Hoehen bestimmen ----
+    for (int ri = 0; ri < NR; ri++) {
+        Road& r = roads[ri];
+        RSamp& S = SS[ri];
         r.built = false;
         int n = (int)r.pts.size();
         if (n < 2 || std::fabs(r.pts[0].x) > 9000 || std::fabs(r.pts[0].z) > 9000) continue;
         const RoadType& T = TYPES[r.type];
-        std::vector<Vec3> c;
+        std::vector<Vec3>& c = S.c;
         std::vector<float> lift;
         r.ptSample.assign(n, 0);
         for (int i = 0; i + 1 < n; i++) {
             const RPoint &p0 = r.pts[std::max(i - 1, 0)], &p1 = r.pts[i], &p2 = r.pts[i + 1], &p3 = r.pts[std::min(i + 2, n - 1)];
             float len = std::hypot(p2.x - p1.x, p2.z - p1.z);
-            int steps = std::max(1, (int)std::ceil(len / 4.0f));
+            int steps = std::max(1, (int)std::ceil(len / 3.0f));
             r.ptSample[i] = (int)c.size();
             for (int s = 0; s < steps + (i == n - 2 ? 1 : 0); s++) {
                 float t = (float)s / steps, t2 = t * t, t3 = t2 * t;
@@ -436,73 +504,250 @@ void buildRoads() {
         }
         r.ptSample[n - 1] = (int)c.size() - 1;
         int m = (int)c.size();
-        std::vector<Vec3> rt(m);
-        std::vector<float> raw(m), hl(m), hr(m), dist(m, 0.0f);
+        if (m < 2) continue;
+        S.rt.resize(m); S.hl.resize(m); S.hr.resize(m); S.dist.assign(m, 0.0f);
+        std::vector<float> raw(m);
         float ext = T.hw + (T.sidewalk ? 1.9f : 0.0f);
         bool ok = true;
         for (int k = 0; k < m && ok; k++) {
             int a = std::max(k - 1, 0), b = std::min(k + 1, m - 1);
             Vec3 t = normalize({c[b].x - c[a].x, 0, c[b].z - c[a].z});
-            rt[k] = {-t.z, 0, t.x};
+            S.rt[k] = {-t.z, 0, t.x};
             float hc;
-            ok = world.height(c[k].x, c[k].z, hc) && world.height(c[k].x - rt[k].x * ext, c[k].z - rt[k].z * ext, hl[k]) && world.height(c[k].x + rt[k].x * ext, c[k].z + rt[k].z * ext, hr[k]);
-            raw[k] = std::max(hc, std::max(hl[k], hr[k])) + 0.10f + lift[k];
-            if (k > 0) dist[k] = dist[k - 1] + length(c[k] - c[k - 1]);
+            ok = world.height(c[k].x, c[k].z, hc) && world.height(c[k].x - S.rt[k].x * ext, c[k].z - S.rt[k].z * ext, S.hl[k]) && world.height(c[k].x + S.rt[k].x * ext, c[k].z + S.rt[k].z * ext, S.hr[k]);
+            raw[k] = std::max(hc, std::max(S.hl[k], S.hr[k])) + 0.10f + lift[k];
+            if (k > 0) S.dist[k] = S.dist[k - 1] + std::hypot(c[k].x - c[k - 1].x, c[k].z - c[k - 1].z);
         }
         if (!ok) { incomplete = true; continue; }
         r.minx = r.minz = 1e9f; r.maxx = r.maxz = -1e9f;
         for (int k = 0; k < m; k++) {
             float sum = 0; int cnt = 0;
-            for (int q = std::max(0, k - 4); q <= std::min(m - 1, k + 4); q++) { sum += raw[q]; cnt++; }
+            for (int q = std::max(0, k - 5); q <= std::min(m - 1, k + 5); q++) { sum += raw[q]; cnt++; }
             c[k].y = std::max(sum / cnt, raw[k]);
             r.minx = std::min(r.minx, c[k].x); r.maxx = std::max(r.maxx, c[k].x);
             r.minz = std::min(r.minz, c[k].z); r.maxz = std::max(r.maxz, c[k].z);
         }
+        S.ok = true;
+    }
+    // ---- 2. Kreuzungen finden: Stuetzpunkte, die aufeinander liegen ----
+    struct Ent { int road, ctrl; float x, z; int node; };
+    std::vector<Ent> ents;
+    for (int ri = 0; ri < NR; ri++) if (SS[ri].ok) for (int i = 0; i < (int)roads[ri].pts.size(); i++) ents.push_back({ri, i, roads[ri].pts[i].x, roads[ri].pts[i].z, -1});
+    int nodeCount = 0;
+    for (size_t a = 0; a < ents.size(); a++) {
+        if (ents[a].node >= 0) continue;
+        bool shared = false;
+        for (size_t b = a + 1; b < ents.size(); b++) if (ents[b].node < 0 && std::hypot(ents[b].x - ents[a].x, ents[b].z - ents[a].z) < 1.0f) { ents[b].node = nodeCount; shared = true; }
+        if (shared) ents[a].node = nodeCount++;
+    }
+    std::vector<std::vector<JArm>> nodes(nodeCount);
+    std::vector<Vec3> nodeC(nodeCount);
+    for (const Ent& e : ents) {
+        if (e.node < 0) continue;
+        const Road& r = roads[e.road];
+        const RSamp& S = SS[e.road];
+        const RoadType& T = TYPES[r.type];
+        float d0 = S.dist[r.ptSample[e.ctrl]], L = S.dist.back();
+        nodeC[e.node] = S.c[r.ptSample[e.ctrl]];
+        for (int sign = -1; sign <= 1; sign += 2) {
+            float avail = sign > 0 ? L - d0 : d0;
+            if (avail < 1.0f) continue;
+            JArm arm{};
+            arm.road = e.road; arm.ctrl = e.ctrl; arm.sign = sign; arm.d0 = d0; arm.hw = T.hw; arm.sidewalk = T.sidewalk; arm.avail = avail;
+            Vec3 q = sampAt(S, d0 + sign * std::min(8.0f, avail)).c - nodeC[e.node];
+            q.y = 0;
+            arm.o = normalize(q);
+            arm.ang = std::atan2(arm.o.z, arm.o.x);
+            nodes[e.node].push_back(arm);
+        }
+    }
+    std::vector<std::vector<std::pair<float, float>>> cuts(NR);   // je Strasse: ausgesparte Bereiche (Kreuzungsflaechen)
+    for (int ni = 0; ni < nodeCount; ni++) {
+        auto& A = nodes[ni];
+        if (A.size() < 3) { A.clear(); continue; }
+        std::sort(A.begin(), A.end(), [](const JArm& a, const JArm& b) { return a.ang < b.ang; });
+        int na = (int)A.size();
+        for (int i = 0; i < na; i++) {
+            JArm& a = A[i];
+            float need = 1.0f;
+            for (int nb : {(i + 1) % na, (i + na - 1) % na}) {
+                const JArm& b = A[nb];
+                float cs = clampv(a.o.x * b.o.x + a.o.z * b.o.z, -1.0f, 1.0f), th = std::acos(cs);
+                if (th > 2.97f) continue;   // fast gegenueber: kein Schnitt der Raender
+                float sn = std::max(0.30f, std::sin(th));
+                need = std::max(need, (b.hw + a.hw * cs) / sn);
+            }
+            float R = a.sidewalk ? 4.5f : 3.0f;
+            a.setback = clampv(need + R, 3.0f, std::max(3.0f, std::min(40.0f, a.avail * 0.45f)));
+            a.endDist = a.d0 + a.sign * a.setback;
+            RAt e = sampAt(SS[a.road], a.endDist);
+            a.pe = e.c;
+            Vec3 out = e.t * (float)a.sign, p1 = e.c + e.rt * a.hw, p2 = e.c - e.rt * a.hw;
+            float cr1 = out.x * (p1.z - e.c.z) - out.z * (p1.x - e.c.x);
+            if (cr1 > 0) { a.hi = p1; a.lo = p2; } else { a.hi = p2; a.lo = p1; }
+            a.o = out;
+            cuts[a.road].push_back({std::min(a.d0, a.endDist), std::max(a.d0, a.endDist)});
+        }
+    }
+    // ---- 3. Fahrbahnbaender (ausserhalb der Kreuzungsflaechen), Gehsteige, Stuetzmauern, Verkehrsnetz ----
+    for (int ri = 0; ri < NR; ri++) {
+        Road& r = roads[ri];
+        const RSamp& S = SS[ri];
+        if (!S.ok) continue;
+        const RoadType& T = TYPES[r.type];
+        int m = (int)S.c.size();
+        float L = S.dist.back();
         Color col{(uint8_t)T.lanes, (uint8_t)T.flags, (uint8_t)T.klass, (uint8_t)(T.hw * 10)};
         float hw = col.a / 10.0f;
         auto rv3 = [&](Vec3 p, float lat, float along) { rv.push_back({{p.x, p.y, p.z}, {0, 1, 0}, {lat, along}, col}); };
-        for (int k = 0; k + 1 < m; k++) {
-            Vec3 L0 = c[k] - rt[k] * hw, R0 = c[k] + rt[k] * hw, L1 = c[k + 1] - rt[k + 1] * hw, R1 = c[k + 1] + rt[k + 1] * hw;
-            rv3(L0, -hw, dist[k]); rv3(R0, hw, dist[k]); rv3(R1, hw, dist[k + 1]);
-            rv3(L0, -hw, dist[k]); rv3(R1, hw, dist[k + 1]); rv3(L1, -hw, dist[k + 1]);
-            segs.push_back({c[k].x, c[k].z, c[k + 1].x, c[k + 1].z, hw, T.speed, (int8_t)T.oneway, (uint8_t)T.klass, (uint8_t)T.lanes, (uint8_t)(T.flags & 1), 0});
+        auto span = [&](const RAt& a, float da, const RAt& b, float db) {
+            Vec3 L0 = a.c - a.rt * hw, R0 = a.c + a.rt * hw, L1 = b.c - b.rt * hw, R1 = b.c + b.rt * hw;
+            rv3(L0, -hw, da); rv3(R0, hw, da); rv3(R1, hw, db);
+            rv3(L0, -hw, da); rv3(R1, hw, db); rv3(L1, -hw, db);
             for (float s : {-1.0f, 1.0f}) { // Gehsteig, Bordstein und Boeschung/Stuetzmauer
-                Vec3 e0 = c[k] + rt[k] * (hw * s), e1 = c[k + 1] + rt[k + 1] * (hw * s), nrm = rt[k] * s;
-                float g0 = (s < 0 ? hl[k] : hr[k]) - 0.6f, g1 = (s < 0 ? hl[k + 1] : hr[k + 1]) - 0.6f;
+                Vec3 e0 = a.c + a.rt * (hw * s), e1 = b.c + b.rt * (hw * s), nrm = a.rt * s;
+                float g0 = (s < 0 ? a.hl : a.hr) - 0.6f, g1 = (s < 0 ? b.hl : b.hr) - 0.6f;
                 if (T.sidewalk) {
-                    Vec3 up{0, 0.13f, 0}, o0 = c[k] + rt[k] * ((hw + 1.8f) * s), o1 = c[k + 1] + rt[k + 1] * ((hw + 1.8f) * s);
+                    Vec3 up{0, 0.13f, 0}, o0 = a.c + a.rt * ((hw + 1.8f) * s), o1 = b.c + b.rt * ((hw + 1.8f) * s);
                     solid.quad(e0, e1, e1 + up, e0 + up, -nrm, curb);
                     solid.quad(e0 + up, e1 + up, o1 + up, o0 + up, {0, 1, 0}, walk);
                     e0 = o0 + up; e1 = o1 + up;
                 }
                 if (e0.y - g0 > 0.2f || e1.y - g1 > 0.2f) solid.quad(e0, e1, {e1.x, std::min(g1, e1.y), e1.z}, {e0.x, std::min(g0, e0.y), e0.z}, nrm, concrete);
             }
-        }
-        r.line = c;
+        };
+        std::vector<std::pair<float, float>>& cu = cuts[ri];
+        std::sort(cu.begin(), cu.end());
+        float from = 0;
+        auto emit = [&](float u, float v) {
+            if (v - u < 0.05f) return;
+            RAt prev = sampAt(S, u);
+            float dp = u;
+            for (int k = 0; k < m; k++) {
+                if (S.dist[k] <= u + 0.02f || S.dist[k] >= v - 0.02f) continue;
+                RAt cur{S.c[k], S.rt[k], {S.rt[k].z, 0, -S.rt[k].x}, S.hl[k], S.hr[k]};
+                span(prev, dp, cur, S.dist[k]);
+                prev = cur; dp = S.dist[k];
+            }
+            span(prev, dp, sampAt(S, v), v);
+        };
+        for (const auto& c2 : cu) { if (c2.first > from) emit(from, c2.first); from = std::max(from, c2.second); }
+        if (from < L) emit(from, L);
+        for (int k = 0; k + 1 < m; k++)
+            segs.push_back({S.c[k].x, S.c[k].z, S.c[k + 1].x, S.c[k + 1].z, hw, T.speed, (int8_t)T.oneway, (uint8_t)T.klass, (uint8_t)T.lanes, (uint8_t)(T.flags & 1), 0});
+        r.line = S.c;
         r.built = true;
     }
-    // Kreuzungen: wo sich Stuetzpunkte zweier Strassen treffen, die Markierungen mit einer Asphaltflaeche ueberdecken
-    for (size_t a = 0; a < roads.size(); a++) {
-        if (!roads[a].built) continue;
-        for (size_t i = 0; i < roads[a].pts.size(); i++) {
-            float rad = 0;
-            for (size_t b = 0; b < roads.size(); b++) {
-                if (b == a || !roads[b].built) continue;
-                for (const RPoint& q : roads[b].pts)
-                    if (std::hypot(q.x - roads[a].pts[i].x, q.z - roads[a].pts[i].z) < 0.8f) rad = std::max(rad, std::max(TYPES[roads[a].type].hw, TYPES[roads[b].type].hw) * 1.3f);
+    // ---- 4. Kreuzungsflaechen, Gehsteigecken, Haltelinien und Richtungspfeile ----
+    for (int ni = 0; ni < nodeCount; ni++) {
+        auto& A = nodes[ni];
+        int na = (int)A.size();
+        if (na < 3) continue;
+        Vec3 C = nodeC[ni];
+        { float ys = 0; for (const JArm& a : A) ys += a.pe.y; C.y = ys / na; }
+        std::vector<Vec3> ring;
+        for (int i = 0; i < na; i++) {
+            const JArm &a = A[i], &b = A[(i + 1) % na];
+            ring.push_back(a.lo); ring.push_back(a.hi);
+            // Ausrundung vom Rand des Arms a zum Rand des naechsten Arms b
+            Vec3 P0 = a.hi, P2 = b.lo, P1 = (P0 + P2) * 0.5f;
+            float den = a.o.x * b.o.z - a.o.z * b.o.x;
+            if (std::fabs(den) > 0.05f) { // Schnittpunkt der beiden zur Mitte verlaengerten Raender
+                float t = ((P2.x - P0.x) * b.o.z - (P2.z - P0.z) * b.o.x) / den;
+                Vec3 X = P0 + a.o * t;
+                X.y = P1.y;
+                float span2 = length(P2 - P0);
+                if (t < 0 && length(X - P1) < span2 * 2.5f) P1 = X;
             }
-            if (rad <= 0) continue;
-            Vec3 ctr = roads[a].line[roads[a].ptSample[i]] + Vec3{0, 0.02f, 0};
-            Color col{1, 0, 3, 255};
-            for (int k = 0; k < 20; k++) {
-                float a0 = k * 2 * PI / 20, a1 = (k + 1) * 2 * PI / 20;
-                Vec3 p0 = ctr + Vec3{std::cos(a0) * rad, 0, std::sin(a0) * rad}, p1 = ctr + Vec3{std::cos(a1) * rad, 0, std::sin(a1) * rad};
-                rv.push_back({{ctr.x, ctr.y, ctr.z}, {0, 1, 0}, {0, 0}, col});
-                rv.push_back({{p0.x, p0.y, p0.z}, {0, 1, 0}, {0, 0}, col});
-                rv.push_back({{p1.x, p1.y, p1.z}, {0, 1, 0}, {0, 0}, col});
+            const int NB = 8;
+            Vec3 prevB = P0, prevN{0, 0, 0};
+            bool sw = a.sidewalk && b.sidewalk;
+            for (int q = 1; q <= NB; q++) {
+                float u = (float)q / NB;
+                Vec3 Bq = P0 * ((1 - u) * (1 - u)) + P1 * (2 * u * (1 - u)) + P2 * (u * u);
+                if (q < NB) ring.push_back(Bq);
+                if (sw) { // Gehsteig um die Ecke
+                    Vec3 tg = normalize(Bq - prevB), nrm{-tg.z, 0, tg.x};
+                    Vec3 mid = (Bq + prevB) * 0.5f;
+                    if ((mid.x - C.x) * nrm.x + (mid.z - C.z) * nrm.z < 0) nrm = nrm * -1.0f;
+                    if (q == 1) prevN = nrm;
+                    Vec3 up{0, 0.13f, 0};
+                    solid.quad(prevB, Bq, Bq + up, prevB + up, nrm * -1.0f, curb);
+                    solid.quad(prevB + up, Bq + up, Bq + nrm * 1.8f + up, prevB + prevN * 1.8f + up, {0, 1, 0}, walk);
+                    prevN = nrm;
+                }
+                prevB = Bq;
+            }
+        }
+        Color jc{1, 0, 3, 255};
+        for (size_t q = 0; q < ring.size(); q++) {
+            Vec3 p0 = ring[q], p1 = ring[(q + 1) % ring.size()];
+            rv.push_back({{C.x, C.y, C.z}, {0, 1, 0}, {0, 0}, jc});
+            rv.push_back({{p0.x, p0.y, p0.z}, {0, 1, 0}, {0, 0}, jc});
+            rv.push_back({{p1.x, p1.y, p1.z}, {0, 1, 0}, {0, 0}, jc});
+        }
+        // Markierungen je Zufahrt
+        for (int i = 0; i < na; i++) {
+            const JArm& a = A[i];
+            const Road& r = roads[a.road];
+            const RoadType& T = TYPES[r.type];
+            const RSamp& S = SS[a.road];
+            int nPts = (int)r.pts.size();
+            bool inbound = T.oneway == 0 || (T.oneway == 1 && a.sign < 0) || (T.oneway == -1 && a.sign > 0);
+            if (!inbound || !(T.flags & 1)) continue;
+            int nl = T.oneway ? T.lanes : std::max(1, T.lanes / 2);
+            float lw = 2 * T.hw / (float)T.lanes;
+            bool isEnd = (a.ctrl == 0 && a.sign > 0) || (a.ctrl == nPts - 1 && a.sign < 0);
+            bool through = !isEnd && na == 3;   // durchgehende Strasse an einer Einmuendung: Vorrang, keine Haltelinie
+            const std::vector<int>* ov = isEnd ? (a.ctrl == 0 ? &r.arrA : &r.arrB) : nullptr;
+            // moegliche Richtungen
+            bool canL = false, canS = false, canR = false;
+            Vec3 f = a.o * -1.0f;
+            for (int j = 0; j < na; j++) {
+                if (j == i) continue;
+                const JArm& b = A[j];
+                const RoadType& TB = TYPES[roads[b.road].type];
+                if ((TB.oneway == 1 && b.sign < 0) || (TB.oneway == -1 && b.sign > 0)) continue;   // dort darf man nicht hineinfahren
+                float cr = f.x * b.o.z - f.z * b.o.x, dt = f.x * b.o.x + f.z * b.o.z, ang = std::atan2(cr, dt);
+                if (std::fabs(ang) < 0.70f) canS = true;
+                else if (std::fabs(ang) > 2.7f) continue;
+                else if (ang > 0) canR = true; else canL = true;
+            }
+            auto lanePos = [&](float back, int lane, Vec3& pos, Vec3& fd, Vec3& rg) {
+                RAt e = sampAt(S, a.endDist + a.sign * back);
+                fd = e.t * (float)-a.sign; rg = {-fd.z, 0, fd.x};
+                float lat = T.oneway ? -T.hw + (lane + 0.5f) * lw : (lane + 0.5f) * lw;
+                pos = e.c + rg * lat + Vec3{0, 0.03f, 0};
+            };
+            if (!through) { // Haltelinie
+                Vec3 p0, p1, fd, rg;
+                lanePos(0.5f, 0, p0, fd, rg); lanePos(0.5f, nl - 1, p1, fd, rg);
+                markBarE(marks, p0 - rg * (lw * 0.5f - 0.15f), p1 + rg * (lw * 0.5f - 0.3f), 0.22f);
+            }
+            if (T.klass > 5) continue;
+            for (int ln = 0; ln < nl; ln++) {
+                int mask;
+                int o = (ov && ln < (int)ov->size()) ? (*ov)[ln] : -1;
+                if (o >= 0) mask = o;
+                else {
+                    if (through && nl < 2) continue;
+                    if (nl == 1) mask = (canL ? 1 : 0) | (canS ? 2 : 0) | (canR ? 4 : 0);
+                    else if (ln == 0) mask = canL ? (1 | ((nl == 2 && canS) ? 2 : 0)) : 2;
+                    else if (ln == nl - 1) mask = canR ? (4 | (canS ? 2 : 0)) : 2;
+                    else mask = canS ? 2 : (canL ? 1 : 4);
+                    if (mask == 0 || (nl == 1 && (canL + canS + canR) <= 1)) continue;   // nur eine Moeglichkeit: kein Pfeil noetig
+                }
+                if (mask == 0) continue;
+                for (float back : {7.0f, 21.0f}) {
+                    if (back + 4.0f > a.avail - a.setback) continue;
+                    Vec3 pos, fd, rg;
+                    lanePos(back, ln, pos, fd, rg);
+                    arrowE(marks, pos, fd, rg, mask, clampv(lw / 3.3f, 0.7f, 1.1f));
+                }
             }
         }
     }
+    rv.insert(rv.end(), marks.begin(), marks.end());
     world.setCustomRoads(rv, segs);
     solidMesh.create(solid.v.data(), (int)solid.v.size());
     if (incomplete) nextBuild = simTime + 1.0; else dirty = false;

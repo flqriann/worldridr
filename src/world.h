@@ -34,7 +34,10 @@ struct Poi { // Tankstelle (0) oder Supermarkt (1)
     std::string name;
 };
 struct TreePos { float x, y, z, rnd; }; // Strassenbaum (wird als Instanz gezeichnet)
-// Verkehrsschilder aus den Kartendaten. kind: 0 Tempolimit (Rundschild), 1 Autobahn-Wegweiserbruecke mit Wechselanzeige (VMS), 2 Ausfahrt-Hinweistafel am Strassenrand
+// Verkehrsschilder aus den Kartendaten. kind: 0 Tempolimit (Rundschild), 1 Autobahn-Wegweiserbruecke mit Wechselanzeige (VMS), 2 Ausfahrtstafel an der Rampe,
+// 5 Einbahnstrasse (Pfeil), 6 Einfahrt verboten, 7 Kreisverkehr + Vorrang geben, 8 Autobahn, 10 Fussgaengeruebergang,
+// 11 Bake vor der Ausfahrt (value = 3/2/1 Streifen), 12 Vorwegweiser (value = Entfernung in m)
+// (Stopp und Vorrang geben kommen aus den Control-Eintraegen)
 struct SignDef {
     int kind = 0;
     Vec3 pos;                 // Strassenmitte bzw. Mastfuss (y = Fahrbahn-/Bodenhoehe)
@@ -44,6 +47,7 @@ struct SignDef {
     int lanes = 2;
     uint32_t seed = 0;
     std::string ref, l1, l2, l3;   // Ausfahrtsnummer und bis zu drei Ziele
+    std::string head, thru;        // Name der Anschlussstelle / des Knotens, Ziel der durchgehenden Fahrbahn
 };
 struct MapConflict { // Unklarheit in den Kartendaten (z. B. Spurzahl wechselt von 2 auf 3)
     std::string key, name;
@@ -74,7 +78,7 @@ public:
     bool insideBuilding(float x, float z);
     void forControls(Vec3 p, float radius, const std::function<void(const Control&)>& fn);
     static int signalState(const Control& c, double t); // 0 rot, 1 rot-gelb, 2 gruen, 3 gelb
-    void drawTerrain(int level, const Mat4& vp); // 0 fern, 1 mittel, 2 nah (nur Sichtbares)
+    void drawTerrain(int level, const Mat4& vp, Vec3 cam); // 0 fern, 1 mittel, 2 nah (nur Sichtbares)
     void forPoisNear(float x, float z, float r, const std::function<void(const Poi&)>& fn) const;
     void forTreesNear(float x, float z, float r, const std::function<void(const TreePos&)>& fn) const;
     void forSignsNear(float x, float z, float r, const std::function<void(const SignDef&)>& fn) const;
@@ -88,6 +92,7 @@ public:
     void setQuality(int q);                       // 0 niedrig, 1 mittel, 2 hoch: Reichweite des Gelaendes
     void drawRoads(const Mat4& vp, Vec3 cam, float maxDist);
     void drawBuildings(const Mat4& vp, Vec3 cam, float maxDist);
+    void drawDecks(const Mat4& vp, Vec3 cam, float maxDist);       // Fahrbahnen auf Bruecken (nach den Bauwerken, mit Tiefe)
     void drawWater(const Mat4& vp, Vec3 cam, float maxDist);
     bool ready(Vec3 p, double now);
     void toLatLon(float x, float z, double& lat, double& lon) const;

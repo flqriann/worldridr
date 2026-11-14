@@ -137,6 +137,7 @@ void gfxMode(int mode, int flags = 0);
 void gfxMVP(const Mat4& mvp);
 void gfxCamera(Vec3 cam, const Mat4& invViewProj);
 void gfxBias(float b);
+void gfxSink(float x, float z, float radius, float depth);   // Gelaende im Umkreis absenken (0 = aus)
 void gfxEnv(float day, float overcast, float fogK, float wet, float snow, Vec3 sun);   // Tageslicht, Bewoelkung, Nebeldichte, Naesse, Schnee
 void gfxHead(Vec3 pos, Vec3 dir, float on);                                              // Scheinwerferkegel des eigenen Autos
 void gfxTint(float r, float g, float b);
