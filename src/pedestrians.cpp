@@ -319,7 +319,7 @@ void update(float dt) {
             p.yaw += err * std::min(1.0f, dt * 8.0f);
         }
         float h;
-        if (world.surface(p.pos.x, p.pos.z, p.pos.y + 1.5f, h)) p.pos.y = h + 0.05f;
+        if (world.surface(p.pos.x, p.pos.z, p.pos.y + 1.5f, h)) { float d = h + 0.05f - p.pos.y, lim = 0.6f * p.speed * dt + 0.01f; if (std::fabs(d) > 2.0f) p.pos.y = h + 0.05f; else p.pos.y += clampv(d, -lim, lim); }
         p.phase += dt * p.speed * 4.6f;
         // Zusammenstoss mit dem Spieler
         float dy = std::fabs(p.pos.y - (car.pos.y - 0.5f));

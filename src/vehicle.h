@@ -10,6 +10,7 @@ struct Wheel {
     float omega = 0, comp = 0, steer = 0, rot = 0;
     bool hasGround = false, contact = false;
     Vec3 gp, gn{0, 1, 0};
+    float gSm = 0, gX = 0, gZ = 0; bool gInit = false;   // geglaettete Bodenhoehe unter dem Rad (Steigungsbegrenzung)
     float mu = 1, crr = 0.012f, slip = 0;
 };
 
@@ -34,6 +35,7 @@ struct Vehicle {
     bool evOverrev = false, evBlown = false, evNonFinite = false;   // Ereignisse eines Frames: Ueberdrehen, Motorschaden, ungueltiger Zustand
     float health = 1.0f;          // Motorzustand 1 = gesund, 0 = Motorschaden
     bool seized = false;          // Motor festgefressen
+    float airT = 0, lastLandT = 0;   // Zeit ohne Bodenkontakt (Schutz gegen dauerndes Fliegen)
     bool flipped = false;         // Fahrzeug liegt auf der Seite / dem Dach
     void repairEngine() { health = 1.0f; seized = false; overrevWarned = false; engW = 0; engineOn = false; }
     float odo = 0;

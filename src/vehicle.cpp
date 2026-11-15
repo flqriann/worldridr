@@ -104,7 +104,8 @@ Vec3 Vehicle::hubLocal(int i) const { return w[i].mount - Vec3{0, SUS_REST - w[i
 void Vehicle::place(Vec3 p, float yaw) {
     pos = p; vel = {}; angVel = {};
     q = qaxis({0, 1, 0}, yaw);
-    for (Wheel& wh : w) { wh.omega = 0; wh.comp = 0.12f; wh.hasGround = false; }
+    for (Wheel& wh : w) { wh.omega = 0; wh.comp = 0.12f; wh.hasGround = false; wh.gInit = false; }
+    airT = 0;
 }
 
 void Vehicle::shift(int dir) {
@@ -164,6 +165,14 @@ void Vehicle::update(float dt, World& world) {
         float yRef = pos.y - 0.2f; // Stufen bis ca. 35 cm werden ueberfahren, hoehere Kanten sind Hindernisse
         wh.hasGround = world.surface(m.x, m.z, yRef, h);
         if (wh.hasGround) {
+            // Mathematische Ausgleichung: Die Bodenhoehe unter dem Rad darf sich je Meter Fahrstrecke nur um 0,45 m aendern (ca. 24 Grad).
+            // Stufen und Spruenge der Daten (Strassenanfang, Hoehenmodell, Kachelgrenzen) werden so zu Rampen, statt das Auto abzuschiessen.
+            // Echte Ebenenwechsel (> 2,5 m, z. B. Bruecke/Unterfuehrung) und Teleports werden direkt uebernommen.
+            float dxz = std::hypot(m.x - wh.gX, m.z - wh.gZ);
+            if (!wh.gInit || dxz > 20.0f || std::fabs(h - wh.gSm) > 2.5f) wh.gSm = h;
+            else { float lim = 0.45f * dxz + 0.015f, d = h - wh.gSm; wh.gSm += clampv(d, -lim, lim); }
+            wh.gInit = true; wh.gX = m.x; wh.gZ = m.z;
+            h = wh.gSm;
             wh.gp = {m.x, h, m.z};
             wh.gn = world.surfaceNormal(m.x, m.z, yRef);
             grounded++;
@@ -190,6 +199,35 @@ void Vehicle::update(float dt, World& world) {
     bool broken = bad(pos.x) || bad(pos.y) || bad(pos.z) || bad(vel.x) || bad(vel.y) || bad(vel.z) || bad(q.w) || bad(q.x) || bad(q.y) || bad(q.z) ||
                   bad(angVel.x) || bad(angVel.y) || bad(angVel.z) || bad(engW) || std::fabs(pos.y - p0.y) > 60.0f;
     if (broken) { pos = p0; q = q0; vel = {}; angVel = {}; engW = std::max(0.0f, std::isfinite(engW) ? engW : 0.0f); evNonFinite = true; }
+    { // Schutz gegen "Fliegen": Bodenkontakt auswerten
+        bool anyContact = false;
+        for (const Wheel& wh : w) anyContact = anyContact || wh.contact;
+        if (anyContact) {
+            airT = 0;
+            if (vel.y > 9.0f) vel.y = 9.0f;   // der Boden darf das Auto nicht schneller als 9 m/s nach oben schiessen (Datenspruenge, Rampenkanten)
+        } else airT += dt;
+        float gh2;
+        if (airT > 0.8f && world.surface(pos.x, pos.z, pos.y - 0.2f, gh2)) {
+            float above = pos.y - gh2;
+            if (above < 25.0f) { // nahe am Boden und trotzdem in der Luft: Bewegung beruhigen, damit das Auto wieder aufsetzt
+                float k = std::min(1.0f, dt * 2.5f);
+                angVel = angVel * (1.0f - k);
+                if (vel.y > 2.0f) vel.y -= (vel.y - 2.0f) * k;
+                // langsam aufrichten
+                Vec3 u = qrot(q, {0, 1, 0});
+                Vec3 axis = cross(u, Vec3{0, 1, 0});
+                q = qnorm(qmul(qaxis(length(axis) > 1e-4f ? normalize(axis) : Vec3{1, 0, 0}, std::min(0.6f, std::asin(std::min(1.0f, length(axis)))) * k), q));
+            }
+            if (airT > 6.0f || above > 80.0f) { // Notfall: zurueck auf den Boden, aufrecht, Tempo bleibt waagrecht erhalten
+                Vec3 f = qrot(q, {0, 0, -1});
+                float yaw = std::atan2(-f.x, -f.z);
+                Vec3 hv{vel.x, 0, vel.z};
+                place({pos.x, gh2 + 0.7f, pos.z}, yaw);
+                vel = hv * 0.5f;
+                airT = 0;
+            }
+        }
+    }
     { Vec3 up2 = qrot(q, {0, 1, 0}); flipped = up2.y < 0.25f; }   // auf der Seite / auf dem Dach
     odo += length(Vec3{pos.x - p0.x, 0, pos.z - p0.z});
     for (Wheel& wh : w) wh.rot = std::fmod(wh.rot + wh.omega * dt, 2 * PI);

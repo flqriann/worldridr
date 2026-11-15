@@ -68,7 +68,7 @@ static void SDLCALL audioCb(void*, SDL_AudioStream* stream, int additional, int)
         }
         // Zuendimpuls -> Druckwelle: kurzer Anstieg, schnelles Abklingen
         env = env * (diesel ? 0.9925f : 0.9905f) + impulse;
-        float pulse = env * (0.55f + 0.45f * noise * (0.25f + 0.5f * rpmN));
+        float pulse = env;   // glatter Druckimpuls, kein Rauschen (sonst klingt der Motor sandig)
         // Auspuffrohr: Kammfilter mit Laufzeit der Welle (ca. 1,2 m Rohr)
         int D = 190 + (int)(60.0f * (1.0f - rpmN));
         float cyc = comb[(cw - D) & 1023];
@@ -80,17 +80,17 @@ static void SDLCALL audioCb(void*, SDL_AudioStream* stream, int additional, int)
         float exh = lp2 * 3.4f;
         float res = 0.9f * boom.run(exh) + 0.55f * body.run(exh) + (0.25f + 0.55f * loadS) * honk.run(exh) * rpmN;
         // Ansauggeraeusch (pfeift mit Last)
-        lpN1 += (noise - lpN1) * 0.25f; lpN2 += (lpN1 - lpN2) * 0.25f;
-        float intake = (lpN1 - lpN2) * 3.0f * loadS * loadS * (0.15f + 0.85f * rpmN);
+        lpN1 += (noise - lpN1) * 0.02f; lpN2 += (lpN1 - lpN2) * 0.02f;   // sehr tiefes, weiches Ansaugbrummen statt hellem Rauschen
+        float intake = lpN2 * 14.0f * loadS * loadS * (0.15f + 0.85f * rpmN);
         // Ventiltrieb / Dieselnageln: hochfrequentes Ticken im Rhythmus der Zuendungen
         float tickPh = (float)(crank * cyl * 0.5 - std::floor(crank * cyl * 0.5));
         hpV = noise - hpPrev; hpPrev = noise;
-        float tick = hpV * (diesel ? 0.075f : 0.018f) * (0.3f + 0.7f * std::exp(-tickPh * 9.0f)) * std::min(1.0f, rpmS / 500.0f);
-        float eng = rpmS > 50 ? (res * 0.55f + intake * 0.35f + tick) * std::min(1.0f, rpmS / 450.0f) : 0.0f;
+        float tick = hpV * (diesel ? 0.03f : 0.004f) * (0.3f + 0.7f * std::exp(-tickPh * 9.0f)) * std::min(1.0f, rpmS / 500.0f);
+        float eng = rpmS > 50 ? (res * 0.55f + intake * 0.22f + tick) * std::min(1.0f, rpmS / 450.0f) : 0.0f;
         eng = std::tanh(eng * 1.6f) * 0.62f;
         // Rollen und Wind: Rauschen, tiefpassgefiltert, wird mit Tempo lauter und heller
-        lpW += (noise - lpW) * (0.03f + std::min(0.25f, speed * 0.004f));
-        float wind = lpW * std::min(0.30f, speed * speed * 0.00018f + speed * 0.0016f);
+        lpW += (noise - lpW) * (0.012f + std::min(0.06f, speed * 0.0012f));   // Fahrtwind dunkler und leiser
+        float wind = lpW * 2.2f * std::min(0.25f, speed * speed * 0.00014f + speed * 0.0012f);
         static float lpR = 0; lpR += (noise - lpR) * 0.35f;
         float rainS = (noise - lpR) * 0.09f * aRain.load();
         float out = eng + wind + rainS;

@@ -98,6 +98,7 @@ std::vector<std::string> wrapText(const std::string& s, float px, float maxW);
 // ---------- Editor ----------
 namespace editor {
 void init();
+bool enabled();               // Studio eingeschaltet? (derzeit aus, WR_STUDIO=1 schaltet es fuer Tests ein)
 void open(Vec3 at, float yaw);
 void close();
 void setCamera(Vec3 p, float yaw, float pitch);
@@ -115,6 +116,10 @@ bool blocked(float x, float z, float y);
 void save();
 bool wantsTestDrive(Vec3& pos, float& yaw);
 bool escape();               // Esc im Studio: Verschieben abbrechen / Bearbeitungsmodus verlassen; true = verbraucht
+// Gemeinsames Bauen im Mehrspiel: geaenderte Karte (Objekte + Strassen) als JSON
+std::string syncPoll(double now);            // neue lokale Aenderung seit dem letzten Aufruf? (sonst leer; erster Aufruf merkt sich nur den Stand)
+std::string currentBlob();                   // aktueller Kartenstand (fuer neu beitretende Mitspieler)
+void applyRemote(const std::string& blob, const std::string& who);   // Kartenstand eines Mitspielers uebernehmen
 }
 
 // ---------- KI-Verkehr ----------
