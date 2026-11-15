@@ -1,0 +1,65 @@
+# Baut worldridr mit CMake (MSVC + Ninja) und veroeffentlicht bei jedem Push auf main ein Release am gebauten Commit.
+# Tag-Pushes (v*) bauen ebenfalls und benutzen den Tag als Release-Namen.
+name: Build und Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # Release anlegen
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Abhaengigkeiten zwischenspeichern (SDL3, OpenXR, Lua ...)
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Konfigurieren
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Bauen
+        run: cmake --build build --parallel
+
+      - name: Paket schnueren
+        shell: pwsh
+        run: |
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $dir = "worldridr-$short"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item build/worldridr.exe $dir/
+          Copy-Item -Recurse assets, scripts $dir/
+          foreach ($f in 'config.lua', 'shifter.cfg', 'README.md', 'run.bat') { if (Test-Path $f) { Copy-Item $f $dir/ } }
+          New-Item -ItemType Directory "$dir/maps" | Out-Null
+          Compress-Archive -Path $dir -DestinationPath "$dir-windows.zip"
+          "ZIP=$dir-windows.zip" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "SHORT=$short" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: worldridr-windows
+          path: ${{ env.ZIP }}
+
+      - name: Release am Commit anlegen
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/*') { $tag = $env:GITHUB_REF_NAME; $title = "worldridr $tag"; $pre = @() }
+          else { $tag = "build-$($env:GITHUB_RUN_NUMBER)-$env:SHORT"; $title = "Build $($env:GITHUB_RUN_NUMBER) ($env:SHORT)"; $pre = @('--prerelease') }
+          # --target: der Tag zeigt auf genau den gebauten Commit, das Release erscheint dort in der Commit-Ansicht
+          gh release create $tag $env:ZIP --target $env:GITHUB_SHA --title $title --generate-notes @pre
