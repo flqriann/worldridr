@@ -11,7 +11,12 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <thread>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/wait.h>
+#include "platform.h"
+#endif
 
 namespace updater {
 namespace {
@@ -29,6 +34,7 @@ std::string repo() { const char* e = std::getenv("WR_UPDATE_REPO"); return e && 
 std::string branch() { const char* e = std::getenv("WR_UPDATE_BRANCH"); return e && *e ? e : "main"; }
 
 // Programm ohne sichtbares Fenster starten und Ausgabe einsammeln.
+#ifdef _WIN32
 bool runCmd(const std::string& cmdline, std::string& out, DWORD* exitCode = nullptr) {
     SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
     HANDLE rd = nullptr, wr = nullptr;
@@ -56,6 +62,18 @@ bool runCmd(const std::string& cmdline, std::string& out, DWORD* exitCode = null
     CloseHandle(rd);
     return true;
 }
+#else
+bool runCmd(const std::string& cmdline, std::string& out, DWORD* exitCode = nullptr) {
+    FILE* p = popen((cmdline + " 2>&1").c_str(), "r");
+    if (!p) return false;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, p)) > 0) out.append(buf, n);
+    int st = pclose(p);
+    if (exitCode) *exitCode = WIFEXITED(st) ? (DWORD)WEXITSTATUS(st) : 1;
+    return true;
+}
+#endif
 std::string trim(std::string s) {
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
     return s;

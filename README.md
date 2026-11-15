@@ -280,6 +280,14 @@ sieht keinen gemeinsamen Verkehr, sondern fährt wie im Einzelspiel mit lokal si
   Gespeichert wird nur, wer auf „Speichern“ drückt. Bei gleichzeitigen Änderungen gilt die letzte.
 - Testhilfe: `WR_MAP=pfad` lädt/speichert eine andere Kartendatei.
 
+## Spurketten und Linux
+
+- **Spurketten:** Spurzahl und Breite laufen entlang einer Straße stetig. Kurze Ausreißer (< 60 m, beide Nachbarn gleich) übernehmen die Spurzahl der
+  Nachbarn. Wo die Spurzahl wirklich wechselt, wird der breitere Abschnitt über bis zu 1,5-fache Keillänge (bis 85 % seiner Länge) schmaler; dabei sinkt die
+  **Spurzahl im Shader stetig mit der Breite**, die Spurbreite bleibt gleich und die äußerste Spur läuft aus, statt dass Linien springen.
+- **Linux (experimentell):** `cmake -S . -B build -G Ninja && cmake --build build` mit SDL3-Abhängigkeiten, OpenGL und libcurl; ohne VR.
+  Die GitHub-CI baut es mit (`continue-on-error`) und hängt das Paket ans Release.
+
 ## Mehrspieler (Details)
 
 Menü → Mehrspieler → „Spiel hosten“ zeigt die eigene Adresse; die anderen wählen „Beitreten“ und tippen sie ein.

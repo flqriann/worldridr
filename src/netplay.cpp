@@ -1,8 +1,7 @@
 // Mehrspieler ueber UDP: ein Spieler hostet (oder ein eigenstaendiger Server laeuft), die anderen treten per Adresse bei.
 // Der Host/Server verteilt Positionen und Chatnachrichten. Positionen werden als Geokoordinaten gesendet, damit jeder
 // seinen eigenen lokalen Ursprung behalten kann. LAN-Spiele werden per Broadcast gefunden.
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "platform.h"
 #include "game.h"
 #include <cstring>
 #include <random>
@@ -166,7 +165,7 @@ void receive() {
     for (;;) {
         char buf[1500];
         sockaddr_in from{};
-        int fl = sizeof from;
+        sockl_t fl = sizeof from;
         int n = recvfrom(sock, buf, sizeof buf, 0, (sockaddr*)&from, &fl);
         if (n < 0) {
             // WSAECONNRESET meldet nur ein frueheres unzustellbares Paket - weiterlesen statt abbrechen
@@ -498,7 +497,7 @@ void pollDiscovery() {
     for (;;) {
         char buf[256];
         sockaddr_in from{};
-        int fl = sizeof from;
+        sockl_t fl = sizeof from;
         int n = recvfrom(discSock, buf, sizeof buf, 0, (sockaddr*)&from, &fl);
         if (n < 0) break;
         if (n != (int)sizeof(InfoPacket)) continue;

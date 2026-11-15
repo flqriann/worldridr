@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include "vr.h"
 #include "gfx.h"
 #include <unknwn.h>
@@ -203,3 +204,15 @@ void VR::endFrame() {
     }
     xrEndFrame(d->session, &ei);
 }
+#else
+// Unter Linux gibt es keine VR-Anbindung (OpenXR ist hier nur fuer Windows/Meta Horizon Link eingerichtet): leere Ersatzfunktionen.
+#include "vr.h"
+struct VR::Impl {};
+bool VR::init() { available = false; return false; }
+bool VR::beginFrame() { return false; }
+bool VR::shouldRender() const { return false; }
+void VR::bindEye(int) {}
+void VR::releaseEye(int) {}
+void VR::endFrame() {}
+void VR::poll() {}
+#endif

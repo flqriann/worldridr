@@ -1406,6 +1406,36 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                 at[w.nodes.front()].push_back(wi);
                 at[w.nodes.back()].push_back(wi);
             }
+            // Kettenlogik, Schritt 1: kurze Ausreisser. Ein Abschnitt (< 60 m) einer durchgehenden Strasse, dessen Spurzahl von seinen beiden
+            // Fortsetzungen abweicht, die untereinander gleich sind, ist fast immer ein Tagging-Rauschen (z. B. eine einzelne Abbiegespur):
+            // er bekommt die Spurzahl der Nachbarn. Sonst entstehen zwei harte Spurwechsel auf wenigen Metern.
+            for (int wi = 0; wi < (int)ways.size(); wi++) {
+                WayTmp& w = ways[wi];
+                if (w.nodes.size() < 2 || w.nodes.size() != w.px.size() || w.klass > 5 || w.ring || r.names[w.name].empty() || w.link) continue;
+                float len = 0;
+                for (size_t i = 0; i + 1 < w.px.size(); i++) len += std::hypot(w.px[i + 1] - w.px[i], w.pz[i + 1] - w.pz[i]);
+                if (len > 60.0f) continue;
+                int nb[2] = {0, 0};
+                int side = 0;
+                for (int64_t node : {w.nodes.front(), w.nodes.back()}) {
+                    int cnt = 0, lanesO = 0;
+                    auto it = at.find(node);
+                    if (it != at.end())
+                        for (int oi : it->second) {
+                            const WayTmp& o = ways[oi];
+                            if (oi == wi || o.klass != w.klass || o.name != w.name || o.oneway != w.oneway) continue;
+                            cnt++; lanesO = o.lanes;
+                        }
+                    nb[side++] = cnt == 1 ? lanesO : 0;
+                }
+                if (nb[0] > 0 && nb[0] == nb[1] && nb[0] != w.lanes) {
+                    w.lanes = nb[0];
+                    float width = w.widthTag > 0 ? w.widthTag : w.lanes * laneW[w.klass] + (w.klass <= 1 ? 1.5f : 0.4f);
+                    w.hw = std::min(width * 0.5f, 25.0f);
+                    if (w.lanes >= 2 && (w.klass <= 4 || w.lanes >= 2)) w.flags |= 1; else w.flags &= ~1;
+                    w.inferred = true;
+                }
+            }
             for (int iter = 0; iter < 4; iter++) { // ueber mehrere Abschnitte hinweg weitergeben
                 bool any = false;
                 for (int wi = 0; wi < (int)ways.size(); wi++) {
@@ -1882,7 +1912,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
             float hwq = std::min(255.0f, w.hw * 10.0f) / 10.0f;
             // Spurverengung/-erweiterung: der breitere Abschnitt einer Strasse verjuengt sich zum Knoten hin auf die Breite der Fortsetzung
             // (Keil mit weichem Verlauf, 28 m innerorts, 50 m, 90 m auf Schnellstrassen) statt eines Sprungs an der Wegegrenze
-            std::vector<float> hwv(m, hwq);
+            std::vector<float> hwv(m, hwq), lnv(m, (float)w.lanes);   // lnv: Spurzahl je Stuetzpunkt (kommt im Keil stetig herunter)
             if ((int)G.wedge.size() == m) for (int k = 0; k < m; k++) hwv[k] = std::min(hwv[k], std::min(255.0f, G.wedge[k] * 10.0f) / 10.0f);   // Rampenkeil
             if (!w.ring && (int)w.nodes.size() == n && w.klass <= 5 && m >= 2) {
                 float Lw = rd[m - 1], taperLen = w.klass <= 1 ? 90.0f : (w.klass <= 3 ? 50.0f : 28.0f);
@@ -1894,7 +1924,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                     float tn = std::hypot(tx, tz);
                     if (tn < 1e-4f) continue;
                     tx /= tn; tz /= tn;
-                    float bestHw = -1;
+                    float bestHw = -1; int bestLanes = w.lanes;
                     for (int oi : it->second) {
                         const WayTmp& o = ways[oi];
                         if (oi == (int)wi || o.klass != w.klass || o.name != w.name || r.names[w.name].empty() || o.oneway != w.oneway || o.ring) continue;
@@ -1907,15 +1937,17 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                         if (ol < 1e-4f) continue;
                         ox /= ol; oz /= ol;
                         if (tx * ox + tz * oz > -0.6f) continue;   // laeuft nicht weiter, sondern zweigt ab
-                        bestHw = bestHw < 0 ? o.hw : std::min(bestHw, o.hw);
+                        if (bestHw < 0 || o.hw < bestHw) { bestHw = o.hw; bestLanes = o.lanes; }
                     }
                     if (bestHw < 0 || bestHw >= w.hw - 0.3f) continue;   // nur der breitere Abschnitt verjuengt sich
-                    float len = std::min(taperLen, Lw * 0.45f);
+                    // Keil lang und weich: Laenge nach Strassenklasse, nur bei sehr kurzen Abschnitten begrenzt (frueher 45 % -> harter Knick)
+                    float len = std::min(taperLen * 1.5f, Lw * 0.85f);
                     for (int k = 0; k < m; k++) {
                         float s = side == 0 ? rd[k] : Lw - rd[k];
                         if (s >= len) continue;
                         float u = s / len, sm = u * u * (3 - 2 * u);
                         hwv[k] = std::min(hwv[k], std::min(255.0f, (bestHw + (w.hw - bestHw) * sm) * 10.0f) / 10.0f);
+                        lnv[k] = std::min(lnv[k], (float)bestLanes + (float)(w.lanes - bestLanes) * sm);   // Spurzahl sinkt stetig: die Spurbreite bleibt gleich
                     }
                 }
             }
@@ -1944,7 +1976,7 @@ w.rbt = klass <= 6 && tagOf(e, "junction") == "roundabout";
                     float yy = ry.empty() ? std::max(H(x, z), H(rx[k], rz[k])) : ((G.bridge || G.tunnel || (G.cut && G.gy[k] - ry[k] > 0.2f)) ? ry[k] : std::max(ry[k], H(x, z)));
                     Color ck = col;
                     ck.a = (uint8_t)std::min(255.0f, hwv[k] * 10.0f);
-                    o = {{x, yy + 0.03f, z}, {0, 1, 0}, {hk * side, rd[k]}, ck};
+                    o = {{x, yy + 0.03f, z}, {lnv[k], 1, 0}, {hk * side, rd[k]}, ck};   // Normale.x = Spurzahl (Shader)
                 };
                 for (int k = 0; k + 1 < m; k++) {
                     if (!inside((rx[k] + rx[k + 1]) * 0.5f, (rz[k] + rz[k + 1]) * 0.5f)) continue;

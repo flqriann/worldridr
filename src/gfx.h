@@ -1,6 +1,13 @@
 #pragma once
 #include "common.h"
+#ifdef _WIN32
 #include <windows.h>
+#else
+#ifndef APIENTRY
+#define APIENTRY
+#endif
+#define GL_GLEXT_LEGACY   // nur die GL-1.1-Funktionen aus gl.h, alles Weitere wird zur Laufzeit geladen (wie unter Windows)
+#endif
 #include <GL/gl.h>
 #include <cstddef>
 

@@ -34,7 +34,12 @@ FetchContent_Declare(stb URL https://github.com/nothings/stb/archive/refs/heads/
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(json URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz)
 
-FetchContent_MakeAvailable(SDL3 openxr lua stb json)
+if(WIN32)
+  FetchContent_MakeAvailable(SDL3 openxr lua stb json)
+else()
+  # Linux: OpenXR/VR wird nicht gebaut; Systembibliotheken: OpenGL, libcurl (HTTP) und die SDL3-Abhaengigkeiten (X11/Wayland/ALSA ...)
+  FetchContent_MakeAvailable(SDL3 lua stb json)
+endif()
 
 file(GLOB LUA_SRC ${lua_SOURCE_DIR}/src/*.c)
 list(FILTER LUA_SRC EXCLUDE REGEX "/(lua|luac)\\.c$")
@@ -47,8 +52,16 @@ add_executable(worldridr
   src/carmodel.cpp src/ui.cpp src/editor.cpp src/netplay.cpp src/traffic.cpp src/worldmap.cpp src/nav.cpp src/pedestrians.cpp src/forest.cpp src/econ.cpp src/keys.cpp src/ragdoll.cpp src/onfoot.cpp src/signs.cpp src/env.cpp src/mapformat.cpp src/updater.cpp)
 target_include_directories(worldridr PRIVATE ${stb_SOURCE_DIR})
 target_compile_definitions(worldridr PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
-target_link_libraries(worldridr PRIVATE SDL3::SDL3-static OpenXR::openxr_loader lua
-  nlohmann_json::nlohmann_json opengl32 winhttp ws2_32)
+if(WIN32)
+  target_link_libraries(worldridr PRIVATE SDL3::SDL3-static OpenXR::openxr_loader lua
+    nlohmann_json::nlohmann_json opengl32 winhttp ws2_32)
+else()
+  find_package(OpenGL REQUIRED)
+  find_package(CURL REQUIRED)
+  find_package(Threads REQUIRED)
+  target_link_libraries(worldridr PRIVATE SDL3::SDL3-static lua nlohmann_json::nlohmann_json
+    OpenGL::GL CURL::libcurl Threads::Threads)
+endif()
 if(MSVC)
   target_compile_options(worldridr PRIVATE /utf-8 /W3 /wd4244 /wd4305 /wd4267)
 endif()

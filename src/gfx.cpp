@@ -125,6 +125,7 @@ void main(){
   if(uMode==2){
     float lat=vUV.x, along=vUV.y; float hw=vC.a*25.5;
     int lanes=int(vC.r*255.0+0.5); int fl=int(vC.g*255.0+0.5); int klass=int(vC.b*255.0+0.5);
+    float lanesF=vN.x>0.5 ? vN.x : float(lanes);   // Spurzahl je Pixel (im Keil stetig)
     if(klass==8){ // Mittelinsel eines Kreisverkehrs: Rasen mit Bordstein
       float inside=-lat;
       float aa=smoothstep(-0.02,0.12,inside);
@@ -160,18 +161,18 @@ void main(){
       c=vec3(0.19+0.05*nz+fine);
       if(klass>=7) c=vec3(0.42,0.38,0.30)+0.05*nz+fine;
       // Spurrillen und Fahrbahnflecken
-      float lw0=2.0*hw/float(max(lanes,1)); float xl=(lat+hw)/lw0; float dc=(fract(xl)-0.5)*lw0;
+      float lw0=2.0*hw/max(lanesF,1.0); float xl=(lat+hw)/lw0; float dc=(fract(xl)-0.5)*lw0;
       float track=smoothstep(0.38,0.0,abs(abs(dc)-0.85))*step(2.0,lw0)*(klass<=5?1.0:0.0);
       c*=1.0-0.12*track*nearF;
       if(uQ>0) c*=0.92+0.10*vnoise(vW.xz*0.35);
       // Markierungen (weich, abgenutzt)
       float line=0.0;
-      if((fl&1)!=0 && lanes>=2){
+      if((fl&1)!=0 && lanesF>=1.5){
         float lw=lw0; float x=(lat+hw)/lw; float k=floor(x+0.5);
         float d=abs(x-k)*lw;
-        if(k>=1.0 && k<=float(lanes)-0.5){
+        if(k>=1.0 && k<=lanesF-0.5){
           int cb=(fl>>5)&7;                                  // Spuren der Gegenrichtung (links), 0 = Mitte
-          float cpos=cb>0 ? float(cb) : float(lanes)*0.5;
+          float cpos=cb>0 ? float(cb) : lanesF*0.5;
           bool center=((fl&4)==0) && (abs(k-cpos)<0.1);
           float dash=(center && klass<=2) ? 1.0 : smoothstep(0.0,0.15,3.0-mod(along,9.0))*smoothstep(0.0,0.15,mod(along,9.0));
           line=max(line, smoothstep(0.085,0.05,d)*dash);

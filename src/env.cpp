@@ -19,7 +19,11 @@ float timeScale() { return speeds[clampv(speedIdx, 0, 3)]; }
 float systemHour() {
     std::time_t t = std::time(nullptr);
     std::tm lt{};
+#ifdef _WIN32
     localtime_s(&lt, &t);
+#else
+    localtime_r(&t, &lt);
+#endif
     return lt.tm_hour + lt.tm_min / 60.0f + lt.tm_sec / 3600.0f;
 }
 bool remoteControlled() { return simTime - remoteT < 4.0; }
