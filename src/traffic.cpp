@@ -323,7 +323,7 @@ void stepFree(AI& c, float dt) {
         c.vel = c.vel * -0.25f; c.yawRate *= -0.3f;
     }
     float h;
-    if (world.surface(c.pos.x, c.pos.z, c.pos.y + 1.2f, h)) c.pos.y += (h - c.pos.y) * std::min(1.0f, dt * 12);
+    if (world.surface(c.pos.x, c.pos.z, c.pos.y + 1.2f, h)) { float d = h - c.pos.y, lim = 0.45f * std::fabs(c.v) * dt + 0.01f; if (std::fabs(d) > 2.5f) c.pos.y = h; else c.pos.y += clampv(d * std::min(1.0f, dt * 12), -lim, lim); }   // Steigung begrenzt: keine Spruenge an Rampen
     c.v = length(c.vel);
     c.wheelRot = std::fmod(c.wheelRot + vf / 0.316f * dt, 2 * PI);
     c.braking = true; c.steerVis *= 0.9f;
@@ -655,7 +655,7 @@ void update(float dt) {
         c.steerVis += (clampv(dt > 0 ? -dy / dt * 2.6f / std::max(c.v, 1.0f) : 0, -0.55f, 0.55f) - c.steerVis) * std::min(1.0f, dt * 8);
         c.pos += Vec3{-std::sin(c.yaw), 0, -std::cos(c.yaw)} * (c.v * dt);
         float h;
-        if (world.surface(c.pos.x, c.pos.z, c.pos.y + 1.2f, h)) c.pos.y += (h - c.pos.y) * std::min(1.0f, dt * 12);
+        if (world.surface(c.pos.x, c.pos.z, c.pos.y + 1.2f, h)) { float d = h - c.pos.y, lim = 0.45f * std::fabs(c.v) * dt + 0.01f; if (std::fabs(d) > 2.5f) c.pos.y = h; else c.pos.y += clampv(d * std::min(1.0f, dt * 12), -lim, lim); }   // Steigung begrenzt: keine Spruenge an Rampen
         c.wheelRot = std::fmod(c.wheelRot + c.v / 0.316f * dt, 2 * PI);
         c.s = dot(c.pos - nodeP[fromNode(c.e, c.rev)], dir);
         c.stuck = c.v < 0.2f ? c.stuck + dt : 0;

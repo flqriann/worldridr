@@ -310,18 +310,13 @@ void draw(const Mat4& vp, Vec3 cam, double now, bool mirrorPass) {
     geoLit.clear(); geoFace.clear(); geoGlow.clear(); textB.clear();
     gK = 0.34f + 0.66f * envir::dayFactor();
     const float R = 320.0f;
-    static const bool dbgOn = std::getenv("WR_SIGNDBG") != nullptr;
-    static double dbgT = 0;
-    bool dbg = dbgOn && now - dbgT > 2.0;
-    if (dbg) dbgT = now;
     world.forSignsNear(cam.x, cam.z, R, [&](const SignDef& s) {
         float dx = s.pos.x - cam.x, dz = s.pos.z - cam.z, d2 = dx * dx + dz * dz;
         bool big = s.kind == 1 || s.kind == 12 || s.kind == 2;
         if (d2 > (big ? R * R : 170.0f * 170.0f)) return;
         drawSign(s, now);
-        if (dbg && s.kind == 1) logMsg("Schild-Test: Wegweiserbruecke %.0f m entfernt, Hoehe %.1f (Kamera %.1f), Spuren %d, hw %.1f", std::sqrt(d2), s.pos.y, cam.y, s.lanes, s.hw);
     });
-    // Stopp und Vorrang geben stehen bei den Ampeln/Haltelinien (Control)
+    // Stopp und Vorrang geben stehen bei den Haltelinien (Control)
     world.forControls(cam, 170.0f, [&](const Control& c) {
         if (c.type != 1 && c.type != 2) return;
         SignDef s;

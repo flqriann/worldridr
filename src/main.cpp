@@ -15,6 +15,7 @@
 #include "game.h"
 #include "keys.h"
 #include "net.h"
+#include "updater.h"
 #include "stb_image_write.h"
 
 Config cfg;
@@ -844,7 +845,7 @@ static void buildMenu() {
         next();
         if (item("Einstellungen")) menuPage = 2;
         next();
-        if (spawned) {
+        if (spawned && editor::enabled()) {
             if (item(editor::active() ? "Studio verlassen" : "Studio: bauen und Stra\xC3\x9F" "en legen")) {
                 closeMenu();
                 if (editor::active()) editor::close();
@@ -1238,6 +1239,7 @@ int main(int argc, char** argv) {
     applyVehicle();
     (void)haveSettings;
     editor::init();
+    updater::start(); // fragt im Hintergrund GitHub nach einer neueren Version
     forest::init();
     script.init(&hud);
     if (cfg.vr) vr.init();
@@ -1286,7 +1288,7 @@ int main(int argc, char** argv) {
                 if (keys::is(A_CHAT, k) && !menuOpen && !edit && !worldmap::active() && netplay::active()) { beginTyping(4); continue; }
                 if (keys::is(A_MAP, k) && !edit && !menuOpen) { if (worldmap::active()) worldmap::close(); else worldmap::open(); continue; }
                 if (k == SDLK_P) { wantShot = true; continue; }
-                if (k == SDLK_F2 && spawned) { if (edit) editor::close(); else { Vec3 f = car.forward(); editor::open(car.pos, std::atan2(-f.x, -f.z)); } continue; }
+                if (k == SDLK_F2 && spawned && editor::enabled()) { if (edit) editor::close(); else { Vec3 f = car.forward(); editor::open(car.pos, std::atan2(-f.x, -f.z)); } continue; }
             }
             if (menuOpen) continue;
             if (worldmap::active()) { worldmap::event(e); continue; }
@@ -1382,7 +1384,7 @@ int main(int argc, char** argv) {
         bool cockpit = camMode == 0 && !edit && !foot::on;
         ui.begin(uiW, uiH, mxp * uiH / wh, myp * uiH / wh, (mb & SDL_BUTTON_LMASK) != 0, uiClick);
         if (mapOpen && !menuOpen) worldmap::buildUI();
-        else if (!edit && !menuOpen && foot::fade() < 0.5f) { buildHUD(cockpit, !spawned); if (spawned) nav::buildHUD(); buildMapQuestion(); }
+        else if (!edit && !menuOpen && foot::fade() < 0.5f) { buildHUD(cockpit, !spawned); if (spawned) nav::buildHUD(); buildMapQuestion(); updater::draw(ui, !spawned || std::fabs(car.speed()) < 0.8f); }
         if (edit && !menuOpen) editor::buildUI();
         buildPrompt();
         if (foot::fade() > 0.01f) ui.geo.rect(0, 0, uiW, uiH, Color{0, 0, 0, (uint8_t)(255.0f * foot::fade())});
@@ -1579,6 +1581,26 @@ int main(int argc, char** argv) {
             if (poiTest == 2 && simTime - spawnTime > 9) { econ::keyJ(); poiTest = 3; }
             if (policeTest && simTime - spawnTime > 8) { traffic::offence(2); traffic::offence(2); traffic::offence(0); policeTest = false; }
             script.update(dt);
+            if (const char* pr = std::getenv("WR_PROFILE")) { // Test: Hoehenprofil entlang einer Linie lat1,lon1,lat2,lon2 (Gelaende und Fahrflaeche) ins Log
+                static bool done = false;
+                if (!done && simTime - spawnTime > 14) {
+                    done = true;
+                    std::vector<Vec3> pts;   // "lat,lon;lat,lon;..."
+                    { std::string str = pr; size_t pos = 0; while (pos < str.size()) { size_t e = str.find(';', pos); if (e == std::string::npos) e = str.size(); double la, lo; if (sscanf(str.substr(pos, e - pos).c_str(), "%lf,%lf", &la, &lo) == 2) { float x, z; world.toLocal(la, lo, x, z); pts.push_back({x, 0, z}); } pos = e + 1; } }
+                    float prevS = 0, acc = 0;
+                    for (size_t i = 0; i + 1 < pts.size(); i++) {
+                        float L = std::hypot(pts[i + 1].x - pts[i].x, pts[i + 1].z - pts[i].z);
+                        for (float d = 0; d < L; d += 2.0f) {
+                            float x = pts[i].x + (pts[i + 1].x - pts[i].x) * d / L, z = pts[i].z + (pts[i + 1].z - pts[i].z) * d / L, hT = 0, hS = 0;
+                            world.height(x, z, hT); world.surface(x, z, 1e9f, hS);
+                            logMsg("PROFIL s=%.0f terrain=%.2f flaeche=%.2f sprung=%.2f", acc + d, hT, hS, (acc + d) > 0 ? hS - prevS : 0.0f);
+                            prevS = hS;
+                        }
+                        acc += L;
+                    }
+                    running = false;
+                }
+            }
 
             float load = car.engineOn ? clampv(car.throttle * 0.9f + 0.1f, 0.0f, 1.0f) : (car.starter ? 0.5f : 0.0f);
             audioRain(std::min(1.0f, envir::rainLevel()));
@@ -1587,6 +1609,15 @@ int main(int argc, char** argv) {
             audioSiren(traffic::sirenLevel());
             input.setFFB(car.ffb, dt);
 
+            if (autodrive) { // Test: Abhebe-Ereignisse sofort melden (Hoehe ueber Boden, Position, Tempo)
+                static double lastHop = -10;
+                float g0 = 0;
+                if (world.surface(car.pos.x, car.pos.z, car.pos.y + 0.5f, g0) && car.pos.y - g0 > 1.1f && simTime - lastHop > 0.3) {
+                    lastHop = simTime;
+                    double la, lo; world.toLatLon(car.pos.x, car.pos.z, la, lo);
+                    logMsg("ABHEBEN t=%.1f hoehe=%.2f v=%.1f km/h vy=%.1f bei %.5f,%.5f", simTime, car.pos.y - g0, car.speed() * 3.6f, car.vel.y, la, lo);
+                }
+            }
             if (autodrive && simTime - lastTelemetry > 1.0) {
                 lastTelemetry = simTime;
                 float gh = 0;

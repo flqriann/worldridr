@@ -161,7 +161,7 @@ roten Ampeln und Stoppschildern, blinken beim Abbiegen und beachten den Vorrang 
 rechts vor links). Nimmst du einem Fahrzeug den Vorrang, gibt es Fehlerpunkte; ein Zusammenstoß zählt als Unfall.
 Anzahl in `config.lua` (`traffic = 22`, 0 = aus) oder im Menü ein-/ausschalten.
 
-## Studio (Editor) – F2 oder Menü
+## Studio (Editor) – derzeit abgeschaltet (eigene Anwendung); zum Testen `WR_STUDIO=1` setzen
 
 Aufbau wie in Roblox Studio / Blender: links **Einfügen** und **Explorer** (Objektliste), rechts **Eigenschaften**,
 oben Speichern, Rückgängig/Wiederholen, Werkzeuge, Raster und der Schalter **Bearbeiten (Tab)**.
@@ -258,6 +258,28 @@ Der Host simuliert KI-Verkehr und Fußgänger und schickt sie mit 10 Hz an alle 
 von Fußgängern). Grenze: Der Verkehr entsteht rund um den Host; ein Mitspieler weit entfernt vom Host (oder auf einem eigenständigen Server ohne Host-Spieler)
 sieht keinen gemeinsamen Verkehr, sondern fährt wie im Einzelspiel mit lokal simuliertem. Mitspieler bewegen sich jetzt ohne Ruckeln (Fortschreibung + weiches Nachführen).
 
+## Schilder, Wegweiser, Unterführungen (Stand 14.11.)
+
+- **Schilder in echten Formen:** Stopp (Achteck), Vorrang geben (Dreieck), Tempolimit, Einbahn, Einfahrt verboten, Kreisverkehr (mit Vorrang geben),
+  Autobahn-Beginn, Fußgängerübergang (dazu Zebrastreifen auf der Fahrbahn aus `crossing=zebra/marked`). Nachts leicht gedimmt.
+- **Autobahn/Schnellstraße:** an jeder Ausfahrt Vorwegweiser (1000 m), Wegweiserbrücke mit Wechselanzeige (450 m), Baken (300/200/100 m) und
+  Ausfahrtstafel an der Rampe. Ziele aus `destination`, sonst aus der Straße, zu der die Rampe führt; Name der Anschlussstelle aus `motorway_junction`.
+- **Unterführungen:** Straßen mit `layer<0`/`covered=yes` und Straßen unter Bahnbrücken werden abgesenkt (mind. 4,8 m unter den Gleisen),
+  das Gelände wird ausgeschnitten, die Bahnbrücke als Platte mit Schienen gezeichnet.
+- **Brücken:** Die Fahrbahn auf Brücken wird nach der Brückenplatte gezeichnet (Markierungen bleiben sichtbar); Dammböschungen sind geglättet.
+- **Kachelgrenzen:** OSM-Abfrage mit 450 m Rand, damit Höhen an Kachelgrenzen übereinstimmen (Zwischenspeicher jetzt `cache/osm2`).
+- **Himmel:** grobe Geländestufen werden um die Kamera abgesenkt, wenn die feine geladen ist (kein braun-graues Flackern mehr am Himmel).
+- **Wasser:** liegt als Tuch auf dem Gelände, offene Umrisse und Bäche/verrohrte Gewässer werden nicht mehr gefüllt.
+
+## Studio: Straßen wie in Cities Skylines, gemeinsames Bauen
+
+- Straßen rasten an Punkten **und mitten auf bestehenden Straßen** ein; dort entsteht automatisch eine Kreuzung mit ausgerundeten Ecken,
+  durchlaufenden Gehsteigen, Haltelinien und Richtungspfeilen je Spur (aus den möglichen Abbiegerichtungen berechnet).
+- Straßenende anklicken: **Richtungspfeile je Spur** einstellen (automatisch, links, geradeaus, rechts, Kombinationen, kein Pfeil).
+- **Mehrspieler:** Änderungen im Studio gehen an alle Mitspieler (über den Host), Neue bekommen beim Beitreten den Kartenstand des Hosts.
+  Gespeichert wird nur, wer auf „Speichern“ drückt. Bei gleichzeitigen Änderungen gilt die letzte.
+- Testhilfe: `WR_MAP=pfad` lädt/speichert eine andere Kartendatei.
+
 ## Mehrspieler (Details)
 
 Menü → Mehrspieler → „Spiel hosten“ zeigt die eigene Adresse; die anderen wählen „Beitreten“ und tippen sie ein.
@@ -284,3 +306,21 @@ und jeder sieht nur seine eigene `maps/welt.json`.
 Eine Fahrstunde ist eine Lua-Tabelle mit `title` und `steps` (siehe `scripts/lessons`). Jeder Schritt hat einen `text`
 und eine Funktion `done(ctx)`, die den Zustand in der Tabelle `car` prüft (`speed_kmh`, `rpm`, `gear`, `clutch`,
 `blinker`, `on_road`, `speed_limit`, `lane_offset`, ...). Neue Datei in `scripts/main.lua` eintragen.
+
+## Kartenformat (Git) und World Studio
+
+Karten liegen als Ordner im Format **worldridr-map** vor (Standard: `maps/world`, anderer Ordner mit `WR_MAPDIR=pfad`): ein Manifest
+`worldridr-map.json` plus eine Datei pro Kachel in `tiles/` mit je einer Zeile pro Objekt/Straße, sortiert und gerundet. Das ist
+für Git gemacht: kleine Diffs, kaum Merge-Konflikte (andere Gegend = andere Datei), jeder kann per Pull Request Änderungen vorschlagen.
+Existiert der Ordner, lädt das Spiel ihn statt `maps/welt.json`, und das Studio (F2, Strg+S) speichert wieder dorthin (neue Objekte
+bekommen eine stabile ID). Erstellt und bearbeitet werden Karten auch mit dem eigenständigen **World Studio**
+(Repository `worldridr-editor`, Format-Beschreibung in `FORMAT.md`). Die alte `maps/welt.json` lässt sich dort über *Datei → Import* übernehmen.
+Liegt im Kartenordner eine `terrain.json` (Gelände aus dem Studio), nutzt das Spiel diese Höhen statt der Online-Daten; Modelle aus `<Karte>/assets/models` werden im Studio-Menü mit angeboten.
+
+## Update-Rückfrage (GitHub)
+
+Beim Start und danach alle 10 Minuten fragt das Spiel im Hintergrund GitHub (`flqriann/worldridr`, Zweig `main`), ob es Neues gibt.
+Gibt es eine neuere Version, erscheint oben eine Rückfrage: **Herunterladen**, **Später** oder **Überspringen** (diese Version nie wieder anbieten).
+Mit Git-Checkout läuft `git pull --ff-only` (bricht ab statt lokale Änderungen zu überschreiben); sonst wird ein ZIP nach `update/` geladen.
+Hat sich Programmcode geändert, einmal `build.bat` ausführen und neu starten; Karten, Assets und Skripte gelten ab dem nächsten Start.
+Abschalten mit `WR_UPDATE=0`, anderes Repository mit `WR_UPDATE_REPO=besitzer/name` (`WR_UPDATE_BRANCH` für den Zweig).

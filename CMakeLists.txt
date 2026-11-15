@@ -44,7 +44,7 @@ target_include_directories(lua PUBLIC ${lua_SOURCE_DIR}/src)
 add_executable(worldridr
   src/main.cpp src/gfx.cpp src/net.cpp src/world.cpp src/vehicle.cpp
   src/input.cpp src/audio.cpp src/script.cpp src/vr.cpp
-  src/carmodel.cpp src/ui.cpp src/editor.cpp src/netplay.cpp src/traffic.cpp src/worldmap.cpp src/nav.cpp src/pedestrians.cpp src/forest.cpp src/econ.cpp src/keys.cpp src/ragdoll.cpp src/onfoot.cpp src/signs.cpp src/env.cpp)
+  src/carmodel.cpp src/ui.cpp src/editor.cpp src/netplay.cpp src/traffic.cpp src/worldmap.cpp src/nav.cpp src/pedestrians.cpp src/forest.cpp src/econ.cpp src/keys.cpp src/ragdoll.cpp src/onfoot.cpp src/signs.cpp src/env.cpp src/mapformat.cpp src/updater.cpp)
 target_include_directories(worldridr PRIVATE ${stb_SOURCE_DIR})
 target_compile_definitions(worldridr PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(worldridr PRIVATE SDL3::SDL3-static OpenXR::openxr_loader lua

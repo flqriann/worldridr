@@ -6,6 +6,9 @@
 #include "game.h"
 #include <cstring>
 #include <random>
+#include <map>
+#include <nlohmann/json.hpp>
+using json = nlohmann::json;
 
 namespace {
 #pragma pack(push, 1)
@@ -33,6 +36,13 @@ struct EnvPacket {
     float hour;
     uint8_t weather, speed;
 };
+struct MapPart {   // Teil eines Kartenstands (gemeinsames Bauen)
+    Hdr h;
+    uint32_t ver;
+    uint16_t idx, total, len;
+    char name[16];
+    char data[1100];
+};
 struct ChatPacket {
     Hdr h;
     char name[16];
@@ -56,6 +66,40 @@ std::vector<LanServer> lan;
 std::vector<netplay::ChatLine> chatLines;
 uint32_t myId = 0;
 float sendTimer = 0, beatTimer = 0, npcTimer = 0, envTimer = 0;
+// Kartenstaende: werden in Teilen verschickt und dreimal wiederholt (UDP kann Pakete verlieren); der Empfaenger setzt sie zusammen
+struct OutMap { std::string blob; uint32_t ver; int left; double next; bool all; sockaddr_in to; };
+std::vector<OutMap> outMaps;
+struct InMap { uint16_t total = 0; int got = 0; std::vector<std::string> parts; std::vector<char> have; double t = 0; std::string name; bool done = false; };
+std::map<uint64_t, InMap> inMaps;
+void queueMap(const std::string& blob, bool all, const sockaddr_in* to) {
+    if (blob.empty() || blob.size() > 6 * 1024 * 1024) return;
+    OutMap o;
+    o.blob = blob; o.ver = (uint32_t)(simTime * 1000.0) ^ myId; o.left = 3; o.next = 0; o.all = all;
+    if (to) o.to = *to;
+    outMaps.push_back(o);
+}
+void pumpMaps() {
+    for (size_t i = 0; i < outMaps.size();) {
+        OutMap& o = outMaps[i];
+        if (simTime < o.next) { i++; continue; }
+        size_t total = (o.blob.size() + 1099) / 1100;
+        for (size_t k = 0; k < total; k++) {
+            MapPart mp{};
+            mp.h = {MAGIC, 9, myId};
+            mp.ver = o.ver; mp.idx = (uint16_t)k; mp.total = (uint16_t)total;
+            size_t len = std::min<size_t>(1100, o.blob.size() - k * 1100);
+            mp.len = (uint16_t)len;
+            strncpy(mp.name, cfg.playerName.c_str(), 15);
+            memcpy(mp.data, o.blob.data() + k * 1100, len);
+            int bytes = (int)offsetof(MapPart, data) + (int)len;
+            if (!o.all) sendto(sock, (const char*)&mp, bytes, 0, (const sockaddr*)&o.to, sizeof o.to);
+            else if (isHost) for (const Peer& pe : peers) sendto(sock, (const char*)&mp, bytes, 0, (const sockaddr*)&pe.addr, sizeof pe.addr);
+            else sendto(sock, (const char*)&mp, bytes, 0, (const sockaddr*)&hostAddr, sizeof hostAddr);
+        }
+        if (--o.left <= 0) outMaps.erase(outMaps.begin() + i);
+        else { o.next = simTime + 1.2; i++; }
+    }
+}
 double lastFromHost = -100, discStart = -100;
 std::string info, serverName = "worldridr";
 int portUsed = 0, maxPlayers = 16;
@@ -146,6 +190,31 @@ void receive() {
             continue;
         }
         if (h.type == 6) { lastFromHost = simTime; continue; }
+        if (h.type == 9 && n >= (int)offsetof(MapPart, data)) { // gemeinsames Bauen: Teil eines Kartenstands
+            MapPart mp{};
+            memcpy(&mp, buf, std::min(n, (int)sizeof mp));
+            if (mp.total == 0 || mp.idx >= mp.total || mp.len > 1100 || n < (int)offsetof(MapPart, data) + mp.len) continue;
+            if (isHost) { // an alle anderen weiterreichen
+                Peer* src = nullptr;
+                for (Peer& q : peers) if (q.addr.sin_addr.s_addr == from.sin_addr.s_addr && q.addr.sin_port == from.sin_port) src = &q;
+                for (const Peer& pe : peers) if (&pe != src) sendto(sock, buf, n, 0, (const sockaddr*)&pe.addr, sizeof pe.addr);
+            }
+            uint64_t key = ((uint64_t)h.id << 32) | mp.ver;
+            InMap& im = inMaps[key];
+            if (im.done) continue;
+            if (im.total == 0) { im.total = mp.total; im.parts.assign(mp.total, ""); im.have.assign(mp.total, 0); mp.name[15] = 0; im.name = mp.name; }
+            im.t = simTime;
+            if (mp.total != im.total || im.have[mp.idx]) continue;
+            im.parts[mp.idx].assign(mp.data, mp.len); im.have[mp.idx] = 1; im.got++;
+            if (im.got == im.total) {
+                std::string blob;
+                for (const std::string& part : im.parts) blob += part;
+                im.done = true; im.parts.clear();
+                editor::applyRemote(blob, im.name);
+                logMsg("Mehrspieler: Kartenstand von %s uebernommen (%d Bytes)", im.name.c_str(), (int)blob.size());
+            }
+            continue;
+        }
         if (h.type == 8) { // Tageszeit und Wetter vom Host
             if (!isHost && n == (int)sizeof(EnvPacket)) { EnvPacket ep; memcpy(&ep, buf, sizeof ep); lastFromHost = simTime; envir::setRemote(ep.hour, ep.weather, ep.speed); }
             continue;
@@ -177,6 +246,9 @@ void receive() {
                     peers.push_back(np);
                     pe = &peers.back();
                     logMsg("Mehrspieler: %s ist beigetreten (%s)", np.name, addrString(from).c_str());
+                    { std::string b = editor::currentBlob(); json jb = json::parse(b, nullptr, false);
+                      bool empty = jb.is_object() && jb.value("objects", json::array()).empty() && jb.value("roads", json::array()).empty();
+                      if (!empty) queueMap(b, false, &from); }
                     std::string msg = std::string(np.name) + " ist beigetreten";
                     say("Server", msg);
                     ChatPacket c{};
@@ -273,6 +345,7 @@ bool join(const std::string& address, int port) {
 }
 
 void stop() {
+    outMaps.clear(); inMaps.clear();
     if (sock != INVALID_SOCKET) {
         Packet p{};
         p.h = {MAGIC, 2, myId};
@@ -323,6 +396,9 @@ void update(float dt, const NetCar& mine) {
         if (isHost) sendAll(p, nullptr); else sendTo(p, hostAddr);
     }
     purge();
+    if (isHost ? !peers.empty() : (simTime - lastFromHost < 5)) { std::string b = editor::syncPoll(simTime); if (!b.empty()) queueMap(b, true, nullptr); }
+    pumpMaps();
+    for (auto it = inMaps.begin(); it != inMaps.end();) { if (simTime - it->second.t > 20) it = inMaps.erase(it); else ++it; }
     if (isHost && !peers.empty()) { // Tageszeit/Wetter (1 Hz)
         envTimer -= dt;
         if (envTimer <= 0) {

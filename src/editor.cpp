@@ -2,6 +2,7 @@
 // Strassen mit Kurven bauen, alles in maps/welt.json speichern. Positionen sind Geokoordinaten.
 #include "game.h"
 #include "net.h"
+#include "mapformat.h"
 #include "editor_mesh.h"
 #include <memory>
 #include <random>
@@ -17,7 +18,10 @@ namespace fs = std::filesystem;
 
 namespace {
 const double DPI = 3.14159265358979323846;
-const char* MAP_FILE = "maps/welt.json";
+// Test: WR_MAP=pfad laedt/speichert eine andere Kartendatei
+const char* MAP_FILE = std::getenv("WR_MAP") ? std::getenv("WR_MAP") : "maps/welt.json";
+// Git-Kartenformat (Ordner mit worldridr-map.json, gemeinsam mit World Studio); hat Vorrang vor welt.json, wenn vorhanden
+const char* MAP_DIR = std::getenv("WR_MAPDIR") ? std::getenv("WR_MAPDIR") : "maps/world";
 const char* SHAPE_NAMES[] = {"Block", "Zylinder", "Keil (Rampe)", "Kugel", "Modell", "Mesh"};
 
 struct Obj {
@@ -32,6 +36,8 @@ struct Obj {
     Vec3 pos;              // lokal, abgeleitet
     std::string name;
     uint32_t uid = 0;      // eindeutige Kennung (gemeinsames Bauen im Mehrspiel)
+    std::string gid;       // stabile Karten-ID fuer das Git-Kartenformat (worldridr-map)
+    json extra = json::object(); // unbekannte Felder aus World Studio (Gruppen, Gebaeude-Parameter, ...) bleiben beim Speichern erhalten
     EMesh mesh;            // shape 5: frei bearbeitbares Mesh (Eckpunkte und Flaechen mit eigenen Farben)
     std::shared_ptr<Mesh> emesh;
 };
@@ -39,6 +45,8 @@ struct RPoint { double lat, lon; float lift; float x, z; };
 struct Road {
     int type = 1;
     uint32_t uid = 0;
+    std::string gid;               // stabile Karten-ID (Git-Kartenformat)
+    json extra = json::object();   // unbekannte Felder aus World Studio bleiben erhalten
     std::vector<int> arrA, arrB;   // Richtungspfeile je Zufahrtsspur am Anfang / Ende: -1 automatisch, 0 keine, Bits 1 links, 2 geradeaus, 4 rechts
     std::vector<RPoint> pts;
     std::vector<Vec3> line;     // abgetastete Mittellinie mit Fahrbahnhoehe
@@ -261,6 +269,8 @@ void scanAssets() {
     }
     for (auto& e : fs::directory_iterator("assets/models", ec))
         if (e.path().extension() == ".obj") modelList.push_back(e.path().filename().string());
+    for (auto& e : fs::directory_iterator(fs::path(MAP_DIR) / "assets/models", ec)) // Modelle der Karte
+        if (e.path().extension() == ".obj" && std::find(modelList.begin(), modelList.end(), e.path().filename().string()) == modelList.end()) modelList.push_back(e.path().filename().string());
     std::sort(textureList.begin(), textureList.end());
     std::sort(modelList.begin(), modelList.end());
 }
@@ -280,6 +290,7 @@ Model& modelOf(const std::string& name) {
     if (it != models.end()) return it->second;
     Model& m = models[name];
     std::ifstream f("assets/models/" + name);
+    if (!f) f.open(std::string(MAP_DIR) + "/assets/models/" + name); // Modelle der Karte (World Studio)
     std::vector<Vec3> P, N;
     Batch b;
     std::string line;
@@ -328,6 +339,8 @@ json objToJson(const Obj& o) {
     json je = {{"shape", o.shape}, {"lat", o.lat}, {"lon", o.lon}, {"alt", o.alt}, {"rot", {o.rot.x, o.rot.y, o.rot.z}},
                {"scale", {o.scale.x, o.scale.y, o.scale.z}}, {"color", {o.color.r, o.color.g, o.color.b}}, {"texture", o.texture},
                {"model", o.model}, {"solid", o.solid}, {"tile", o.tile}, {"name", o.name}, {"uid", o.uid}};
+    if (!o.gid.empty()) je["id"] = o.gid;
+    for (auto it = o.extra.begin(); it != o.extra.end(); ++it) if (!je.contains(it.key())) je[it.key()] = it.value();
     if (o.shape == 5) { // frei bearbeitbares Mesh: Eckpunkte und Flaechen mit Farbe
         json mv = json::array(), mf = json::array();
         for (const Vec3& p : o.mesh.v) mv.push_back({p.x, p.y, p.z});
@@ -339,7 +352,10 @@ json objToJson(const Obj& o) {
 json roadToJson(const Road& r) {
     json pts = json::array();
     for (const RPoint& p : r.pts) pts.push_back({p.lat, p.lon, p.lift});
-    return {{"type", r.type}, {"points", pts}, {"uid", r.uid}, {"arrowsA", r.arrA}, {"arrowsB", r.arrB}};
+    json jr = {{"type", r.type}, {"points", pts}, {"uid", r.uid}, {"arrowsA", r.arrA}, {"arrowsB", r.arrB}};
+    if (!r.gid.empty()) jr["id"] = r.gid;
+    for (auto it = r.extra.begin(); it != r.extra.end(); ++it) if (!jr.contains(it.key())) jr[it.key()] = it.value();
+    return jr;
 }
 bool objFromJson(const json& e, Obj& o) {
     try {
@@ -350,6 +366,11 @@ bool objFromJson(const json& e, Obj& o) {
         o.texture = e.value("texture", ""); o.model = e.value("model", ""); o.solid = e.value("solid", true); o.tile = e.value("tile", 2.0f);
         o.name = e.value("name", ""); o.uid = e.value("uid", (uint32_t)0);
         if (o.uid == 0) o.uid = newUid();
+        if (e.contains("id") && e["id"].is_string()) o.gid = e["id"].get<std::string>();
+        for (auto it = e.begin(); it != e.end(); ++it) { // alles Unbekannte aufheben
+            const std::string& k = it.key();
+            if (k != "shape" && k != "lat" && k != "lon" && k != "alt" && k != "rot" && k != "scale" && k != "color" && k != "texture" && k != "model" && k != "solid" && k != "tile" && k != "name" && k != "uid" && k != "id" && k != "mesh") o.extra[k] = it.value();
+        }
         if (o.shape == 5 && e.contains("mesh")) {
             for (const json& p : e["mesh"]["v"]) o.mesh.v.push_back({p[0].get<float>(), p[1].get<float>(), p[2].get<float>()});
             for (const json& fj : e["mesh"]["f"]) {
@@ -371,6 +392,11 @@ bool roadFromJson(const json& e, Road& r) {
         r.type = clampv(e.value("type", 0), 0, NTYPES - 1);
         r.uid = e.value("uid", (uint32_t)0);
         if (r.uid == 0) r.uid = newUid();
+        if (e.contains("id") && e["id"].is_string()) r.gid = e["id"].get<std::string>();
+        for (auto it = e.begin(); it != e.end(); ++it) {
+            const std::string& k = it.key();
+            if (k != "type" && k != "points" && k != "uid" && k != "id" && k != "arrowsA" && k != "arrowsB") r.extra[k] = it.value();
+        }
         for (const json& p : e["points"]) r.pts.push_back(RPoint{p[0].get<double>(), p[1].get<double>(), p[2].get<float>(), 0, 0});
         if (e.contains("arrowsA")) r.arrA = e["arrowsA"].get<std::vector<int>>();
         if (e.contains("arrowsB")) r.arrB = e["arrowsB"].get<std::vector<int>>();
@@ -747,6 +773,8 @@ void buildRoads() {
             }
         }
     }
+    { int nj = 0; for (auto& A : nodes) if (A.size() >= 3) nj++;
+      static int lastLog = -1; if (nj != lastLog) { lastLog = nj; logMsg("Studio-Strassen: %d Strassen, %d Knoten, %d Kreuzungen, %d Markierungsdreiecke", NR, nodeCount, nj, (int)marks.size() / 3); } }
     rv.insert(rv.end(), marks.begin(), marks.end());
     world.setCustomRoads(rv, segs);
     solidMesh.create(solid.v.data(), (int)solid.v.size());
@@ -1237,7 +1265,11 @@ void init() {
     genTextures();
     scanAssets();
     std::vector<uint8_t> data;
-    if (readFile(MAP_FILE, data)) {
+    json mapDirJson;
+    if (mapformat::exists(MAP_DIR) && mapformat::load(MAP_DIR, mapDirJson)) {
+        deserialize(mapDirJson);
+        logMsg("Karte %s geladen: %d Objekte, %d Strassen", MAP_DIR, (int)objs.size(), (int)roads.size());
+    } else if (readFile(MAP_FILE, data)) {
         json j = json::parse(data.begin(), data.end(), nullptr, false);
         if (!j.is_discarded()) deserialize(j);
         logMsg("Karte geladen: %d Objekte, %d Strassen", (int)objs.size(), (int)roads.size());
@@ -1246,6 +1278,11 @@ void init() {
 }
 
 void save() {
+    if (mapformat::exists(MAP_DIR)) { // Git-Kartenformat: neue Objekte bekommen eine stabile ID, geschrieben werden nur geaenderte Kacheln
+        for (Obj& o : objs) if (o.gid.empty()) o.gid = mapformat::newId();
+        for (Road& r : roads) if (r.gid.empty()) r.gid = mapformat::newId();
+        if (mapformat::save(MAP_DIR, serialize())) { modified = false; say(std::string("Gespeichert: ") + MAP_DIR); return; }
+    }
     std::string s = serialize().dump(1);
     writeFile(MAP_FILE, std::vector<uint8_t>(s.begin(), s.end()));
     modified = false;
@@ -1253,7 +1290,11 @@ void save() {
 }
 
 bool active() { return on; }
+// Das Studio ist vorerst abgeschaltet (eigene Anwendung). Zum Wiedereinschalten: STUDIO_ENABLED auf true setzen oder Umgebungsvariable WR_STUDIO=1.
+static const bool STUDIO_ENABLED = false;
+bool enabled() { static const bool e = STUDIO_ENABLED || std::getenv("WR_STUDIO") != nullptr; return e; }
 void open(Vec3 at, float yaw) {
+    if (!enabled()) return;
     on = true;
     camP = at + Vec3{std::sin(yaw) * 10, 7, std::cos(yaw) * 10};
     camYaw = yaw; camPitch = -0.45f;
@@ -1271,6 +1312,39 @@ bool wantsTestDrive(Vec3& pos, float& yaw) {
     pos = rayGround(camP, rd, hit, true) && length(hit - camP) < 300 ? hit : camP;
     yaw = camYaw;
     return true;
+}
+
+// ---------- Gemeinsames Bauen ----------
+namespace { std::string lastSync; double lastSyncCheck = -10; bool syncInit = false; }
+std::string serverBlob;   // eigenstaendiger Server (ohne Fenster): merkt sich nur den letzten Kartenstand fuer neue Mitspieler
+std::string currentBlob() { if (cfg.server) return serverBlob; json j = serialize(); j.erase("palette"); return j.dump(); }
+std::string syncPoll(double now) {
+    if (cfg.server) return "";
+    if (now - lastSyncCheck < 0.5) return "";
+    lastSyncCheck = now;
+    if (drawing || mo.active || dragAxis >= 0 || dragPoint) return "";   // erst nach Abschluss eines Arbeitsschritts senden
+    std::string b = currentBlob();
+    if (!syncInit) { syncInit = true; lastSync = b; return ""; }
+    if (b == lastSync) return "";
+    lastSync = b;
+    return b;
+}
+void applyRemote(const std::string& blob, const std::string& who) {
+    if (cfg.server) { serverBlob = blob; return; }
+    json j = json::parse(blob, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return;
+    std::vector<Color> pal = customPal;
+    int keepSel = sel, keepRoad = selRoad, keepPt = selPt;
+    drawing = false; mo.active = false; dragAxis = -1; dragBody = dragPoint = false;
+    deserialize(j);
+    customPal = pal;
+    sel = keepSel < (int)objs.size() ? keepSel : -1;
+    selRoad = keepRoad < (int)roads.size() ? keepRoad : -1;
+    selPt = (selRoad >= 0 && keepPt < (int)roads[selRoad].pts.size()) ? keepPt : -1;
+    if (sel < 0) editMode = false;
+    lastSync = currentBlob(); syncInit = true;
+    modified = true;
+    say(who.empty() ? "Karte vom Mitspieler aktualisiert" : who + " hat gebaut");
 }
 
 void refresh(double now) {
@@ -1538,6 +1612,32 @@ void update(float dt, const Mat4& vp, float ww, float wh) {
                 for (size_t a = 0; a < roads.size(); a++)
                     for (size_t i = 0; i < roads[a].pts.size(); i++)
                         if (!(drawing && a + 1 == roads.size() && i + 1 == roads[a].pts.size()) && std::hypot(roads[a].pts[i].x - hit.x, roads[a].pts[i].z - hit.z) < 6.0f) { snapR = (int)a; snapP = (int)i; }
+                if (snapR < 0) { // mitten auf eine bestehende Strasse geklickt: dort einen Knoten einfuegen (Kreuzung/Einmuendung)
+                    float bestD = 1e9f; int br = -1, bk = -1;
+                    for (size_t a2 = 0; a2 < roads.size(); a2++) {
+                        if (drawing && a2 + 1 == roads.size()) continue;
+                        const Road& rr = roads[a2];
+                        if (!rr.built || rr.line.size() < 2 || rr.ptSample.size() != rr.pts.size()) continue;
+                        float reach = TYPES[rr.type].hw + 1.5f;
+                        for (size_t k = 1; k + 1 < rr.line.size(); k++) {
+                            float dd = std::hypot(rr.line[k].x - hit.x, rr.line[k].z - hit.z);
+                            if (dd < reach && dd < bestD) { bestD = dd; br = (int)a2; bk = (int)k; }
+                        }
+                    }
+                    if (br >= 0) {
+                        Road& rr = roads[br];
+                        int seg = 0;
+                        while (seg + 1 < (int)rr.ptSample.size() && rr.ptSample[seg + 1] <= bk) seg++;
+                        if (seg + 1 < (int)rr.pts.size() && rr.ptSample[seg] != bk) {
+                            pushUndo();
+                            RPoint ip{0, 0, rr.pts[seg].lift + (rr.pts[seg + 1].lift - rr.pts[seg].lift) * 0.5f, rr.line[bk].x, rr.line[bk].z};
+                            world.toLatLon(ip.x, ip.z, ip.lat, ip.lon);
+                            rr.pts.insert(rr.pts.begin() + seg + 1, ip);
+                            rr.ptSample.insert(rr.ptSample.begin() + seg + 1, bk);
+                            snapR = br; snapP = seg + 1;
+                        } else if (rr.ptSample[seg] == bk) { snapR = br; snapP = seg; }
+                    }
+                }
                 if (snapR >= 0) np = roads[snapR].pts[snapP];
                 else world.toLatLon(hit.x, hit.z, np.lat, np.lon);
                 pushUndo();
@@ -1897,6 +1997,26 @@ void buildUI() {
         if (ui.button(px + 96, 144, 76, 28, "+ 0,5 m", false, 14)) { pushUndo(); roads[selRoad].pts[selPt].lift += 0.5f; dirty = true; nextBuild = 0; }
         if (ui.button(px + 178, 144, 80, 28, "Typ >", false, 14)) { pushUndo(); roads[selRoad].type = (roads[selRoad].type + 1) % NTYPES; dirty = true; nextBuild = 0; }
         ui.label(px + 14, 194, 12, col::gray, "Ziehen = verschieben, Entf = Punkt l\xC3\xB6schen");
+        // Richtungspfeile je Zufahrtsspur, wenn der Punkt ein Strassenende ist (Anfang oder Ende einer Strasse an einer Kreuzung)
+        Road& rr = roads[selRoad];
+        bool atA = selPt == 0, atB = selPt == (int)rr.pts.size() - 1;
+        const RoadType& RT = TYPES[rr.type];
+        bool inbound = RT.oneway == 0 || (RT.oneway == 1 && atB) || (RT.oneway == -1 && atA);
+        if ((atA || atB) && inbound && (RT.flags & 1)) {
+            std::vector<int>& av = atA ? rr.arrA : rr.arrB;
+            int nl = RT.oneway ? RT.lanes : std::max(1, RT.lanes / 2);
+            if ((int)av.size() < nl) av.resize(nl, -1);
+            static const int cyc[8] = {-1, 1, 2, 4, 3, 6, 7, 0};
+            static const char* cname[8] = {"automatisch", "links", "geradeaus", "rechts", "links + geradeaus", "geradeaus + rechts", "alle Richtungen", "kein Pfeil"};
+            ui.panel(px, 216, 272, 44 + nl * 34.0f);
+            ui.label(px + 14, 240, 15, col::accent, "Richtungspfeile");
+            for (int ln = 0; ln < nl; ln++) {
+                int ci = 0;
+                for (int q = 0; q < 8; q++) if (cyc[q] == av[ln]) ci = q;
+                snprintf(buf, sizeof buf, "Spur %d (von links): %s", ln + 1, cname[ci]);
+                if (ui.button(px + 14, 252 + ln * 34.0f, 244, 28, buf, av[ln] >= 0, 13)) { pushUndo(); av[ln] = cyc[(ci + 1) % 8]; dirty = true; nextBuild = 0; }
+            }
+        }
     }
 
     // ---- Auswahlrahmen und Anzeige waehrend Verschieben/Drehen/Skalieren ----
@@ -1919,7 +2039,7 @@ void buildUI() {
     if (simTime < statusUntil) hint = statusMsg;
     else if (mo.active) hint = "G/R/S: Maus bewegen, X/Y/Z sperrt die Achse, N = Fl\xC3\xA4" "chennormale, Zahl tippen f\xC3\xBCr exakten Wert";
     else if (eo) hint = "Klick = w\xC3\xA4hlen  |  Shift = mehrere  |  Rahmen ziehen  |  G/R/S bewegen, drehen, skalieren  |  E extrudieren  |  X l\xC3\xB6schen  |  F Fl\xC3\xA4" "che  |  Tab fertig";
-    else if (tool == 3) hint = "Klick = Stra\xC3\x9F" "enpunkt setzen  |  Enter / Rechtsklick = fertig  |  Entf = letzten Punkt entfernen";
+    else if (tool == 3) hint = "Klick = Punkt setzen (rastet an Stra\xC3\x9F" "en ein: Kreuzung entsteht automatisch)  |  Enter / Rechtsklick = fertig  |  Strassenende anklicken = Pfeile je Spur";
     else hint = "Rechte Maustaste + WASD/QE fliegen  |  Mittlere Taste kreisen (+Shift schieben)  |  F auf Auswahl  |  Tab = Mesh bearbeiten  |  Strg+D  |  Strg+S";
     ui.label(12, H - 10, 13, simTime < statusUntil ? col::accent : col::gray, hint);
     snprintf(buf, sizeof buf, "%d Objekte, %d Stra\xC3\x9F" "en", (int)objs.size(), (int)roads.size());

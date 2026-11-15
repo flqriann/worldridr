@@ -1,6 +1,7 @@
 // Welt-Streaming: Satellitenbilder (Esri oder Google Map Tiles), Hoehen (Terrarium), Strassen/Gebaeude (OpenStreetMap)
 #include "world.h"
 #include "net.h"
+#include "mapformat.h"
 #include "stb_image.h"
 #include <nlohmann/json.hpp>
 #include <atomic>
@@ -80,6 +81,7 @@ struct Elev {
             if (px) stbi_image_free(px);
         }
         if (!ok) logMsg("Hoehendaten %d/%d nicht ladbar - verwende flaches Gelaende", tx, ty);
+        mapformat::applyTerrain(tx, ty, t->h.data()); // Gelaende aus der Karte (World Studio) hat Vorrang
         std::lock_guard<std::mutex> lk(mx);
         m[key] = t;
         return t;
@@ -2875,23 +2877,64 @@ void World::forBuildingsNear(float x, float z, float r, const std::function<void
 
 bool World::surface(float x, float z, float yRef, float& h) {
     if (!height(x, z, h)) return false;
-    // ueberschriebene Strassen (z. B. Unterfuehrung unter einer im Hoehenmodell enthaltenen Bruecke): hoechste Flaeche unter yRef
-    float bestP = -1e9f;
+    // Fahrflaechen mit eigener Hoehe (Bruecke, Rampe, Unterfuehrung, Tunnel): hoechste Flaeche unter yRef.
+    // "Nah" = innerhalb von 1,6 m unter und 0,6 m ueber yRef: diese Flaeche gilt immer, auch wenn das Gelaende (Hoehenmodell) daneben hoeher
+    // oder tiefer liegt. Sonst fuhr man in eine ansteigende Strasse hinein bzw. ueber eine absteigende (Einschnitt) hinweg.
+    float bestP = -1e9f, bestNear = -1e9f;
     for (auto& kv : d->chunks) {
         if (kv.second.patches.empty() || x < kv.second.x0 - 40 || x > kv.second.x1 + 40 || z < kv.second.z0 - 40 || z > kv.second.z1 + 40) continue;
         for (const RoadPatch& p : kv.second.patches) {
             if (x < p.x0 - p.hw - 1 || x > p.x1 + p.hw + 1 || z < p.z0 - p.hw - 1 || z > p.z1 + p.hw + 1) continue;
+            // Hoehe dieser Fahrflaeche an (x,z): gewichtetes Mittel der Hoehen an den Fusspunkten aller Abschnitte in Reichweite.
+            // Fruehere Fassung nahm den hoechsten Abschnitt: in Kurven ergab das eine Treppe (Abschnittslaenge x Steigung) und Spruenge.
+            float reach = p.hw + 0.6f, sw = 0, sy = 0;
             for (size_t i = 0; i + 1 < p.px.size(); i++) {
                 float vx = p.px[i + 1] - p.px[i], vz = p.pz[i + 1] - p.pz[i], l2 = vx * vx + vz * vz;
                 if (l2 < 1e-6f) continue;
                 float t = clampv(((x - p.px[i]) * vx + (z - p.pz[i]) * vz) / l2, 0.0f, 1.0f);
-                if (std::hypot(x - (p.px[i] + vx * t), z - (p.pz[i] + vz * t)) > p.hw + 0.6f) continue;
-                float y = p.py[i] + (p.py[i + 1] - p.py[i]) * t + 0.03f;
-                if (y <= yRef && y > bestP) bestP = y;
+                float dd = std::hypot(x - (p.px[i] + vx * t), z - (p.pz[i] + vz * t));
+                if (dd > reach) continue;
+                float wgt = std::max(1e-3f, 1.0f - dd / reach);
+                wgt = wgt * wgt * wgt;   // nahe Abschnitte zaehlen deutlich staerker
+                sw += wgt; sy += wgt * (p.py[i] + (p.py[i + 1] - p.py[i]) * t);
             }
+            if (sw <= 0) continue;
+            float y = sy / sw + 0.03f;
+            if (y <= yRef && y > bestP) bestP = y;
+            if (y <= yRef + 0.6f && y >= yRef - 1.6f && y > bestNear) bestNear = y;
         }
     }
-    if (bestP > -1e8f && (h > yRef || bestP > h)) h = bestP; // ueberschriebene Fahrbahn gilt auch, wenn das gemessene Gelaende darueber liegt
+    if (bestNear > -1e8f) h = bestNear;
+    else if (bestP > -1e8f && (h > yRef || bestP > h)) h = bestP; // ueberschriebene Fahrbahn gilt auch, wenn das gemessene Gelaende darueber liegt
+    else {
+        // Strassen auf dem Gelaende: die gezeichnete Fahrbahn liegt auf der Hoehe der Mittellinie (nie unter dem Gelaende der Mitte).
+        // Die Physik muss genau diese Flaeche verwenden, sonst sinken Raeder an der tiefer liegenden Strassenseite in den Asphalt ein.
+        // Gewichtetes Mittel ueber alle Abschnitte in Reichweite (Gewicht faellt zum Rand auf 0): stetig, keine Spruenge, wenn der naechste
+        // Punkt an einer Kurve zwischen Abschnitten wechselt (das war an steilen Strassen eine Treppe von ca. 0,35 m).
+        float sumW = 0, sumH = 0, maxW = 0;
+        for (auto& kv : d->chunks) {
+            const Chunk& c = kv.second;
+            if (x < c.x0 - 10 || x > c.x1 + 10 || z < c.z0 - 10 || z > c.z1 + 10) continue;
+            for (const RoadSeg& sg : c.segs) {
+                if (sg.klass > 6 || sg.ya > -1e8f) continue;   // Strassen mit eigener Hoehe sind oben abgedeckt
+                float reach = sg.hw + 0.15f;
+                if (x < std::min(sg.ax, sg.bx) - reach || x > std::max(sg.ax, sg.bx) + reach || z < std::min(sg.az, sg.bz) - reach || z > std::max(sg.az, sg.bz) + reach) continue;
+                float vx = sg.bx - sg.ax, vz = sg.bz - sg.az, l2 = vx * vx + vz * vz;
+                if (l2 < 1e-6f) continue;
+                float t = clampv(((x - sg.ax) * vx + (z - sg.az) * vz) / l2, 0.0f, 1.0f);
+                float qx = sg.ax + vx * t, qz = sg.az + vz * t, dd = std::hypot(x - qx, z - qz);
+                if (dd >= reach) continue;
+                float hc;
+                if (!height(qx, qz, hc)) continue;
+                float wgt = (reach - dd) / reach;
+                wgt *= wgt;
+                sumW += wgt; sumH += wgt * (hc + 0.03f); maxW = std::max(maxW, wgt);
+            }
+        }
+        float lift = sumW > 1e-4f ? sumH / sumW : -1e9f;
+        // blendet am Rand weich aus: ohne Strasse in Reichweite bleibt es beim Gelaende
+        if (lift > h && lift <= yRef + 0.6f) h += (lift - h) * std::min(1.0f, maxW * 4.0f);
+    }
     float hh;
     if (surfaceHook && surfaceHook(x, z, yRef, hh) && hh > h) h = hh;
     return true;
@@ -2912,7 +2955,7 @@ void World::setRoadHeight(int64_t id, int mode, float delta) {
 }
 Vec3 World::surfaceNormal(float x, float z, float yRef) {
     float a, b, c, e;
-    const float s = 0.5f;
+    const float s = 1.2f;   // weiter abtasten: die Hoehenmasche ist ca. 6 m, bei 0,5 m springt die Normale und das Auto ruckelt
     if (!surface(x - s, z, yRef, a) || !surface(x + s, z, yRef, b) || !surface(x, z - s, yRef, c) || !surface(x, z + s, yRef, e)) return {0, 1, 0};
     Vec3 n = normalize({a - b, 2 * s, c - e});
     return n.y < 0.5f ? Vec3{0, 1, 0} : n; // Kanten von Objekten nicht als Steilhang werten
