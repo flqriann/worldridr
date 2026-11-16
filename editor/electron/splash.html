@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; font-family: 'Segoe UI', system-ui, sans-serif; color: #e8ecf3; overflow: hidden; user-select: none; }
+  .card { position: absolute; inset: 0; border-radius: 16px; overflow: hidden; background: radial-gradient(120% 140% at 0% 0%, #2a4f9e 0%, #172238 45%, #0d1018 100%); box-shadow: 0 30px 80px rgba(0,0,0,.55); }
+  .glow { position: absolute; width: 520px; height: 520px; right: -160px; bottom: -220px; border-radius: 50%; background: radial-gradient(circle, rgba(79,149,255,.45), transparent 65%); filter: blur(20px); animation: drift 6s ease-in-out infinite alternate; }
+  @keyframes drift { to { transform: translate(-60px, -30px) scale(1.1); } }
+  .logo { position: absolute; left: 40px; top: 40px; width: 64px; height: 64px; animation: pop .7s cubic-bezier(.2,1.4,.4,1) both; }
+  @keyframes pop { from { transform: scale(.4) rotate(-20deg); opacity: 0; } }
+  h1 { position: absolute; left: 40px; top: 118px; margin: 0; font-size: 34px; font-weight: 650; letter-spacing: -.02em; }
+  h1 span { color: #7fb2ff; }
+  .sub { position: absolute; left: 41px; top: 166px; color: #9fb0cc; font-size: 13px; }
+  .bar { position: absolute; left: 40px; right: 40px; bottom: 46px; height: 4px; border-radius: 2px; background: rgba(255,255,255,.08); overflow: hidden; }
+  .bar i { position: absolute; top: 0; bottom: 0; width: 35%; border-radius: 2px; background: linear-gradient(90deg, #2f7cf6, #8ec1ff); animation: load 1.2s ease-in-out infinite; }
+  @keyframes load { from { left: -35%; } to { left: 100%; } }
+  .status { position: absolute; left: 40px; bottom: 18px; color: #8a96ab; font-size: 11px; }
+  .ver { position: absolute; right: 40px; bottom: 18px; color: #66728a; font-size: 11px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="glow"></div>
+    <svg class="logo" viewBox="0 0 16 16"><path d="M8 1 14.5 4.8v6.4L8 15 1.5 11.2V4.8z" fill="#2f7cf6"/><path d="M5.2 5h5.6v1.6H7v1.2h3.2v1.6H7V12H5.2z" fill="#fff"/></svg>
+    <h1>Forge <span id="product">Studio</span></h1>
+    <div class="sub" id="tagline">Build, script and play 3D games</div>
+    <div class="bar"><i></i></div>
+    <div class="status" id="status">Starting…</div>
+    <div class="ver" id="ver"></div>
+  </div>
+  <script>
+    const q = new URLSearchParams(location.search);
+    document.getElementById('product').textContent = q.get('product') || 'Studio';
+    document.getElementById('ver').textContent = q.get('version') ? 'v' + q.get('version') : '';
+    if (q.get('tagline')) document.getElementById('tagline').textContent = q.get('tagline');
+    window.setStatus = (s) => { document.getElementById('status').textContent = s; };
+  </script>
+</body>
+</html>

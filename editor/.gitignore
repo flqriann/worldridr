@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+release/
+.vite/
+*.tsbuildinfo
+
+# Rust build output (engine = WASM core, server = forge-server)
+engine/target/
+server/target/
+# note: the prebuilt src/engine/forge_core.wasm IS tracked (fallback without Rust)
+
+# Local server data (published games, DataStores, publish key)
+server-data/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code: keep shared config (launch.json), ignore personal settings
+.claude/settings.local.json
+
+# Environment
+.env
+.env.*

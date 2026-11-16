@@ -157,6 +157,7 @@ namespace envir {
 extern float hour;            // Ortszeit 0..24
 extern int weather;           // 0 Klar, 1 Wolkig, 2 Regen, 3 Nebel, 4 Gewitter, 5 Schnee
 extern int speedIdx;          // 0 Uhr steht, 1 Echtzeit, 2 x30, 3 x120
+extern bool realEnv;          // Tageszeit, Sonnenstand und Wetter vom Ort der Karte
 extern const char* weatherName[6];
 void update(float dt);
 void apply();                 // Shader-Parameter setzen (je Bild)

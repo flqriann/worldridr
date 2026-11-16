@@ -1,0 +1,60 @@
+# Builds Forge Studio, Forge Player and Forge Server for Windows and Linux.
+# Run it manually (Actions ▸ Build packages ▸ Run workflow) or push a tag "v*".
+# The packages are attached to the run as artifacts; for tags also to a GitHub release.
+name: Build packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            server
+            engine
+      - run: npm ci
+      - run: node scripts/dist.mjs studio player server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forge-${{ runner.os }}
+          path: |
+            release/studio/*.exe
+            release/studio/*.AppImage
+            release/studio/*.tar.gz
+            release/player/*.exe
+            release/player/*.AppImage
+            release/player/*.tar.gz
+            release/server/*.zip
+            release/server/*.tar.gz
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/studio/*.exe
+            release/studio/*.AppImage
+            release/studio/*.tar.gz
+            release/player/*.exe
+            release/player/*.AppImage
+            release/player/*.tar.gz
+            release/server/*.zip
+            release/server/*.tar.gz

@@ -207,6 +207,16 @@ Feste Objekte sind Hindernis und Untergrund: Rampen, Podeste und **Treppen** (Me
 - **Wasser:** Seen, Flüsse, Kanäle und Bäche kommen aus OpenStreetMap und werden mit Himmelsspiegelung gezeichnet.
 - **Straßenhöhe (Studio, Taste 5):** Straße anklicken und „Boden / Unterführung“ oder ±1 m wählen. Für Unterführungen, die das Höhenmodell
   als Brücke zeigt. Gespeichert in `maps/map_overrides.json`.
+- **Glatte Fahrbahnen:** Jede Straße hat ein eigenes Höhenprofil: das Höhenmodell (ca. 25 m Raster, mit Resten von Gebäuden und Bäumen) wird entlang
+  der Straße geglättet (lokale lineare Regression, σ 8–16 m), gemeinsame Knoten bekommen dieselbe Höhe. Die Fahrbahn ist quer eben; das Gelände wird
+  daneben angepasst (Sohle bis 4,5 m neben dem Rand, dann Böschung), in der Grafik und in der Physik gleich. Auto, KI-Verkehr und Fußgänger verwenden
+  dieselbe Fläche; überlappende Fahrbahnen (Abzweige, Rampen) werden nach Nähe gemischt statt hart umgeschaltet. Testhilfe: `WR_ROADCHECK=1` schreibt nach
+  20 s die Unebenheit aller Straßen im Umkreis von 600 m ins Log (`=2` zusätzlich jede Stelle mit Knick oder über 16 % Steigung).
+- **Brückenköpfe und Unterführungen:** Kurze Tunnel (unter 150 m) gelten als überdeckte Unterführung: die Fahrbahn wird abgesenkt statt die Straße darüber
+  anzuheben, unter kreuzenden Straßen liegt eine Betonplatte. Ebenerdige Straßen unter einem Brückenende sinken bis 4,5 m ab. Straßenbahngleise auf
+  Brücken erzeugen keine eigene Bahnbrücke mehr. Der Aufschlag über der Grundhöhe ist auf 10 m begrenzt (vorher schaukelten sich Stockwerke bis 90 m auf).
+- **Verfolgerkamera** rückt näher ans Auto, wenn ein Gebäude oder Gelände im Weg ist. **Absturzprotokoll:** bei einem Absturz stehen Funktion, Datei
+  und Zeile am Ende von `worldridr.log`.
 
 ## Brücken, Tunnel, Rampen und Spuren
 
@@ -233,10 +243,14 @@ Feste Objekte sind Hindernis und Untergrund: Rampen, Podeste und **Treppen** (Me
 
 ## Bäume und Wälder
 
-Straßenbäume und Wälder nutzen die Modelle `assets/trees/tree.glb` (Laubbaum) und `assets/trees/pine.glb` (Kiefer) sowie vier
-prozedurale Arten (Birke, Fichte, Pappel, Buche mit unregelmäßigen Kronen). Wälder sind Mischwald, Straßenbäume überwiegend Laubbäume; eigene `.glb`
-mit Materialfarben lassen sich einfach austauschen. Wald entsteht dort, wo das Satellitenbild dunkel und grün ist (nicht auf
-Straßen und Gebäuden). Nah wird das volle Modell gezeichnet, weiter weg eine einfache Version (Instanced Rendering).
+- Sechs prozedurale Arten (Linde, Buche, Birke, Fichte, Kiefer, Pappel) mit Stamm, Ästen und Kronen aus vielen **Blattkarten**: eine beim Start erzeugte
+  Textur mit einzelnen Blättern bzw. Nadelzweigen (Alpha-Test), weich beleuchtet mit durchscheinendem Gegenlicht. Bis 220 m volles Modell, dahinter
+  wenige große Karten (Instanced Rendering). Die alten kantigen `assets/trees/*.glb` werden nicht mehr verwendet.
+- **Wald nur auf Waldflächen:** Landnutzung aus OpenStreetMap (`landuse=forest`, `natural=wood`, Acker, Wiese, Obst/Wein, bebaut) wird je Kachel auf ein
+  ca. 5-m-Raster gezeichnet (Cache `cache/osm/land_14_*.json`). Auf Äckern, Wiesen, Parks und bebauten Flächen stehen keine Waldbäume mehr; nur wo
+  OSM nichts kennt, entscheidet wie früher das dunkelgrüne Satellitenbild.
+- **Feldfarben:** Blasse bzw. verschneite Luftbilder (Winteraufnahmen) werden auf Äckern (Farbe je Parzelle), Wiesen und im Wald in passende Farben
+  umgefärbt; die Struktur des Bildes bleibt erhalten.
 
 ## Schilder, Wechselverkehrszeichen, Abfahrten
 
@@ -251,6 +265,11 @@ Straßen und Gebäuden). Nah wird das volle Modell gezeichnet, weiter weg eine e
   (Uhr steht, Echtzeit, 30-fach, 120-fach). Sonne, Mond, Sterne, Himmelsfarben, Dämmerung, Nebel, Regen-/Schneepartikel und beleuchtete Fenster folgen daraus.
 - Bei Dunkelheit schalten Licht und Scheinwerferkegel automatisch ein (Taste für Licht wie gewohnt). Nasse Straße und Schnee senken die Haftung (bis ca. 50 %).
 - Mehrspieler: Der Host bestimmt Tageszeit und Wetter für alle.
+- **Echte Zeit & Wetter am Ort** (Einstellungen): Uhrzeit, Sonnenstand (Höhe und Richtung nach Datum und Ort) und das aktuelle Wetter am Kartenort
+  (open-meteo.com, alle 15 min; gesendet werden nur die Koordinaten der Karte). Tageszeit, Wetter und Zeitablauf sind dann fest.
+- **Nacht:** dunkleres Umgebungslicht, **Straßenlaternen** nur innerorts (Straßen mit Gehsteig oder Tempo 50) mit Dämmerungsschalter: die 24 nächsten
+  beleuchten Straße, Gelände, Gebäude, Bäume und Autos (warmes Licht, auf nasser Straße stärker), alle bis 450 m zeigen einen Lichthof.
+- Testhilfen: `WR_HOUR=22.5` (feste Uhrzeit), `WR_REALENV=1` (echte Zeit und Wetter).
 
 ## Verkehr und Fußgänger im Mehrspiel
 
@@ -286,7 +305,7 @@ sieht keinen gemeinsamen Verkehr, sondern fährt wie im Einzelspiel mit lokal si
   Nachbarn. Wo die Spurzahl wirklich wechselt, wird der breitere Abschnitt über bis zu 1,5-fache Keillänge (bis 85 % seiner Länge) schmaler; dabei sinkt die
   **Spurzahl im Shader stetig mit der Breite**, die Spurbreite bleibt gleich und die äußerste Spur läuft aus, statt dass Linien springen.
 - **Linux (experimentell):** `cmake -S . -B build -G Ninja && cmake --build build` mit SDL3-Abhängigkeiten, OpenGL und libcurl; ohne VR.
-  Die GitHub-CI baut es mit (`continue-on-error`) und hängt das Paket ans Release.
+  Die GitHub-CI baut nur noch Windows; Linux muss man selbst bauen.
 
 ## Mehrspieler (Details)
 

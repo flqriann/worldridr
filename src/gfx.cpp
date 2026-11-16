@@ -54,6 +54,7 @@ static const char* FS = R"(#version 330 core
 in vec3 vW; in vec3 vN; in vec2 vUV; in vec4 vC;
 uniform int uQ; uniform int uMode; uniform int uFlags; uniform sampler2D uTex; uniform vec3 uCam; uniform vec3 uSun; uniform mat4 uInvVP; uniform vec3 uTint; uniform float uTile;
 uniform vec4 uEnv; uniform float uSnow; uniform vec3 uHP; uniform vec3 uHD; uniform float uHOn;
+uniform vec4 uL[24]; uniform int uNL;
 out vec4 o;
 float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453); }
 float vnoise(vec2 p){
@@ -90,7 +91,19 @@ float headLight(vec3 w, vec3 n){
   float ndl=max(dot(n,-dir),0.0)*0.6+0.4;
   return cone*fall*ndl*2.4*uHOn;
 }
-float envLight(){ return mix(0.17,1.0,uEnv.x)*(1.0-0.20*uEnv.y); }
+// Strassenlaternen (nur nachts gesetzt): warmes Licht, nach unten gerichtet, Reichweite ca. 22 m
+vec3 lampL(vec3 w, vec3 n){
+  vec3 s=vec3(0.0);
+  for(int i=0;i<uNL;i++){
+    vec3 d=uL[i].xyz-w; float dd=length(d); if(dd>24.0) continue;
+    vec3 dir=d/max(dd,0.01);
+    float cone=0.35+0.65*smoothstep(0.15,0.75,dir.y);
+    float a=1.0/(1.0+dd*dd*0.030)*(1.0-smoothstep(15.0,24.0,dd));
+    s+=vec3(1.0,0.78,0.52)*a*cone*(0.30+0.70*max(dot(n,dir),0.0))*uL[i].w;
+  }
+  return s*1.6;
+}
+float envLight(){ return mix(0.10,1.0,uEnv.x)*(1.0-0.20*uEnv.y); }
 vec3 fog(vec3 c){
   vec3 v=vW-uCam; float d=length(v); float f=1.0-exp(-d*0.00026*uEnv.z); f=max(f, smoothstep(4000.0,12000.0,d));
   vec3 dir=v/max(d,0.001);
@@ -103,7 +116,8 @@ void main(){
   if(uMode==8){ o=texture(uTex,vUV)*vec4(uTint,1.0); return; }
   vec3 nn=normalize(vN);
   float hl=headLight(vW,nn);
-  float l=mix(0.15,0.45,uEnv.x)*(1.0-0.18*uEnv.y)+0.13*nn.y*uEnv.x+0.52*uEnv.x*(1.0-0.65*uEnv.y)*max(dot(nn,uSun),0.0)+hl;
+  vec3 LL=uNL>0 ? lampL(vW,nn) : vec3(0.0);
+  float l=mix(0.09,0.45,uEnv.x)*(1.0-0.18*uEnv.y)+0.13*nn.y*uEnv.x+0.52*uEnv.x*(1.0-0.65*uEnv.y)*max(dot(nn,uSun),0.0)+hl;
   if(uMode==7 || uMode==9){ // Editor-Objekte: Textur als Wuerfelprojektion in Weltkoordinaten (9: mal Flaechenfarbe)
     vec3 an=abs(nn);
     vec2 uv=(an.y>an.x && an.y>an.z) ? vW.xz : (an.x>an.z ? vW.zy : vW.xy);
@@ -119,8 +133,16 @@ void main(){
     // Hangschummerung aus dem Hoehenmodell: Sonnenseiten heller, Schattenhaenge dunkler (Gelaenderelief)
     c*=mix(1.0, (0.58+0.62*max(dot(nn,uSun),0.0))/1.03, 0.9);
     c=mix(c, vec3(0.86,0.88,0.92)*(0.55+0.45*nn.y), uSnow*0.62);
-    c*=envLight()*mix(1.0,0.82,uEnv.w)+hl*0.9;
+    c=c*(envLight()*mix(1.0,0.82,uEnv.w)+hl*0.9)+c*LL;
     o=vec4(fog(c),1.0); return;
+  }
+  if(uMode==10){ // Baumkronen: Blattkarten (Alpha-Test), Licht von der Sonne plus durchscheinendes Gegenlicht
+    vec4 tx=texture(uTex,vUV); if(tx.a<0.35) discard;
+    vec3 c=vC.rgb*tx.rgb*1.55;
+    float nd=dot(nn,uSun);
+    float lit=mix(0.13,0.40,uEnv.x)*(1.0-0.18*uEnv.y)+0.58*uEnv.x*(1.0-0.65*uEnv.y)*(0.30+0.70*max(nd,0.0))+0.16*uEnv.x*(1.0-uEnv.y)*max(-nd,0.0)+hl;
+    c=mix(c, vec3(0.86,0.88,0.92)*(0.5+0.5*nn.y), uSnow*0.45*max(nn.y,0.0));
+    o=vec4(fog(c*lit+c*LL),1.0); return;
   }
   if(uMode==2){
     float lat=vUV.x, along=vUV.y; float hw=vC.a*25.5;
@@ -185,7 +207,7 @@ void main(){
       c*=1.0-0.30*uEnv.w;
       c=mix(c, vec3(0.84,0.86,0.90), uSnow*0.55*(1.0-0.7*line));
     }
-    c*=envLight()+hl*0.95;
+    c=c*(envLight()+hl*0.95)+c*LL*(1.0+1.2*uEnv.w);
     if(a<0.02) discard;
     o=vec4(fog(c),a); return;
   }
@@ -203,10 +225,10 @@ void main(){
       c=mix(c, glassC, win);
       em=vec3(1.0,0.82,0.52)*win*step(0.62,id)*(1.0-uEnv.x)*0.9;
     }
-    o=vec4(fog(c*l+em),1.0); return;
+    o=vec4(fog(c*l+c*LL+em),1.0); return;
   }
   vec3 c=vC.rgb*uTint;
-  if((uFlags&1)!=0) c*=l;
+  if((uFlags&1)!=0) c=c*l+c*LL;
   if((uFlags&4)!=0 && dot(nn,normalize(vW-uCam))>0.28){ c=vec3(0.13,0.13,0.14)*(vC.a<0.99?0.0:1.0); if(vC.a<0.99){ o=vec4(0.0); return; } }
   else if((uFlags&4)!=0){ // Lack/Glas: Himmelsspiegelung + Glanzlicht
     vec3 v=normalize(vW-uCam); vec3 r=reflect(v,nn);
@@ -220,7 +242,7 @@ void main(){
 
 static struct {
     GLuint prog = 0, dynVao = 0, dynVbo = 0;
-    GLint uMVP, uMode, uFlags, uTex, uCam, uSun, uInvVP, uBias, uTint, uModel, uTile, uQ, uInst, uEnv, uSnow, uHP, uHD, uHOn, uSink;
+    GLint uMVP, uMode, uFlags, uTex, uCam, uSun, uInvVP, uBias, uTint, uModel, uTile, uQ, uInst, uEnv, uSnow, uHP, uHD, uHOn, uSink, uL, uNL;
     float maxAniso = 1;
 } G;
 
@@ -260,6 +282,7 @@ bool gfxInit() {
     G.uCam = glGetUniformLocation(G.prog, "uCam"); G.uSun = glGetUniformLocation(G.prog, "uSun");
     G.uInvVP = glGetUniformLocation(G.prog, "uInvVP"); G.uBias = glGetUniformLocation(G.prog, "uBias");
     G.uTint = glGetUniformLocation(G.prog, "uTint"); G.uQ = glGetUniformLocation(G.prog, "uQ");
+    G.uL = glGetUniformLocation(G.prog, "uL"); G.uNL = glGetUniformLocation(G.prog, "uNL");
     G.uEnv = glGetUniformLocation(G.prog, "uEnv"); G.uSnow = glGetUniformLocation(G.prog, "uSnow");
     G.uSink = glGetUniformLocation(G.prog, "uSink"); glUniform4f(G.uSink, 0, 0, 0, 0);
     G.uHP = glGetUniformLocation(G.prog, "uHP"); G.uHD = glGetUniformLocation(G.prog, "uHD"); G.uHOn = glGetUniformLocation(G.prog, "uHOn");
@@ -271,6 +294,7 @@ bool gfxInit() {
     Vec3 sun = normalize({0.45f, 0.75f, 0.35f});
     glUniform3f(G.uSun, sun.x, sun.y, sun.z);
     glUniform3f(G.uTint, 1, 1, 1);
+    glUniform1i(G.uNL, 0);
     glUniform4f(G.uEnv, 1, 0, 1, 0); glUniform1f(G.uSnow, 0); glUniform1f(G.uHOn, 0);
     glGenVertexArrays(1, &G.dynVao); glBindVertexArray(G.dynVao);
     glGenBuffers(1, &G.dynVbo); glBindBuffer(GL_ARRAY_BUFFER, G.dynVbo);
@@ -512,4 +536,11 @@ void Target::create(int w_, int h_) {
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void gfxLamps(const float* xyzw, int n) {
+    glUseProgram(G.prog);
+    n = clampv(n, 0, 24);
+    if (n > 0) glUniform4fv(G.uL, n, xyzw);
+    glUniform1i(G.uNL, n);
 }

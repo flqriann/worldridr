@@ -82,6 +82,9 @@ public:
     void forPoisNear(float x, float z, float r, const std::function<void(const Poi&)>& fn) const;
     void forTreesNear(float x, float z, float r, const std::function<void(const TreePos&)>& fn) const;
     void forSignsNear(float x, float z, float r, const std::function<void(const SignDef&)>& fn) const;
+    void forLampsNear(float x, float z, float r, const std::function<void(const Vec3&)>& fn) const;   // Leuchtenkoepfe der Strassenlaternen
+    int landAt(float x, float z) const;     // Landnutzung (OSM): -1 noch nicht geladen, 0 unbekannt, 1 Wald, 2 Acker, 3 Wiese/Park, 4 Obst/Wein, 5 bebaut
+    int landVersion() const;                // zaehlt hoch, wenn neue Landnutzung geladen wurde
     int forestAt(float x, float z) const;   // 1 dunkle Waldflaeche im Satellitenbild, 0 sonst, -1 Bild noch nicht geladen
     bool osmReady(float x, float z) const;  // Strassen/Gebaeude der Kachel sind geladen
     std::vector<MapConflict> takeConflicts();              // neu erkannte Unklarheiten abholen

@@ -140,9 +140,9 @@ static void applyVehicle() {
 static void saveSettings() {
     FILE* f = fopen("settings.cfg", "w");
     if (!f) return;
-    fprintf(f, "quality=%d\nscale=%.2f\nmirrors=%d\ntraffic=%d\npolice=%d\nfaults=%d\nhud=%d\nminimap=%d\nautomatic=%d\ncamera=%d\ncar=%s\nmsaa=%d\nbld=%.0f\nroad=%.0f\npeds=%d\nmapq=%d\nhour=%.2f\nweather=%d\ntimespeed=%d\n",
+    fprintf(f, "quality=%d\nscale=%.2f\nmirrors=%d\ntraffic=%d\npolice=%d\nfaults=%d\nhud=%d\nminimap=%d\nautomatic=%d\ncamera=%d\ncar=%s\nmsaa=%d\nbld=%.0f\nroad=%.0f\npeds=%d\nmapq=%d\nhour=%.2f\nweather=%d\ntimespeed=%d\nrealenv=%d\n",
             cfg.quality, cfg.renderScale, (int)cfg.mirrors, cfg.traffic, (int)cfg.police, (int)cfg.faultPoints, cfg.hudMode, (int)cfg.minimap, (int)cfg.automatic, camMode,
-            carModelSel >= 0 ? carModelName(carModelSel).c_str() : "builtin", (int)cfg.msaa, cfg.bldDist, cfg.roadDist, cfg.peds, (int)cfg.mapQuestions, envir::hour, envir::weather, envir::speedIdx);
+            carModelSel >= 0 ? carModelName(carModelSel).c_str() : "builtin", (int)cfg.msaa, cfg.bldDist, cfg.roadDist, cfg.peds, (int)cfg.mapQuestions, envir::hour, envir::weather, envir::speedIdx, (int)envir::realEnv);
     if (carColorSet) fprintf(f, "carcolor=%d,%d,%d\n", carColor[0], carColor[1], carColor[2]);
     // Der Tankstand wird bewusst nicht gespeichert: jede Fahrt beginnt mit vollem Tank (sonst kommt man mit leerem Tank nicht mehr los).
     fprintf(f, "veh=%d\nmoney=%.2f\ndiesel=%d\n", vehKind, econ::money, (int)cfg.diesel);
@@ -186,6 +186,7 @@ static bool loadSettings() {
         else if (k == "hour") envir::hour = clampv((float)n, 0.0f, 24.0f);
         else if (k == "weather") envir::weather = clampv((int)n, 0, 5);
         else if (k == "timespeed") envir::speedIdx = clampv((int)n, 0, 3);
+        else if (k == "realenv") envir::realEnv = n != 0;
         else keys::load(k, v);
     }
     fclose(f);
@@ -403,6 +404,17 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
     envir::apply();
     { Vec3 hf = car.forward(); hf.y = 0; hf = normalize(hf);
       gfxHead(car.pos + hf * 2.0f + Vec3{0, 0.35f, 0}, normalize(hf + Vec3{0, -0.07f, 0}), lightsOn() ? 1.0f : 0.0f); }
+    { // Strassenlaternen: die 24 naechsten leuchten im Shader (nur bei Dunkelheit; Daemmerungsschalter)
+        float on = clampv((envir::night() - 0.35f) / 0.3f, 0.0f, 1.0f);
+        static std::vector<std::pair<float, Vec3>> nearL;
+        nearL.clear();
+        if (on > 0) world.forLampsNear(cam.x, cam.z, 110.0f, [&](const Vec3& p) { nearL.push_back({(p.x - cam.x) * (p.x - cam.x) + (p.z - cam.z) * (p.z - cam.z), p}); });
+        int n = std::min<int>(24, (int)nearL.size());
+        std::partial_sort(nearL.begin(), nearL.begin() + n, nearL.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        float L[96];
+        for (int i = 0; i < n; i++) { L[i * 4] = nearL[i].second.x; L[i * 4 + 1] = nearL[i].second.y; L[i * 4 + 2] = nearL[i].second.z; L[i * 4 + 3] = on; }
+        gfxLamps(L, n);
+    }
     { // Himmel: Blickrichtung je Pixel direkt aus Projektion und Drehung (keine Matrix-Inverse, kein NaN, keine Kameraposition)
         const float* V = view.m; const float* P = proj.m;
         float ax = 1.0f / P[0], ay = 1.0f / P[5], ox = P[8] / P[0], oy = P[9] / P[5];
@@ -439,6 +451,14 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
     gfxBias(2e-5f);
     gfxMode(0, FLAG_LIT | FLAG_FOG | FLAG_GLOSS);
     world.drawWater(vp, cam, mirrorPass ? 1200.0f : 3500.0f);
+    glDisable(GL_BLEND);
+    gfxBias(0);
+    gfxMode(3);
+    // Bauwerke VOR den Strassen: Strassen schreiben keine Tiefe. Kamen Bruecken-/Unterfuehrungsplatten, Pfeiler und Boeschungen danach,
+    // malten sie ueber die Fahrbahn, auch wenn sie knapp darunter lagen (Loch in der Fahrbahn am Linzer Brueckenkopf).
+    world.drawBuildings(vp, cam, mirrorPass ? 250.0f : cfg.bldDist);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
     gfxBias(3e-5f);
     gfxMode(2);
@@ -453,7 +473,6 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
     glDisable(GL_BLEND);
     gfxBias(0);
     gfxMode(3);
-    world.drawBuildings(vp, cam, mirrorPass ? 250.0f : cfg.bldDist);
     { // Fahrbahnen auf Bruecken: nach der Brueckenplatte, mit Tiefenwerten
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -483,6 +502,38 @@ static void drawScene(const Mat4& view, const Mat4& proj, Vec3 cam, bool mirrorP
         v.driver = c.kind == 0; v.headYaw = c.hyS; v.headPitch = c.hpS;
         { uint32_t h = c.id * 2654435761u; v.occShirt = Color{(uint8_t)(60 + (h >> 4 & 0x7F)), (uint8_t)(70 + (h >> 11 & 0x7F)), (uint8_t)(90 + (h >> 18 & 0x7F)), 255}; }
         carDraw(v, vp, false, nullptr);
+    }
+    { // Leuchten der Laternen (weicher Lichthof, additiv), sichtbar bis 450 m
+        float on = clampv((envir::night() - 0.35f) / 0.3f, 0.0f, 1.0f);
+        if (on > 0) {
+            static Batch glow;
+            glow.clear();
+            Vec3 rt = normalize(Vec3{view.m[0], view.m[4], view.m[8]}), up = normalize(Vec3{view.m[1], view.m[5], view.m[9]});
+            world.forLampsNear(cam.x, cam.z, 450.0f, [&](const Vec3& p) {
+                float d = length(p - cam);
+                if (d > 450.0f) return;
+                for (int layer = 0; layer < 2; layer++) {
+                    float rad = layer == 0 ? 0.32f + d * 0.002f : 1.6f + d * 0.006f;
+                    uint8_t a = (uint8_t)(on * (layer == 0 ? 255 : 90));
+                    Color cc{255, 222, 160, a}, ce{255, 190, 120, 0};
+                    Vec3 cp = p + Vec3{0, -0.05f, 0};
+                    for (int i = 0; i < 10; i++) {
+                        float a0 = i * 6.2832f / 10, a1 = (i + 1) * 6.2832f / 10;
+                        Vec3 q0 = cp + (rt * std::cos(a0) + up * std::sin(a0)) * rad, q1 = cp + (rt * std::cos(a1) + up * std::sin(a1)) * rad;
+                        glow.vert(cp, {0, 1, 0}, 0, 0, cc); glow.vert(q0, {0, 1, 0}, 0, 0, ce); glow.vert(q1, {0, 1, 0}, 0, 0, ce);
+                    }
+                }
+            });
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glDepthMask(GL_FALSE);
+            gfxModel(identity());
+            gfxMode(0, 0);
+            glow.draw();
+            glDepthMask(GL_TRUE);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glDisable(GL_BLEND);
+        }
     }
     traffic::draw(vp, cam, mirrorPass ? 160.0f : std::min(700.0f, cfg.bldDist));
     ped::draw(vp, cam, mirrorPass ? 90.0f : std::min(260.0f, cfg.bldDist * 0.5f));
@@ -1041,14 +1092,17 @@ static void buildMenu() {
             char b[64];
             int hh = (int)envir::hour, mm = (int)((envir::hour - hh) * 60);
             snprintf(b, sizeof b, "Tageszeit: %02d:%02d%s%s", hh, mm, cur > 0 ? "  " : "", cur > 0 ? pn[cur] : "");
-            if (left(b)) {
+            if (envir::realEnv) snprintf(b, sizeof b, "Tageszeit: %02d:%02d (echt am Ort)", hh, mm);
+            if (left(b) && !envir::realEnv) {
                 int nx = cur < 0 ? 1 : cur + 1;
                 envir::hour = nx >= 6 ? envir::systemHour() : presets[nx];
                 changed = true;
             }
         }
         next();
-        if (left(std::string("Wetter: ") + envir::weatherName[envir::weather])) { envir::weather = (envir::weather + 1) % 6; changed = true; }
+        if (left(std::string("Wetter: ") + envir::weatherName[envir::weather] + (envir::realEnv ? " (echt am Ort)" : "")) && !envir::realEnv) { envir::weather = (envir::weather + 1) % 6; changed = true; }
+        next();
+        if (left(envir::realEnv ? "Echte Zeit & Wetter am Ort: an" : "Echte Zeit & Wetter am Ort: aus")) { envir::realEnv = !envir::realEnv; changed = true; }
         next();
         float leftEnd = by;
         if (right(cfg.police ? "Polizei: an" : "Polizei: aus", ry)) { cfg.police = !cfg.police; changed = true; }
@@ -1122,7 +1176,41 @@ static void saveScreenshot(const std::string& path, int w, int h) {
     logMsg("Screenshot: %s", path.c_str());
 }
 
+#ifdef _WIN32
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
+// Absturz: Funktion, Datei und Zeile (aus worldridr.pdb) ans Log anhaengen, damit Fehlermeldungen nachvollziehbar sind
+static LONG WINAPI crashLog(EXCEPTION_POINTERS* ep) {
+    FILE* f = fopen("worldridr.log", "a");
+    if (!f) return EXCEPTION_CONTINUE_SEARCH;
+    fprintf(f, "ABSTURZ: Ausnahme 0x%08lX bei Adresse %p\n", ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+    HANDLE proc = GetCurrentProcess();
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+    if (SymInitialize(proc, nullptr, TRUE)) {
+        CONTEXT ctx = *ep->ContextRecord;
+        STACKFRAME64 sf{};
+        sf.AddrPC.Offset = ctx.Rip; sf.AddrPC.Mode = AddrModeFlat;
+        sf.AddrFrame.Offset = ctx.Rbp; sf.AddrFrame.Mode = AddrModeFlat;
+        sf.AddrStack.Offset = ctx.Rsp; sf.AddrStack.Mode = AddrModeFlat;
+        for (int i = 0; i < 16 && StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, GetCurrentThread(), &sf, &ctx, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr); i++) {
+            char buf[sizeof(SYMBOL_INFO) + 256] = {};
+            SYMBOL_INFO* si = (SYMBOL_INFO*)buf;
+            si->SizeOfStruct = sizeof(SYMBOL_INFO); si->MaxNameLen = 255;
+            DWORD64 d64 = 0; DWORD d32 = 0;
+            IMAGEHLP_LINE64 ln{}; ln.SizeOfStruct = sizeof ln;
+            bool hs = SymFromAddr(proc, sf.AddrPC.Offset, &d64, si), hl = SymGetLineFromAddr64(proc, sf.AddrPC.Offset, &d32, &ln);
+            fprintf(f, "  %s  %s:%lu\n", hs ? si->Name : "?", hl ? ln.FileName : "?", hl ? ln.LineNumber : 0);
+        }
+    }
+    fclose(f);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(crashLog);
+#endif
     if (!std::filesystem::exists("scripts/main.lua")) { // Projektordner finden (scripts/ und config.lua)
         std::filesystem::path p = SDL_GetBasePath() ? SDL_GetBasePath() : ".";
         for (int i = 0; i < 4; i++) {
@@ -1132,6 +1220,8 @@ int main(int argc, char** argv) {
     }
     loadConfig();
     bool haveSettings = loadSettings();
+    if (const char* th = std::getenv("WR_HOUR")) { envir::hour = (float)atof(th); envir::speedIdx = 0; }   // Test: feste Uhrzeit
+    if (const char* re = std::getenv("WR_REALENV")) envir::realEnv = atoi(re) != 0;                    // Test: echte Zeit/Wetter
     double shotAt = -1;
     std::string shotPath, startLesson, joinAddr;
     bool startEditor = false, startHost = false, showMenu = true, startMap = false, testTp = false;
@@ -1581,6 +1671,38 @@ int main(int argc, char** argv) {
             if (poiTest == 2 && simTime - spawnTime > 9) { econ::keyJ(); poiTest = 3; }
             if (policeTest && simTime - spawnTime > 8) { traffic::offence(2); traffic::offence(2); traffic::offence(0); policeTest = false; }
             script.update(dt);
+            if (std::getenv("WR_ROADCHECK") && simTime - spawnTime > 20) { // Test: Unebenheit aller Strassen im Umkreis (Knick = Aenderung der Steigung je Meter) ins Log
+                static bool rcDone = false;
+                if (!rcDone) {
+                    rcDone = true;
+                    std::vector<RoadSeg> segs; world.collectSegs(segs);
+                    int n = 0, bump10 = 0, bump25 = 0, steep = 0; float worst = 0, worstX = 0, worstZ = 0, sumAbs = 0;
+                    for (const RoadSeg& s : segs) {
+                        if (s.klass > 6) continue;
+                        float mx = (s.ax + s.bx) * 0.5f, mz = (s.az + s.bz) * 0.5f;
+                        if (std::hypot(mx - car.pos.x, mz - car.pos.z) > 600) continue;
+                        float L = std::hypot(s.bx - s.ax, s.bz - s.az);
+                        if (L < 3) continue;
+                        float h0 = 0, h1 = 0, h2 = 0; bool ok = true;
+                        float yr = s.ya > -1e8f ? s.ya + 0.5f : 1e9f;
+                        for (float dd = 0; dd + 2 <= L && ok; dd += 1.0f) {
+                            auto P = [&](float q, float& h) { float t = q / L; return world.surface(s.ax + (s.bx - s.ax) * t, s.az + (s.bz - s.az) * t, yr, h); };
+                            ok = P(dd, h0) && P(dd + 1, h1) && P(dd + 2, h2);
+                            if (!ok) break;
+                            float c = std::fabs(h2 - 2 * h1 + h0);   // Knick je Meter (Aenderung der Steigung)
+                            n++; sumAbs += c;
+                            if (c > 0.10f) bump10++;
+                            if (c > 0.25f) bump25++;
+                            if (c > worst) { worst = c; worstX = s.ax + (s.bx - s.ax) * (dd + 1) / L; worstZ = s.az + (s.bz - s.az) * (dd + 1) / L; }
+                            if (std::fabs(h1 - h0) > 0.16f) { steep++; if (std::getenv("WR_ROADCHECK")[0] == '2' && steep < 40) logMsg("  STEIL %.0f%% x=%.1f z=%.1f klass=%d ya=%.2f yb=%.2f L=%.0f", std::fabs(h1 - h0) * 100, s.ax + (s.bx - s.ax) * dd / L, s.az + (s.bz - s.az) * dd / L, s.klass, s.ya, s.yb, L); }
+                            if (c > 0.10f && std::getenv("WR_ROADCHECK")[0] == '2') { float qx = s.ax + (s.bx - s.ax) * (dd + 1) / L, qz = s.az + (s.bz - s.az) * (dd + 1) / L, th = 0; world.height(qx, qz, th);
+                                logMsg("  KNICK %.2f x=%.1f z=%.1f klass=%d ya=%.2f yb=%.2f h=%.2f %.2f %.2f gelaende=%.2f", c, qx, qz, s.klass, s.ya, s.yb, h0, h1, h2, th); }
+                            yr = h1 + 0.5f;
+                        }
+                    }
+                    logMsg("ROADCHECK proben=%d mittel=%.4f knick>0.10=%d knick>0.25=%d steil>16%%=%d max=%.2f bei x=%.1f z=%.1f", n, n ? sumAbs / n : 0.0f, bump10, bump25, steep, worst, worstX, worstZ);
+                }
+            }
             if (const char* pr = std::getenv("WR_PROFILE")) { // Test: Hoehenprofil entlang einer Linie lat1,lon1,lat2,lon2 (Gelaende und Fahrflaeche) ins Log
                 static bool done = false;
                 if (!done && simTime - spawnTime > 14) {
@@ -1721,7 +1843,16 @@ int main(int argc, char** argv) {
                 Vec3 f = car.forward();
                 float yaw = std::atan2(-f.x, -f.z) + lookYaw;
                 Vec3 back{std::sin(yaw), 0, std::cos(yaw)};
-                camM = mul(translate(car.pos + back * 7.2f + Vec3{0, 2.2f, 0}), mul(rotY(yaw), rotX(-0.20f + lookPitch)));
+                // Kamera rueckt naeher ans Auto, wenn hinten ein Gebaeude oder das Gelaende im Weg ist (sonst sah man nur Waende von innen)
+                static float camDist = 7.2f;
+                float want = 7.2f;
+                for (float dd = 1.0f; dd <= 7.2f; dd += 0.4f) {
+                    Vec3 q = car.pos + back * dd + Vec3{0, 2.2f * dd / 7.2f + 0.6f, 0};
+                    float gh = -1e9f;
+                    if (world.insideBuilding(q.x, q.z) || (world.surface(q.x, q.z, car.pos.y + 1.0f, gh) && gh > q.y - 0.4f)) { want = std::max(1.6f, dd - 0.8f); break; }
+                }
+                camDist = want < camDist ? want : camDist + std::min(want - camDist, dt * 3.0f);   // sofort heran, langsam zurueck
+                camM = mul(translate(car.pos + back * camDist + Vec3{0, 0.6f + 1.6f * camDist / 7.2f, 0}), mul(rotY(yaw), rotX(-0.20f + lookPitch)));
             }
             Mat4 view = rigidInverse(camM), proj = perspective(cfg.fov * PI / 180.0f, aspect, 0.2f, 16000.0f);
             mainVP = mul(proj, view);

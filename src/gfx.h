@@ -56,6 +56,7 @@ typedef ptrdiff_t GLsizeiptr;
     X(void, Uniform1f, (GLint, GLfloat)) \
     X(void, Uniform3f, (GLint, GLfloat, GLfloat, GLfloat)) \
     X(void, Uniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat)) \
+    X(void, Uniform4fv, (GLint, GLsizei, const GLfloat*)) \
     X(void, UniformMatrix4fv, (GLint, GLsizei, GLboolean, const GLfloat*)) \
     X(void, GenVertexArrays, (GLsizei, GLuint*)) \
     X(void, BindVertexArray, (GLuint)) \
@@ -146,7 +147,8 @@ void gfxCamera(Vec3 cam, const Mat4& invViewProj);
 void gfxBias(float b);
 void gfxSink(float x, float z, float radius, float depth);   // Gelaende im Umkreis absenken (0 = aus)
 void gfxEnv(float day, float overcast, float fogK, float wet, float snow, Vec3 sun);   // Tageslicht, Bewoelkung, Nebeldichte, Naesse, Schnee
-void gfxHead(Vec3 pos, Vec3 dir, float on);                                              // Scheinwerferkegel des eigenen Autos
+void gfxHead(Vec3 pos, Vec3 dir, float on);
+void gfxLamps(const float* xyzw, int n);   // Strassenlaternen in der Naehe: je Laterne x, y, z, Staerke (0 = aus); bis 24                                              // Scheinwerferkegel des eigenen Autos
 void gfxTint(float r, float g, float b);
 void gfxQuality(int q);   // 0 = einfache Shader (kein Detailrauschen), 1+ = volle Details
 GLuint gfxTexture(const uint8_t* px, int w, int h, int comp, bool mips);

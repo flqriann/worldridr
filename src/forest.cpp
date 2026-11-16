@@ -1,6 +1,6 @@
-// Baeume und Waelder: .glb-Modelle (assets/trees) werden per Instanced Rendering gezeichnet.
+// Baeume und Waelder: prozedurale Baeume mit Blattkarten, per Instanced Rendering gezeichnet.
 //  - Strassenbaeume kommen aus den OSM-Kacheln (World::forTreesNear)
-//  - Waelder entstehen dort, wo das Satellitenbild dunkel und gruen ist (World::forestAt), nicht auf Strassen/Gebaeuden
+//  - Waelder stehen auf OSM-Waldflaechen (World::forestAt), ohne OSM-Landnutzung dort, wo das Satellitenbild dunkel und gruen ist
 //  - Nah volles Modell, weiter weg ein stark vereinfachtes Modell (Kegel / Kugel), dahinter nichts
 #include "game.h"
 #include "net.h"
@@ -118,7 +118,7 @@ struct Species {
     float minScale = 3, maxScale = 4; // Zielhoehe / height
     bool ok = false;
 };
-// 0 Laubbaum (GLB), 1 Kiefer (GLB), 2 Birke, 3 Fichte, 4 Pappel, 5 Buche (prozedural)
+// 0 Linde, 1 Kiefer, 2 Birke, 3 Fichte, 4 Pappel, 5 Buche (alle prozedural mit Blattkarten)
 const int NSP = 6;
 Species SP[NSP];
 
@@ -160,6 +160,10 @@ void pushTrunk(std::vector<Vertex>& out, float h, float r, Color col) {
     }
 }
 
+void pushCluster(std::vector<Vertex>& out, Vec3 c, float r, int cards, Vec3 crownC, bool needles, Color col, uint32_t seed);
+void pushCore(std::vector<Vertex>& out, Vec3 c, Vec3 r, Color col);
+Color jitterC(Color c, float k);
+void pushLimb(std::vector<Vertex>& out, Vec3 a, Vec3 b, float ra, float rb, Color col);
 // Modell fertigstellen: Fuss auf y = 0, Fernansicht (einfacher Stamm + Krone aus mittleren Farben), Zielgroessen in Metern
 bool finishSpecies(int k, std::vector<Vertex>& v, bool pine, float minMeters, float maxMeters, const char* label) {
     Species& s = SP[k];
@@ -176,16 +180,18 @@ bool finishSpecies(int k, std::vector<Vertex>& v, bool pine, float minMeters, fl
     }
     Color foliage{(uint8_t)(nf ? fr / nf : 60), (uint8_t)(nf ? fg / nf : 110), (uint8_t)(nf ? fb / nf : 50), 255};
     Color bark{(uint8_t)(nt ? tr / nt : 90), (uint8_t)(nt ? tg / nt : 62), (uint8_t)(nt ? tb / nt : 40), 255};
-    std::vector<Vertex> l;
+    std::vector<Vertex> l;   // Fernmodell: Stamm, Kern und wenige grosse Blattkarten (gleiche Textur wie nah, keine Kanten)
     float H = s.height, R = s.radius;
-    pushTrunk(l, H * (pine ? 0.3f : 0.42f), R * 0.1f, bark);
+    pushLimb(l, {0, 0, 0}, {0, H * (pine ? 0.5f : 0.45f), 0}, R * 0.07f, R * 0.04f, bark);
     if (pine) {
-        for (int i = 0; i < 4; i++) {
-            Color c = foliage;
-            c.r = (uint8_t)(c.r * (0.8f + 0.07f * i)); c.g = (uint8_t)(std::min(255.0f, c.g * (0.8f + 0.07f * i))); c.b = (uint8_t)(c.b * (0.8f + 0.07f * i));
-            pushCone(l, {0, H * (0.2f + 0.17f * i), 0}, R * (1.0f - 0.2f * i), H * 0.34f, c);
-        }
-    } else pushSphere(l, {0, H * 0.66f, 0}, {R, H * 0.34f, R}, foliage);
+        Vec3 cc{0, H * 0.55f, 0};
+        pushCore(l, cc, {R * 0.45f, H * 0.38f, R * 0.45f}, jitterC(foliage, 0.55f));
+        for (int i = 0; i < 4; i++) pushCluster(l, {0, H * (0.30f + 0.17f * i), 0}, R * (0.95f - 0.18f * i), 4, cc, true, foliage, 900 + i);
+    } else {
+        Vec3 cc{0, H * 0.66f, 0};
+        pushCore(l, cc, {R * 0.70f, H * 0.28f, R * 0.70f}, jitterC(foliage, 0.55f));
+        for (int i = 0; i < 4; i++) { float a = i * 1.57f; pushCluster(l, cc + Vec3{std::cos(a) * R * 0.4f, (i % 2 ? 0.08f : -0.05f) * H, std::sin(a) * R * 0.4f}, R * 0.75f, 4, cc, false, foliage, 950 + i); }
+    }
     s.lod.create(l.data(), (int)l.size());
     s.minScale = minMeters / H; s.maxScale = maxMeters / H;
     s.ok = true;
@@ -199,29 +205,90 @@ bool loadSpecies(int k, const char* path, bool pine) {
 }
 
 // ---------- Prozedurale Baumarten (Einheitshoehe 1, die Instanz skaliert auf Meter) ----------
+// Kronen aus vielen kleinen Blattkarten (Textur mit Transparenz: einzelne Blaetter bzw. Nadelzweige), dazu Stamm und Aeste.
+// Die Normalen der Karten zeigen vom Kronenmittelpunkt nach aussen: die Krone wirkt rund und weich beleuchtet statt facettiert.
 float rnd01(uint32_t& s) { s = s * 1664525u + 1013904223u; return (s >> 8) / 16777216.0f; }
 Color jitterC(Color c, float k) { return Color{(uint8_t)clampv(c.r * k, 0.0f, 255.0f), (uint8_t)clampv(c.g * k, 0.0f, 255.0f), (uint8_t)clampv(c.b * k, 0.0f, 255.0f), 255}; }
-// unregelmaessiger Laubballen: Radius je Gitterpunkt zufaellig (0,82..1,18), je Dreieck leichte Farbvariation, Pole sind geschlossen
-void pushBlob(std::vector<Vertex>& out, Vec3 c, Vec3 r, Color col, uint32_t seed) {
-    const int S = 9, R = 6;
-    std::vector<float> jit((S + 1) * (R + 1), 1.0f);
-    uint32_t st = seed * 2654435761u + 17u;
-    for (int i = 0; i < S; i++) for (int j = 1; j < R; j++) jit[i * (R + 1) + j] = 0.82f + 0.36f * rnd01(st);
-    for (int j = 0; j <= R; j++) jit[S * (R + 1) + j] = jit[j];   // Naht schliessen
-    auto P = [&](int i, int j) {
-        float a = i * 2 * PI / S, b = -PI / 2 + j * PI / R, k = jit[i * (R + 1) + j];
-        return Vec3{c.x + std::cos(a) * std::cos(b) * r.x * k, c.y + std::sin(b) * r.y * k, c.z + std::sin(a) * std::cos(b) * r.z * k};
+
+// Atlas 512 x 512: links Laubblaetter (u 0..0.5), rechts Nadelzweige (u 0.5..1), unten ein deckender Rindenstreifen (v 0.92..1)
+GLuint leafTex = 0;
+const float BARK_V = 0.96f;
+void buildLeafTexture() {
+    const int W = 512, H = 512;
+    std::vector<uint8_t> px((size_t)W * H * 4, 0);
+    uint32_t st = 1234;
+    auto put = [&](int x, int y, float v, float g) {
+        if (x < 0 || y < 0 || x >= W || y >= H) return;
+        uint8_t* p = &px[((size_t)y * W + x) * 4];
+        p[0] = (uint8_t)clampv(v * 0.92f * 255, 0.0f, 255.0f); p[1] = (uint8_t)clampv(v * g * 255, 0.0f, 255.0f); p[2] = (uint8_t)clampv(v * 0.82f * 255, 0.0f, 255.0f); p[3] = 255;
     };
-    auto T = [&](Vec3 a, Vec3 b, Vec3 d) {
-        Vec3 n = normalize(cross(b - a, d - a));
-        if (dot(n, a - c) < 0) n = -n;
-        Color cc = jitterC(col, 0.88f + 0.24f * rnd01(st));
-        for (Vec3 q : {a, b, d}) out.push_back({{q.x, q.y, q.z}, {n.x, n.y, n.z}, {0, 0}, cc});
-    };
-    for (int i = 0; i < S; i++)
-        for (int j = 0; j < R; j++) { T(P(i, j), P(i + 1, j), P(i, j + 1)); T(P(i + 1, j), P(i + 1, j + 1), P(i, j + 1)); }
+    // Laubblaetter: dicht in der Mitte, locker am Rand (runder Zweigbuschel)
+    for (int i = 0; i < 520; i++) {
+        float r = std::sqrt(rnd01(st)) * 108.0f, a = rnd01(st) * 6.2832f;
+        float cx = 128 + std::cos(a) * r, cy = 230 + std::sin(a) * r * 0.95f;
+        float len = 7 + rnd01(st) * 7, wid = 3 + rnd01(st) * 2.5f, ang = rnd01(st) * 6.2832f, ca = std::cos(ang), sa = std::sin(ang);
+        float shade = 0.50f + 0.32f * rnd01(st) - 0.18f * (r / 108.0f), g = 1.0f + 0.10f * rnd01(st);
+        for (int y = (int)(cy - len); y <= (int)(cy + len); y++)
+            for (int x = (int)(cx - len); x <= (int)(cx + len); x++) {
+                float dx = x - cx, dy = y - cy, u = dx * ca + dy * sa, v = -dx * sa + dy * ca;
+                float e = (u * u) / (len * len) + (v * v) / (wid * wid);
+                if (e > 1) continue;
+                put(x, y, shade * (0.86f + 0.14f * (1 - e)) * (std::fabs(v) < 0.6f ? 0.85f : 1.0f), g);   // Mittelrippe etwas dunkler
+            }
+    }
+    // Nadelzweige: Zweige vom Mittelpunkt, Nadeln beidseitig
+    for (int b = 0; b < 9; b++) {
+        float a = -1.1f + b * 0.28f + rnd01(st) * 0.1f, ca = std::cos(a), sa = std::sin(a);
+        float L = 70 + rnd01(st) * 60;
+        for (float s2 = 0; s2 < L; s2 += 2.0f) {
+            float bx = 300 + ca * s2 * 1.6f, by = 230 + sa * s2;
+            for (int sd = -1; sd <= 1; sd += 2) {
+                float na = a + sd * (0.9f + rnd01(st) * 0.3f), nl = 8 + rnd01(st) * 6 - s2 * 0.03f, shade = 0.38f + 0.25f * rnd01(st);
+                for (float t = 0; t < nl; t += 0.6f) { put((int)(bx + std::cos(na) * t), (int)(by + std::sin(na) * t), shade, 1.05f); put((int)(bx + std::cos(na) * t) + 1, (int)(by + std::sin(na) * t), shade * 0.9f, 1.05f); }
+            }
+            put((int)bx, (int)by, 0.30f, 0.9f); put((int)bx, (int)by + 1, 0.30f, 0.9f);
+        }
+    }
+    // Rinde: deckend, senkrechte Streifen
+    for (int y = (int)(H * 0.92f); y < H; y++)
+        for (int x = 0; x < W; x++) {
+            float v = 0.55f + 0.18f * std::sin(x * 0.9f + std::sin(x * 0.13f) * 3) + 0.08f * (((x * 7 + y * 13) % 11) / 11.0f);
+            uint8_t* p = &px[((size_t)y * W + x) * 4];
+            p[0] = p[1] = p[2] = (uint8_t)clampv(v * 255, 0.0f, 255.0f); p[3] = 255;
+        }
+    leafTex = gfxTexture(px.data(), W, H, 4, true);
 }
-// Kegelstumpf/Ast von a nach b (6 Seiten)
+
+struct Crown { Vec3 c; float r; };
+// Karte (Quad) mit Blatt- oder Nadeltextur; Normale = Richtung vom Kronenmittelpunkt (weiche, runde Beleuchtung)
+void pushCard(std::vector<Vertex>& out, Vec3 p, Vec3 axU, Vec3 axV, Vec3 center, bool needles, Color col) {
+    float u0 = needles ? 0.5f : 0.0f, u1 = u0 + 0.5f;
+    Vec3 q[4] = {p - axU - axV, p + axU - axV, p + axU + axV, p - axU + axV};
+    float uv[4][2] = {{u0, 0.9f}, {u1, 0.9f}, {u1, 0.0f}, {u0, 0.0f}};
+    Vertex v[4];
+    for (int i = 0; i < 4; i++) {
+        Vec3 n = normalize(q[i] - center + Vec3{0, 0.15f, 0});
+        v[i] = {{q[i].x, q[i].y, q[i].z}, {n.x, n.y, n.z}, {uv[i][0], uv[i][1]}, col};
+    }
+    out.push_back(v[0]); out.push_back(v[1]); out.push_back(v[2]);
+    out.push_back(v[0]); out.push_back(v[2]); out.push_back(v[3]);
+}
+// Blattbuschel: viele zufaellig gedrehte Karten um c
+void pushCluster(std::vector<Vertex>& out, Vec3 c, float r, int cards, Vec3 crownC, bool needles, Color col, uint32_t seed) {
+    uint32_t st = seed * 2654435761u + 7u;
+    for (int i = 0; i < cards; i++) {
+        Vec3 d = normalize(Vec3{rnd01(st) - 0.5f, (rnd01(st) - 0.5f) * 0.7f, rnd01(st) - 0.5f});
+        Vec3 p = c + d * (r * 0.45f * rnd01(st));
+        Vec3 nrm = normalize(Vec3{rnd01(st) - 0.5f, rnd01(st) * 0.8f + 0.2f, rnd01(st) - 0.5f});
+        Vec3 ref = std::fabs(nrm.y) > 0.9f ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+        Vec3 au = normalize(cross(nrm, ref)), av = cross(nrm, au);
+        float s = r * (0.55f + 0.35f * rnd01(st));
+        // oben heller (Sonne), innen/unten dunkler (Eigenschatten)
+        float k = 0.78f + 0.30f * clampv((p.y - crownC.y) / std::max(r, 0.01f) * 0.5f + 0.5f, 0.0f, 1.0f) + 0.10f * (rnd01(st) - 0.5f);
+        pushCard(out, p, au * s, av * s, crownC, needles, jitterC(col, k));
+    }
+}
+// Kegelstumpf/Ast von a nach b (6 Seiten), Rindentextur
 void pushLimb(std::vector<Vertex>& out, Vec3 a, Vec3 b, float ra, float rb, Color col) {
     Vec3 ax = normalize(b - a), ref = std::fabs(ax.y) > 0.9f ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
     Vec3 u = normalize(cross(ax, ref)), w = cross(ax, u);
@@ -229,69 +296,116 @@ void pushLimb(std::vector<Vertex>& out, Vec3 a, Vec3 b, float ra, float rb, Colo
     for (int i = 0; i < S; i++) {
         float a0 = i * 2 * PI / S, a1 = (i + 1) * 2 * PI / S;
         Vec3 d0 = u * std::cos(a0) + w * std::sin(a0), d1 = u * std::cos(a1) + w * std::sin(a1);
-        Vec3 p0 = a + d0 * ra, p1 = a + d1 * ra, q0 = b + d0 * rb, q1 = b + d1 * rb, n = normalize(d0 + d1);
-        for (Vec3 q : {p0, p1, q1, p0, q1, q0}) out.push_back({{q.x, q.y, q.z}, {n.x, n.y, n.z}, {0, 0}, col});
+        Vec3 p0 = a + d0 * ra, p1 = a + d1 * ra, q0 = b + d0 * rb, q1 = b + d1 * rb;
+        float uA = (float)i / S, uB = (float)(i + 1) / S;
+        Vertex vv[4] = {{{p0.x, p0.y, p0.z}, {d0.x, d0.y, d0.z}, {uA, BARK_V}, col}, {{p1.x, p1.y, p1.z}, {d1.x, d1.y, d1.z}, {uB, BARK_V}, col},
+                        {{q1.x, q1.y, q1.z}, {d1.x, d1.y, d1.z}, {uB, 0.99f}, col}, {{q0.x, q0.y, q0.z}, {d0.x, d0.y, d0.z}, {uA, 0.99f}, col}};
+        out.push_back(vv[0]); out.push_back(vv[1]); out.push_back(vv[2]);
+        out.push_back(vv[0]); out.push_back(vv[2]); out.push_back(vv[3]);
     }
 }
-// Kegelstockwerk der Fichte mit leicht welligem Rand
-void pushTier(std::vector<Vertex>& out, float y, float r, float h, Color col, uint32_t seed) {
-    const int S = 10;
+// dunkler Kern der Krone (deckend), damit man nicht durch die Krone hindurchsieht
+void pushCore(std::vector<Vertex>& out, Vec3 c, Vec3 r, Color col) {
+    const int S = 7, R = 4;
+    auto P = [&](int i, int j) {
+        float a = i * 2 * PI / S, b = -PI / 2 + j * PI / R;
+        return Vec3{c.x + std::cos(a) * std::cos(b) * r.x, c.y + std::sin(b) * r.y, c.z + std::sin(a) * std::cos(b) * r.z};
+    };
+    auto T = [&](Vec3 a, Vec3 b, Vec3 d) {
+        for (Vec3 q : {a, b, d}) { Vec3 n = normalize(q - c); out.push_back({{q.x, q.y, q.z}, {n.x, n.y, n.z}, {0.5f, 0.97f}, col}); }
+    };
+    for (int i = 0; i < S; i++)
+        for (int j = 0; j < R; j++) { T(P(i, j), P(i + 1, j), P(i, j + 1)); T(P(i + 1, j), P(i + 1, j + 1), P(i, j + 1)); }
+}
+// Laubbaum: Stamm, Hauptaeste zu den Buescheln, Kern, Blattkarten
+void broadleaf(int k, const char* label, Color leaf, Color bark, float trunkTop, float crownY, float crownR, float crownH, int clusters, float minM, float maxM, uint32_t seed, float trunkR) {
+    std::vector<Vertex> v;
     uint32_t st = seed;
-    Vec3 apex{0, y + h, 0};
-    for (int i = 0; i < S; i++) {
-        float a0 = i * 2 * PI / S, a1 = (i + 1) * 2 * PI / S, k0 = 0.88f + 0.24f * rnd01(st), k1 = (i + 1 == S) ? 1.0f : 0.88f + 0.24f * rnd01(st);
-        Vec3 p0{std::cos(a0) * r * k0, y, std::sin(a0) * r * k0}, p1{std::cos(a1) * r * k1, y, std::sin(a1) * r * k1};
-        Vec3 n = normalize(cross(p1 - p0, apex - p0));
-        if (dot(n, p0) < 0) n = -n;
-        Color cc = jitterC(col, 0.9f + 0.2f * rnd01(st));
-        for (Vec3 q : {p0, p1, apex}) out.push_back({{q.x, q.y, q.z}, {n.x, n.y, n.z}, {0, 0}, cc});
-        Vec3 dn{0, -1, 0};
-        for (Vec3 q : {Vec3{0, y, 0}, p1, p0}) out.push_back({{q.x, q.y, q.z}, {dn.x, dn.y, dn.z}, {0, 0}, jitterC(col, 0.55f)});
+    pushLimb(v, {0, 0, 0}, {0, 0.06f, 0}, trunkR * 1.35f, trunkR, bark);                 // Wurzelanlauf
+    pushLimb(v, {0, 0.06f, 0}, {0.01f, trunkTop, 0.005f}, trunkR, trunkR * 0.62f, bark);
+    Vec3 cc{0, crownY, 0};
+    std::vector<Crown> cl;
+    for (int i = 0; i < clusters; i++) {
+        float a = i * 2.39996f + rnd01(st) * 0.4f, h = rnd01(st);
+        float rr = crownR * std::sqrt(1.0f - (h - 0.45f) * (h - 0.45f) * 2.2f) * (0.55f + 0.45f * rnd01(st));
+        Vec3 c{std::cos(a) * rr, crownY + (h - 0.45f) * crownH, std::sin(a) * rr};
+        cl.push_back({c, crownR * (0.36f + 0.14f * rnd01(st))});
     }
+    for (size_t i = 0; i < cl.size(); i++) { // Aeste vom Stammende zu den aeusseren Bueschen
+        if (i % 2) continue;
+        Vec3 from{0, trunkTop * (0.75f + 0.25f * rnd01(st)), 0};
+        pushLimb(v, from, cl[i].c * 0.8f + from * 0.2f, trunkR * 0.42f, trunkR * 0.12f, bark);
+    }
+    pushCore(v, cc, {crownR * 0.55f, crownH * 0.30f, crownR * 0.55f}, jitterC(leaf, 0.50f));
+    for (size_t i = 0; i < cl.size(); i++) pushCluster(v, cl[i].c, cl[i].r, 9, cc, false, leaf, seed * 31 + (uint32_t)i);
+    finishSpecies(k, v, false, minM, maxM, label);
 }
 void buildProcedural() {
-    { // 2 Birke: schlanker weisser Stamm, locker verteilte helle Kronenballen
+    buildLeafTexture();
+    broadleaf(0, "Linde (Blattkarten)", Color{92, 132, 60, 255}, Color{104, 90, 76, 255}, 0.44f, 0.64f, 0.32f, 0.50f, 16, 8.0f, 14.0f, 21, 0.032f);
+    broadleaf(5, "Buche (Blattkarten)", Color{70, 112, 50, 255}, Color{118, 112, 104, 255}, 0.40f, 0.62f, 0.38f, 0.48f, 18, 12.0f, 20.0f, 5, 0.036f);
+    { // 2 Birke: schlanker weisser Stamm, lockere haengende Bueschel
         std::vector<Vertex> v;
         uint32_t st = 11;
-        Color bark{226, 222, 214, 255}, leaf{118, 156, 66, 255};
-        pushLimb(v, {0, 0, 0}, {0.015f, 0.62f, 0.01f}, 0.020f, 0.010f, bark);
-        for (int i = 0; i < 5; i++) {
-            float a = i * 1.26f + rnd01(st), y = 0.56f + 0.09f * i, rr = 0.07f + 0.09f * (1.0f - std::fabs(i - 2) / 3.0f);
+        Color bark{224, 220, 212, 255}, leaf{128, 162, 72, 255};
+        pushLimb(v, {0, 0, 0}, {0.015f, 0.80f, 0.01f}, 0.020f, 0.008f, bark);
+        Vec3 cc{0, 0.66f, 0};
+        pushCore(v, cc, {0.08f, 0.13f, 0.08f}, jitterC(leaf, 0.55f));
+        for (int i = 0; i < 12; i++) {
+            float a = i * 2.39996f + rnd01(st) * 0.3f, y = 0.42f + 0.48f * rnd01(st), rr = 0.07f + 0.12f * (1.0f - std::fabs(y - 0.62f) * 2.0f);
             Vec3 c{std::cos(a) * rr, y, std::sin(a) * rr};
-            pushLimb(v, {0.012f, 0.42f + 0.03f * i, 0.008f}, c, 0.007f, 0.004f, bark);
-            pushBlob(v, c, {0.15f, 0.12f, 0.15f}, leaf, 100 + i);
+            if (i % 2 == 0) pushLimb(v, {0.012f, y - 0.06f, 0.008f}, c, 0.006f, 0.003f, bark);
+            pushCluster(v, c, 0.10f + 0.03f * rnd01(st), 7, cc, false, leaf, 100 + i);
         }
-        pushBlob(v, {0, 0.96f, 0}, {0.12f, 0.09f, 0.12f}, jitterC(leaf, 1.08f), 150);
-        finishSpecies(2, v, false, 9.0f, 15.0f, "Birke (prozedural)");
+        finishSpecies(2, v, false, 9.0f, 15.0f, "Birke (Blattkarten)");
     }
-    { // 3 Fichte: dunkle Kegelstockwerke, nach oben schmaler
+    { // 3 Fichte: Stockwerke aus haengenden Nadelzweig-Karten rund um den Stamm
         std::vector<Vertex> v;
-        Color leaf{34, 78, 46, 255}, bark{84, 60, 42, 255};
-        pushLimb(v, {0, 0, 0}, {0, 0.30f, 0}, 0.022f, 0.012f, bark);
-        for (int i = 0; i < 8; i++) pushTier(v, 0.10f + 0.105f * i, 0.30f * (1.0f - 0.105f * i) + 0.02f, 0.26f - 0.012f * i, leaf, 300 + i);
-        finishSpecies(3, v, true, 14.0f, 24.0f, "Fichte (prozedural)");
+        uint32_t st = 300;
+        Color leaf{44, 84, 52, 255}, bark{88, 64, 46, 255};
+        pushLimb(v, {0, 0, 0}, {0, 1.0f, 0}, 0.022f, 0.004f, bark);
+        pushCore(v, {0, 0.50f, 0}, {0.06f, 0.36f, 0.06f}, jitterC(leaf, 0.55f));
+        for (int t = 0; t < 14; t++) {
+            float y = 0.14f + 0.062f * t, r = 0.30f * (1.0f - (y - 0.1f) / 0.95f) + 0.03f;
+            int n = 9 + (int)(r * 20);
+            for (int i = 0; i < n; i++) {
+                float a = (i + rnd01(st) * 0.6f) * 6.2832f / n + t * 0.7f, ca = std::cos(a), sa = std::sin(a);
+                Vec3 out{ca, -0.32f, sa};   // Zweig haengt leicht nach unten
+                Vec3 mid = Vec3{0, y, 0} + out * (r * 0.55f);
+                Vec3 side{-sa, 0, ca};
+                Vec3 au = normalize(out) * (r * 0.58f), av = side * (r * 0.55f);
+                pushCard(v, mid, au, av, Vec3{0, y + 0.05f, 0}, true, jitterC(leaf, 0.85f + 0.3f * rnd01(st) + 0.12f * (t / 14.0f)));
+            }
+        }
+        finishSpecies(3, v, true, 14.0f, 24.0f, "Fichte (Nadelkarten)");
     }
-    { // 4 Pappel: hohe schmale Saeule aus uebereinanderliegenden Ballen
+    { // 1 Kiefer: langer kahler Stamm, lockere schirmfoermige Nadelbueschel oben
+        std::vector<Vertex> v;
+        uint32_t st = 900;
+        Color leaf{58, 92, 54, 255}, bark{136, 92, 62, 255};
+        pushLimb(v, {0, 0, 0}, {0.02f, 0.82f, 0.01f}, 0.026f, 0.012f, bark);
+        Vec3 cc{0, 0.84f, 0};
+        pushCore(v, cc, {0.08f, 0.04f, 0.08f}, jitterC(leaf, 0.55f));
+        for (int i = 0; i < 11; i++) {
+            float a = i * 2.39996f, rr = 0.06f + 0.14f * rnd01(st), y = 0.74f + 0.20f * rnd01(st);
+            Vec3 c{std::cos(a) * rr, y, std::sin(a) * rr};
+            pushLimb(v, {0.015f, 0.66f + 0.1f * rnd01(st), 0.008f}, c, 0.010f, 0.004f, bark);
+            pushCluster(v, c, 0.09f + 0.03f * rnd01(st), 7, cc, true, leaf, 200 + i);
+        }
+        finishSpecies(1, v, true, 12.0f, 20.0f, "Kiefer (Nadelkarten)");
+    }
+    { // 4 Pappel: hohe schmale Saeule
         std::vector<Vertex> v;
         uint32_t st = 77;
-        Color leaf{90, 132, 52, 255}, bark{96, 80, 62, 255};
-        pushLimb(v, {0, 0, 0}, {0, 0.34f, 0}, 0.014f, 0.009f, bark);
-        for (int i = 0; i < 6; i++) pushBlob(v, {(rnd01(st) - 0.5f) * 0.03f, 0.33f + 0.115f * i, (rnd01(st) - 0.5f) * 0.03f}, {0.095f - 0.008f * i, 0.13f, 0.095f - 0.008f * i}, leaf, 500 + i);
-        finishSpecies(4, v, false, 16.0f, 26.0f, "Pappel (prozedural)");
-    }
-    { // 5 Buche: kraeftiger Stamm mit Wurzelanlauf, breite Krone aus vielen Ballen, dunkleres Gruen
-        std::vector<Vertex> v;
-        uint32_t st = 5;
-        Color leaf{52, 102, 46, 255}, bark{96, 82, 70, 255};
-        pushLimb(v, {0, 0, 0}, {0, 0.12f, 0}, 0.050f, 0.036f, bark);
-        pushLimb(v, {0, 0.12f, 0}, {0, 0.42f, 0}, 0.036f, 0.026f, bark);
-        for (int i = 0; i < 9; i++) {
-            float a = i * 2.4f, rr = i < 6 ? 0.20f + 0.08f * rnd01(st) : 0.05f, y = i < 6 ? 0.50f + 0.14f * rnd01(st) : 0.80f + 0.05f * (i - 6);
-            Vec3 c{std::cos(a) * rr, y, std::sin(a) * rr};
-            pushLimb(v, {0, 0.34f + 0.04f * (i % 3), 0}, c, 0.014f, 0.007f, bark);
-            pushBlob(v, c, {0.20f + 0.05f * rnd01(st), 0.16f + 0.05f * rnd01(st), 0.20f + 0.05f * rnd01(st)}, jitterC(leaf, 0.85f + 0.3f * rnd01(st)), 700 + i);
+        Color leaf{96, 138, 58, 255}, bark{108, 96, 80, 255};
+        pushLimb(v, {0, 0, 0}, {0, 0.86f, 0}, 0.016f, 0.006f, bark);
+        Vec3 cc{0, 0.62f, 0};
+        pushCore(v, cc, {0.05f, 0.24f, 0.05f}, jitterC(leaf, 0.55f));
+        for (int i = 0; i < 14; i++) {
+            float y = 0.30f + 0.66f * (i / 13.0f), a = i * 2.39996f, rr = 0.04f * (1.0f - std::fabs(y - 0.6f));
+            pushCluster(v, {std::cos(a) * rr, y, std::sin(a) * rr}, 0.075f + 0.02f * rnd01(st), 6, cc, false, leaf, 500 + i);
         }
-        finishSpecies(5, v, false, 12.0f, 20.0f, "Buche (prozedural)");
+        finishSpecies(4, v, false, 16.0f, 26.0f, "Pappel (Blattkarten)");
     }
 }
 
@@ -300,7 +414,7 @@ struct TreeI { float x, y, z, s; uint8_t kind; };
 struct FCell { std::vector<TreeI> t; };
 std::unordered_map<int64_t, FCell> cells;
 const float CELL = 48.0f, SPACING = 8.0f;
-const float FULL_R = 130, LOD1_R = 260, LOD2_R = 480, STREET_R = 400;
+const float FULL_R = 220, LOD1_R = 330, LOD2_R = 520, STREET_R = 400;   // bis 220 m das volle Modell mit Blattkarten
 
 float hash3(int a, int b, int c) {
     uint32_t h = (uint32_t)a * 374761393u + (uint32_t)b * 668265263u + (uint32_t)c * 2246822519u;
@@ -344,8 +458,8 @@ int counts[NSP][3] = {};
 namespace forest {
 
 void init() {
-    loadSpecies(0, "assets/trees/tree.glb", false);
-    loadSpecies(1, "assets/trees/pine.glb", true);
+    // Die mitgelieferten .glb-Baeume (assets/trees) sind sehr kantig; alle Arten werden jetzt mit Blattkarten erzeugt.
+    (void)loadSpecies;
     buildProcedural();
 }
 
@@ -355,6 +469,8 @@ void update(Vec3 cam) {
     if (!anyOk) return;
     static int geoGen = -1;
     if (geoGen != world.geo().gen) { geoGen = world.geo().gen; cells.clear(); } // Ortswechsel: neuer lokaler Ursprung
+    static int landVer = -1;
+    if (landVer != world.landVersion()) { landVer = world.landVersion(); cells.clear(); } // neue Landnutzung: Wald nur auf OSM-Waldflaechen
     // fehlende Zellen im Umkreis erzeugen (wenige pro Bild), weit entfernte verwerfen
     int cx0 = (int)std::floor(cam.x / CELL), cz0 = (int)std::floor(cam.z / CELL), rc = (int)(LOD2_R / CELL) + 1, made = 0;
     for (int ring = 0; ring <= rc && made < 4; ring++)
@@ -401,11 +517,12 @@ void update(Vec3 cam) {
 
 void draw(bool mirror) {
     gfxModel(identity());
-    gfxMode(0, FLAG_LIT | FLAG_FOG);
     gfxInstanced(true);
+    gfxBindTexture(leafTex);
+    gfxMode(10);   // Blattkarten mit Transparenz (Alpha-Test), durchscheinendes Licht; nah volles Modell, fern wenige grosse Karten
+    for (int k = 0; k < NSP; k++) if (SP[k].ok) SP[k].full.drawInstanced(bufs[k][0], counts[k][0]);
     for (int k = 0; k < NSP; k++) {
         if (!SP[k].ok) continue;
-        SP[k].full.drawInstanced(bufs[k][0], counts[k][0]);
         SP[k].lod.drawInstanced(bufs[k][1], counts[k][1]);
         if (!mirror) SP[k].lod.drawInstanced(bufs[k][2], counts[k][2]);
     }

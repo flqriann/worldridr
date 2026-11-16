@@ -15,7 +15,7 @@ static HINTERNET session() {
         HINTERNET h = WinHttpOpen(L"worldridr/0.1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (h) {
             WinHttpSetTimeouts(h, 8000, 8000, 20000, 60000);
-            DWORD d = WINHTTP_DECOMPRESSION_FLAG_ALL;
+            DWORD d = WINHTTP_DECOMPRESSION_FLAG_GZIP;   // nur gzip: "deflate" (z. B. open-meteo.com) kam als leere Antwort an
             WinHttpSetOption(h, WINHTTP_OPTION_DECOMPRESSION, &d, sizeof d);
         }
         return h;
